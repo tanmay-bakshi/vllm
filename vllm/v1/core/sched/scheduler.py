@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -148,6 +150,10 @@ class Scheduler(SchedulerInterface):
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
 
         self.block_size = block_size
+        self._kv_group_block_sizes = tuple(
+            int(group.kv_cache_spec.block_size)
+            for group in self.kv_cache_config.kv_cache_groups
+        )
         self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
 
@@ -179,6 +185,7 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        self._p2p_request_milestone_once_events: set[tuple[str, str]] = set()
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -254,6 +261,14 @@ class Scheduler(SchedulerInterface):
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
+        self._gemma4_scheduler_trace_enabled = (
+            os.environ.get("GEMMA4_SCHEDULER_TRACE", "0").strip().lower()
+            in ("1", "true", "yes")
+        )
+        self._gemma4_scheduler_trace_label = os.environ.get(
+            "GEMMA4_SCHEDULER_TRACE_LABEL", ""
+        )
+        self._gemma4_scheduler_trace_step = 0
 
         self.enable_return_routed_experts = (
             vllm_config.model_config.enable_return_routed_experts
@@ -326,6 +341,144 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _gemma4_scheduler_trace_status_counts(
+        self, requests: Iterable[Request]
+    ) -> dict[str, int]:
+        """Count request statuses for scheduler trace output.
+
+        :param requests: Requests to summarize.
+        :returns: Mapping from request status name to count.
+        """
+
+        status_counts: dict[str, int] = {}
+        for request in requests:
+            status_name = request.status.name
+            status_counts[status_name] = status_counts.get(status_name, 0) + 1
+        return status_counts
+
+    def _gemma4_scheduler_trace_phase_summary(
+        self,
+        scheduled_requests: Iterable[Request],
+        num_scheduled_tokens: dict[str, int],
+    ) -> dict[str, dict[str, int]]:
+        """Summarize scheduled work as prefill, decode, or mixed.
+
+        :param scheduled_requests: Requests scheduled in the current step.
+        :param num_scheduled_tokens: Scheduled token counts keyed by request id.
+        :returns: Per-phase request and token counts.
+        """
+
+        summary = {
+            "prefill": {"requests": 0, "tokens": 0},
+            "decode": {"requests": 0, "tokens": 0},
+            "mixed": {"requests": 0, "tokens": 0},
+        }
+        for request in scheduled_requests:
+            request_id = request.request_id
+            scheduled_tokens = num_scheduled_tokens.get(request_id, 0)
+            if scheduled_tokens == 0:
+                continue
+
+            prompt_remaining_tokens = max(
+                0, request.num_prompt_tokens - request.num_computed_tokens
+            )
+            if prompt_remaining_tokens == 0:
+                phase = "decode"
+            elif scheduled_tokens <= prompt_remaining_tokens:
+                phase = "prefill"
+            else:
+                phase = "mixed"
+            summary[phase]["requests"] += 1
+            summary[phase]["tokens"] += scheduled_tokens
+        return summary
+
+    def _gemma4_scheduler_trace_emit(
+        self,
+        trace_started_ns: int,
+        scheduled_new_reqs: list[Request],
+        scheduled_resumed_reqs: list[Request],
+        scheduled_running_reqs: list[Request],
+        preempted_reqs: list[Request],
+        scheduler_output: SchedulerOutput,
+        token_budget_remaining: int,
+        waiting_status_before: dict[str, int],
+        running_status_before: dict[str, int],
+        scheduled_phase_summary: dict[str, dict[str, int]],
+    ) -> None:
+        """Emit an opt-in per-step scheduler trace event.
+
+        :param trace_started_ns: Monotonic timestamp captured before scheduling.
+        :param scheduled_new_reqs: Newly scheduled requests.
+        :param scheduled_resumed_reqs: Resumed requests.
+        :param scheduled_running_reqs: Previously running requests scheduled again.
+        :param preempted_reqs: Requests preempted during this schedule step.
+        :param scheduler_output: Output produced by the scheduler.
+        :param token_budget_remaining: Remaining scheduler token budget.
+        :param waiting_status_before: Waiting status counts before scheduling.
+        :param running_status_before: Running status counts before scheduling.
+        :param scheduled_phase_summary: Pre-update scheduled phase summary.
+        """
+
+        scheduled_requests = [
+            *scheduled_new_reqs,
+            *scheduled_resumed_reqs,
+            *scheduled_running_reqs,
+        ]
+        waiting_status_after = self._gemma4_scheduler_trace_status_counts(
+            itertools.chain(self.waiting, self.skipped_waiting)
+        )
+        running_status_after = self._gemma4_scheduler_trace_status_counts(self.running)
+        scheduled_token_values = list(
+            scheduler_output.num_scheduled_tokens.values()
+        )
+        scheduled_token_min = 0
+        scheduled_token_max = 0
+        if len(scheduled_token_values) > 0:
+            scheduled_token_min = min(scheduled_token_values)
+            scheduled_token_max = max(scheduled_token_values)
+
+        finished_ns = time.monotonic_ns()
+        event = {
+            "event": "gemma4_scheduler_step_trace",
+            "pid": os.getpid(),
+            "trace_label": self._gemma4_scheduler_trace_label,
+            "step": self._gemma4_scheduler_trace_step,
+            "started_ns": trace_started_ns,
+            "finished_ns": finished_ns,
+            "duration_ms": (finished_ns - trace_started_ns) / 1e6,
+            "max_num_running_reqs": self.max_num_running_reqs,
+            "max_num_scheduled_tokens": self.max_num_scheduled_tokens,
+            "token_budget_remaining": token_budget_remaining,
+            "running_before": sum(running_status_before.values()),
+            "waiting_before": sum(waiting_status_before.values()),
+            "waiting_status_before": waiting_status_before,
+            "running_status_before": running_status_before,
+            "running_after": len(self.running),
+            "waiting_after": len(self.waiting) + len(self.skipped_waiting),
+            "waiting_status_after": waiting_status_after,
+            "running_status_after": running_status_after,
+            "scheduled_new_reqs": len(scheduled_new_reqs),
+            "scheduled_resumed_reqs": len(scheduled_resumed_reqs),
+            "scheduled_running_reqs": len(scheduled_running_reqs),
+            "scheduled_total_reqs": len(scheduled_requests),
+            "scheduled_total_tokens": scheduler_output.total_num_scheduled_tokens,
+            "scheduled_token_min": scheduled_token_min,
+            "scheduled_token_max": scheduled_token_max,
+            "scheduled_phase_summary": scheduled_phase_summary,
+            "scheduled_spec_reqs": len(
+                scheduler_output.scheduled_spec_decode_tokens
+            ),
+            "scheduled_spec_tokens": sum(
+                len(tokens)
+                for tokens in scheduler_output.scheduled_spec_decode_tokens.values()
+            ),
+            "preempted_reqs": len(preempted_reqs),
+            "finished_req_ids": len(scheduler_output.finished_req_ids),
+            "kv_cache_usage": self.kv_cache_manager.usage,
+        }
+        print(json.dumps(event, sort_keys=True), flush=True)
+        self._gemma4_scheduler_trace_step += 1
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -337,6 +490,18 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+
+        trace_started_ns = 0
+        waiting_status_before: dict[str, int] = {}
+        running_status_before: dict[str, int] = {}
+        if self._gemma4_scheduler_trace_enabled is True:
+            trace_started_ns = time.monotonic_ns()
+            waiting_status_before = self._gemma4_scheduler_trace_status_counts(
+                itertools.chain(self.waiting, self.skipped_waiting)
+            )
+            running_status_before = self._gemma4_scheduler_trace_status_counts(
+                self.running
+            )
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -764,6 +929,16 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    self._emit_p2p_request_milestone_once(
+                        request.request_id,
+                        "scheduler_remote_kv_wait_registered",
+                        extra={
+                            "num_computed_tokens": int(request.num_computed_tokens),
+                            "num_external_computed_tokens": int(
+                                num_external_computed_tokens
+                            ),
+                        },
+                    )
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
@@ -782,6 +957,15 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                self._emit_p2p_request_milestone_once(
+                    request.request_id,
+                    "scheduler_request_scheduled",
+                    extra={
+                        "num_computed_tokens": int(request.num_computed_tokens),
+                        "num_new_tokens": int(num_new_tokens),
+                        "num_scheduled_tokens": int(num_new_tokens),
+                    },
+                )
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -917,8 +1101,32 @@ class Scheduler(SchedulerInterface):
             )
             scheduler_output.ec_connector_metadata = ec_meta
 
+        scheduled_phase_summary: dict[str, dict[str, int]] = {}
+        if self._gemma4_scheduler_trace_enabled is True:
+            scheduled_phase_summary = self._gemma4_scheduler_trace_phase_summary(
+                [
+                    *scheduled_new_reqs,
+                    *scheduled_resumed_reqs,
+                    *scheduled_running_reqs,
+                ],
+                scheduler_output.num_scheduled_tokens,
+            )
+
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if self._gemma4_scheduler_trace_enabled is True:
+            self._gemma4_scheduler_trace_emit(
+                trace_started_ns=trace_started_ns,
+                scheduled_new_reqs=scheduled_new_reqs,
+                scheduled_resumed_reqs=scheduled_resumed_reqs,
+                scheduled_running_reqs=scheduled_running_reqs,
+                preempted_reqs=preempted_reqs,
+                scheduler_output=scheduler_output,
+                token_budget_remaining=token_budget,
+                waiting_status_before=waiting_status_before,
+                running_status_before=running_status_before,
+                scheduled_phase_summary=scheduled_phase_summary,
+            )
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1364,6 +1572,15 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            if len(generated_token_ids) > 0:
+                self._emit_p2p_request_milestone_once(
+                    req_id,
+                    "scheduler_output_token_ready",
+                    extra={
+                        "new_token_count": int(len(generated_token_ids)),
+                        "num_tokens_scheduled": int(num_tokens_scheduled),
+                    },
+                )
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -1956,6 +2173,46 @@ class Scheduler(SchedulerInterface):
         """
         self.encoder_cache_manager.reset()
 
+    def _is_p2p_request_timing_enabled(self) -> bool:
+        """Return whether P2P request milestone logging is enabled."""
+
+        return (
+            os.environ.get("VLLM_P2P_NCCL_REQUEST_TIMING", "0") == "1"
+            or os.environ.get("VLLM_P2P_NCCL_TRACE", "0") == "1"
+        )
+
+    def _emit_p2p_request_milestone_once(
+        self,
+        request_id: str,
+        milestone: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit one P2P milestone per request and milestone name."""
+
+        if self._is_p2p_request_timing_enabled() is False:
+            return
+
+        key = (request_id, milestone)
+        if key in self._p2p_request_milestone_once_events:
+            return
+        self._p2p_request_milestone_once_events.add(key)
+
+        payload: dict[str, Any] = {
+            "event": "p2p_request_milestone",
+            "milestone": milestone,
+            "monotonic_ns": time.monotonic_ns(),
+            "rank": -1,
+            "request_id": request_id,
+            "role": "scheduler",
+            "time_ns": time.time_ns(),
+        }
+        if extra is not None:
+            payload.update(extra)
+        logger.info(
+            "P2P NCCL request milestone %s",
+            json.dumps(payload, sort_keys=True),
+        )
+
     def make_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,
@@ -2101,7 +2358,21 @@ class Scheduler(SchedulerInterface):
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
+            self._emit_p2p_request_milestone_once(
+                request.request_id,
+                "scheduler_remote_kv_promote_start",
+                extra={
+                    "num_computed_tokens": int(request.num_computed_tokens),
+                },
+            )
             self._update_waiting_for_remote_kv(request)
+            self._emit_p2p_request_milestone_once(
+                request.request_id,
+                "scheduler_remote_kv_promote_done",
+                extra={
+                    "num_computed_tokens": int(request.num_computed_tokens),
+                },
+            )
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
@@ -2144,6 +2415,13 @@ class Scheduler(SchedulerInterface):
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                self._emit_p2p_request_milestone_once(
+                    req_id,
+                    "scheduler_finished_recving_seen",
+                    extra={
+                        "num_computed_tokens": int(req.num_computed_tokens),
+                    },
+                )
                 self.finished_recving_kv_req_ids.add(req_id)
             else:
                 assert RequestStatus.is_finished(req.status)
@@ -2152,6 +2430,31 @@ class Scheduler(SchedulerInterface):
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
+
+    def _kv_group_block_size(self, group_index: int) -> int:
+        """Get the scheduler KV block size for a KV cache group.
+
+        :param group_index: KV cache group index.
+        :returns: Number of tokens represented by one KV block.
+        """
+
+        if group_index < len(self._kv_group_block_sizes):
+            return self._kv_group_block_sizes[group_index]
+        return self.block_size
+
+    def _aligned_kv_recompute_token_pos(self, token_pos: int) -> int:
+        """Get a token boundary that is safe for all KV cache groups.
+
+        :param token_pos: First token position affected by an invalid KV block.
+        :returns: Earliest whole-block boundary that covers the affected token.
+        """
+
+        if len(self._kv_group_block_sizes) == 0:
+            return token_pos
+        return min(
+            (token_pos // group_block_size) * group_block_size
+            for group_block_size in self._kv_group_block_sizes
+        )
 
     def _update_requests_with_invalid_blocks(
         self,
@@ -2195,33 +2498,45 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
 
-            req_num_computed_blocks = (
-                req_num_computed_tokens + self.block_size - 1
-            ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
-                    continue
+            invalid_ids_by_token_pos: dict[int, set[int]] = {}
+            for group_index, group_block_ids in enumerate(req_block_id_groups):
+                group_block_size = self._kv_group_block_size(group_index)
+                req_num_computed_blocks = (
+                    req_num_computed_tokens + group_block_size - 1
+                ) // group_block_size
+                for idx in range(min(req_num_computed_blocks, len(group_block_ids))):
+                    block_id = group_block_ids[idx]
+                    if block_id not in invalid_block_ids:
+                        continue
+                    token_pos = idx * group_block_size
+                    invalid_ids_by_token_pos.setdefault(token_pos, set()).add(block_id)
 
-                is_affected = True
+            if len(invalid_ids_by_token_pos) == 0:
+                continue
 
-                if block_id in marked_invalid_block_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
+            is_affected = True
+            for token_pos in sorted(invalid_ids_by_token_pos):
+                invalid_ids_at_token_pos = invalid_ids_by_token_pos[token_pos]
+                new_invalid_block_ids = (
+                    invalid_ids_at_token_pos - marked_invalid_block_ids
+                )
+                if len(new_invalid_block_ids) == 0:
+                    # The invalid blocks are shared with a previous request and
+                    # were already marked for recomputation. This request can
+                    # still consider this token position as computed when
+                    # rescheduled.
                     # Currently this only applies to sync loading; Async
                     # loading does not yet support block sharing
                     continue
 
-                marked_invalid_block_ids.add(block_id)
+                marked_invalid_block_ids.update(new_invalid_block_ids)
 
                 if marked_invalid_block:
                     # This request has already marked an invalid block for
@@ -2230,7 +2545,9 @@ class Scheduler(SchedulerInterface):
 
                 marked_invalid_block = True
                 # Truncate the computed tokens at the first failed block
-                request.num_computed_tokens = idx * self.block_size
+                request.num_computed_tokens = (
+                    self._aligned_kv_recompute_token_pos(token_pos)
+                )
                 num_affected_tokens = (
                     req_num_computed_tokens - request.num_computed_tokens
                 )
@@ -2238,7 +2555,12 @@ class Scheduler(SchedulerInterface):
 
                 # collect invalid block and all downstream dependent blocks
                 if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+                    for group_index, group_block_ids in enumerate(req_block_id_groups):
+                        group_block_size = self._kv_group_block_size(group_index)
+                        evict_start_idx = (
+                            request.num_computed_tokens // group_block_size
+                        )
+                        blocks_to_evict.update(group_block_ids[evict_start_idx:])
 
             if is_affected:
                 if not marked_invalid_block:

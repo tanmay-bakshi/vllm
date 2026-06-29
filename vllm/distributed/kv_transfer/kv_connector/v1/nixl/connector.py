@@ -70,6 +70,7 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         if backend.get_name() not in (
             "FLASH_ATTN",
             "FLASHINFER",
+            "FLASHINFER_GEMMA4_TRTLLM_GEN",
             "TRITON_ATTN",
         ):
             return False

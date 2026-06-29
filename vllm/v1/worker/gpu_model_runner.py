@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import json
+import os
 import threading
 import time
 from collections import defaultdict
@@ -439,6 +441,7 @@ class GPUModelRunner(
         self.device = device
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
+        self._p2p_request_milestone_once_events: set[tuple[str, str]] = set()
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
@@ -1725,6 +1728,9 @@ class GPUModelRunner(
         common_indices_match = True
         max_flattened_index = -1
         total_num_spec_tokens = 0
+        draft_token_stride = self.num_spec_tokens
+        if torch.is_tensor(self._draft_token_ids):
+            draft_token_stride = self._draft_token_ids.shape[1]
 
         for cur_index in range(num_reqs):
             prev_index = prev_positions[cur_index]
@@ -1744,7 +1750,13 @@ class GPUModelRunner(
             spec_flattened_indices.extend(
                 range(flattened_index - draft_len + 1, flattened_index + 1)
             )
-            start = prev_index * self.num_spec_tokens
+            start = prev_index * draft_token_stride
+            if draft_len > draft_token_stride:
+                raise RuntimeError(
+                    "Scheduled draft length exceeds previous draft-token "
+                    f"tensor width: draft_len={draft_len}, "
+                    f"draft_token_stride={draft_token_stride}."
+                )
             # prev_draft_token_indices is used to find which draft_tokens_id
             # should be copied to input_ids
             # example: prev draft_tokens_id [[1,2], [3,4], [5, 6]]
@@ -3951,6 +3963,71 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    def _is_p2p_request_timing_enabled(self) -> bool:
+        """Return whether P2P request milestone logging is enabled."""
+
+        return (
+            os.environ.get("VLLM_P2P_NCCL_REQUEST_TIMING", "0") == "1"
+            or os.environ.get("VLLM_P2P_NCCL_TRACE", "0") == "1"
+        )
+
+    def _emit_p2p_request_milestone_once(
+        self,
+        request_id: str,
+        milestone: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit one P2P milestone per request and milestone name."""
+
+        if self._is_p2p_request_timing_enabled() is False:
+            return
+
+        key = (request_id, milestone)
+        if key in self._p2p_request_milestone_once_events:
+            return
+        self._p2p_request_milestone_once_events.add(key)
+
+        payload: dict[str, Any] = {
+            "event": "p2p_request_milestone",
+            "milestone": milestone,
+            "monotonic_ns": time.monotonic_ns(),
+            "rank": int(getattr(self.parallel_config, "data_parallel_rank", 0)),
+            "request_id": request_id,
+            "role": "model_runner",
+            "time_ns": time.time_ns(),
+        }
+        if extra is not None:
+            payload.update(extra)
+        logger.info(
+            "P2P NCCL request milestone %s",
+            json.dumps(payload, sort_keys=True),
+        )
+
+    def _emit_p2p_milestone_for_scheduled_requests(
+        self,
+        scheduler_output: "SchedulerOutput",
+        milestone: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit a milestone for each request in the scheduler step."""
+
+        if self._is_p2p_request_timing_enabled() is False:
+            return
+        for (
+            request_id,
+            scheduled_tokens,
+        ) in scheduler_output.num_scheduled_tokens.items():
+            request_extra: dict[str, Any] = {
+                "num_scheduled_tokens": int(scheduled_tokens),
+            }
+            if extra is not None:
+                request_extra.update(extra)
+            self._emit_p2p_request_milestone_once(
+                request_id,
+                milestone,
+                request_extra,
+            )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4228,12 +4305,29 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            self._emit_p2p_milestone_for_scheduled_requests(
+                scheduler_output,
+                "model_runner_forward_start",
+                extra={
+                    "batch_num_requests": int(num_reqs),
+                    "batch_num_tokens": int(num_tokens_unpadded),
+                    "cudagraph_mode": str(cudagraph_mode),
+                },
+            )
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
+            )
+            self._emit_p2p_milestone_for_scheduled_requests(
+                scheduler_output,
+                "model_runner_forward_end",
+                extra={
+                    "batch_num_requests": int(num_reqs),
+                    "batch_num_tokens": int(num_tokens_unpadded),
+                },
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
@@ -4360,8 +4454,19 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        self._emit_p2p_milestone_for_scheduled_requests(
+            scheduler_output,
+            "model_runner_sample_start",
+        )
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        self._emit_p2p_milestone_for_scheduled_requests(
+            scheduler_output,
+            "model_runner_sample_end",
+            extra={
+                "sampled_request_count": int(sampler_output.sampled_token_ids.shape[0]),
+            },
+        )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4665,7 +4770,8 @@ class GPUModelRunner(
             if not zeros_only:
                 # Trigger async copy of draft token ids to cpu.
                 self.draft_token_ids_copy_stream.wait_stream(default_stream)
-                self.draft_token_ids_cpu[:num_reqs].copy_(
+                draft_token_width = draft_token_ids.shape[1]
+                self.draft_token_ids_cpu[:num_reqs, :draft_token_width].copy_(
                     draft_token_ids, non_blocking=True
                 )
             else:
@@ -4682,7 +4788,13 @@ class GPUModelRunner(
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
         self.draft_token_ids_event.synchronize()
-        return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
+        draft_token_width = self.num_spec_tokens
+        if torch.is_tensor(self._draft_token_ids):
+            draft_token_width = self._draft_token_ids.shape[1]
+        return (
+            self.draft_token_ids_cpu[: len(req_ids), :draft_token_width].tolist(),
+            req_ids,
+        )
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
@@ -6556,8 +6668,21 @@ class GPUModelRunner(
         assert len(self.attn_groups) == 0, "Attention backends are already initialized"
 
         class AttentionGroupKey(NamedTuple):
+            """Deduplication key for attention groups within a KV cache group.
+
+            Splits on per-rank ``num_heads_q`` in addition to backend + spec
+            so layers with different Q-head counts (e.g. a spec-decode draft
+            with fewer attention heads than its target) get separate metadata
+            builders. The builders' scratch (e.g. ``softmax_segm_*`` in
+            ``triton_attn``, ``num_qo_heads`` in FlashInfer) is sized by
+            ``num_heads_q`` and assumes uniformity within the group; see
+            ``get_num_attention_heads_from_layers`` in
+            ``vllm/v1/attention/backends/utils.py``.
+            """
+
             attn_backend: type[AttentionBackend]
             kv_cache_spec: KVCacheSpec
+            num_heads_q: int
 
         def get_attn_backends_for_group(
             kv_cache_group_spec: KVCacheGroupSpec,
@@ -6586,9 +6711,16 @@ class GPUModelRunner(
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
-                key = (full_cls_name, layer_kv_cache_spec)
+                # Non-Attention layer types (e.g. Mamba1, ShortConv) do not
+                # expose ``num_heads``; fall back to 0 so they cluster as
+                # before. Such layers never coexist with Attention in a
+                # single KV cache group (different KVCacheSpec), so the
+                # fallback can never spuriously merge them with attention
+                # layers.
+                num_heads_q = getattr(layers[layer_name], "num_heads", 0)
+                key = (full_cls_name, layer_kv_cache_spec, num_heads_q)
                 attn_backends[key] = AttentionGroupKey(
-                    attn_backend, layer_kv_cache_spec
+                    attn_backend, layer_kv_cache_spec, num_heads_q
                 )
                 attn_backend_layers[key].append(layer_name)
             return (
@@ -6601,11 +6733,11 @@ class GPUModelRunner(
             kv_cache_group_id: int,
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
-            for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
+            for key, layer_names in attn_backends_map.items():
                 attn_group = AttentionGroup(
-                    attn_backend,
+                    key.attn_backend,
                     layer_names,
-                    kv_cache_spec,
+                    key.kv_cache_spec,
                     kv_cache_group_id,
                 )
 

@@ -352,6 +352,11 @@ class NixlConnectorWorker:
                 "is not supported."
             )
         self.nixl_memory_type = nixl_memory_type
+        self.compact_per_request_dlists = (
+            self.kv_transfer_config.get_from_extra_config(
+                "compact_per_request_dlists", True
+            )
+        )
 
         # Note: host xfer buffer ops when use_host_buffer is True
         self.copy_blocks: CopyBlocksOp | None = None
@@ -368,16 +373,24 @@ class NixlConnectorWorker:
 
         # nixl_prepped_dlist_handle.
         self.src_xfer_handles_by_block_size: dict[int, int] = {}
+        self.src_blocks_data_by_block_size: dict[int, list[tuple[int, int, int]]] = {}
         # Populated dynamically during handshake based on remote configuration.
         # Keep track of regions at different tp_ratio values. tp_ratio->handles
         self.src_xfer_handles_by_tp_ratio: dict[int, list[int]] = {}
+        self.src_blocks_data_by_tp_ratio: dict[
+            int, list[list[tuple[int, int, int]]]
+        ] = {}
         # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
         self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
+        self.dst_blocks_data = defaultdict[
+            EngineId, dict[int, list[tuple[int, int, int]]]
+        ](dict)
 
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
         self.dst_num_blocks: dict[EngineId, int] = {}
         self._registered_descs: list[Any] = []
+        self._compact_xfer_dlist_handles: dict[int, tuple[Any, ...]] = {}
 
         # In progress transfers.
         # [req_id -> list[handle]]
@@ -850,10 +863,22 @@ class NixlConnectorWorker:
             # However, physical page_size may differ when kernel requires a specific
             # block size. This leads to SSM and FA layers having different num_blocks.
             # `_physical_blocks_per_logical_kv_block` ratio is used to adjust for this.
-            layer_spec = self._layer_specs[layer_name]
+            spec_layer_name = layer_name
+            layer_spec = self._layer_specs.get(layer_name)
+            if layer_spec is None:
+                for candidate_name, candidate_cache in xfer_buffers.items():
+                    if (
+                        candidate_cache is cache_or_caches
+                        and candidate_name in self._layer_specs
+                    ):
+                        spec_layer_name = candidate_name
+                        layer_spec = self._layer_specs[candidate_name]
+                        break
+            if layer_spec is None:
+                raise KeyError(layer_name)
             if isinstance(layer_spec, UniformTypeKVCacheSpecs):
                 # MLA DSv32 Indexer case: UniformTypeKVCacheSpecs merges kv_cache_specs
-                layer_spec = layer_spec.kv_cache_specs[layer_name]
+                layer_spec = layer_spec.kv_cache_specs[spec_layer_name]
             cache_list = self.transfer_topo.get_transfer_cache_regions(
                 cache_or_caches, layer_spec
             )
@@ -981,9 +1006,12 @@ class NixlConnectorWorker:
             )
 
         # Register local/src descr for NIXL xfer.
-        self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
-            self.register_local_xfer_handler(self.block_size)
+        local_xfer_handle, local_blocks_data = self.register_local_xfer_handler(
+            self.block_size
         )
+        self.src_xfer_handles_by_block_size[self.block_size] = local_xfer_handle
+        self.src_blocks_data_by_block_size[self.block_size] = local_blocks_data
+        self.src_blocks_data = local_blocks_data
 
         # After KV Caches registered, listen for new connections.
         agent_metadata = NixlAgentMetadata(
@@ -1351,6 +1379,7 @@ class NixlConnectorWorker:
             # Logically "split" own regions into |tp_ratio| chunks. Mind that
             # we only do this once per remote tp_size (replica-friendly).
             self.src_xfer_handles_by_tp_ratio[tp_ratio] = []
+            self.src_blocks_data_by_tp_ratio[tp_ratio] = []
 
             for handle_data in self._build_local_splits_from_plan(
                 plan,
@@ -1362,6 +1391,7 @@ class NixlConnectorWorker:
                 )
                 handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
                 self.src_xfer_handles_by_tp_ratio[tp_ratio].append(handle)
+                self.src_blocks_data_by_tp_ratio[tp_ratio].append(handle_data)
 
         ### Register remote agent memory regions
         # With homogeneous TP, D pulls the whole kv cache from corresponding rank. With
@@ -1398,6 +1428,7 @@ class NixlConnectorWorker:
 
         # Register with NIXL.
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+        self.dst_blocks_data[engine_id][remote_tp_rank] = blocks_data
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
         )
@@ -1405,8 +1436,14 @@ class NixlConnectorWorker:
         if block_size_ratio > 1:
             # when prefill with smaller block_size, we need to init a
             # new handler with same block_len to match
+            local_xfer_handle, local_blocks_data = self.register_local_xfer_handler(
+                nixl_agent_meta.block_size
+            )
             self.src_xfer_handles_by_block_size[nixl_agent_meta.block_size] = (
-                self.register_local_xfer_handler(nixl_agent_meta.block_size)[0]
+                local_xfer_handle
+            )
+            self.src_blocks_data_by_block_size[nixl_agent_meta.block_size] = (
+                local_blocks_data
             )
 
         return remote_agent_name
@@ -1865,7 +1902,162 @@ class NixlConnectorWorker:
                     new_expiry,
                 )
 
-    def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
+    def _release_compact_xfer_dlists(self, handle: TransferHandle) -> None:
+        """Release per-request descriptor-list handles attached to a transfer."""
+
+        side_handles = self._compact_xfer_dlist_handles.pop(id(handle), None)
+        if side_handles is None:
+            return
+        for side_handle in side_handles:
+            self.nixl_wrapper.release_dlist_handle(side_handle)
+
+    def _release_dlist_handles(self, side_handles: tuple[Any, ...]) -> None:
+        """Release descriptor-list handles that were not attached to a transfer."""
+
+        for side_handle in side_handles:
+            self.nixl_wrapper.release_dlist_handle(side_handle)
+
+    @staticmethod
+    def _append_coalesced_descriptor_pair(
+        local_result: list[tuple[int, int, int]],
+        remote_result: list[tuple[int, int, int]],
+        local_desc: tuple[int, int, int],
+        remote_desc: tuple[int, int, int],
+    ) -> None:
+        """Append a descriptor pair, merging adjacent local and remote ranges."""
+
+        if len(local_result) == 0:
+            local_result.append(local_desc)
+            remote_result.append(remote_desc)
+            return
+
+        last_local_addr, last_local_len, last_local_dev = local_result[-1]
+        last_remote_addr, last_remote_len, last_remote_dev = remote_result[-1]
+        local_addr, local_len, local_dev = local_desc
+        remote_addr, remote_len, remote_dev = remote_desc
+        can_merge = (
+            last_local_addr + last_local_len == local_addr
+            and last_remote_addr + last_remote_len == remote_addr
+            and last_local_dev == local_dev
+            and last_remote_dev == remote_dev
+        )
+        if can_merge is False:
+            local_result.append(local_desc)
+            remote_result.append(remote_desc)
+            return
+
+        local_result[-1] = (
+            last_local_addr,
+            last_local_len + local_len,
+            last_local_dev,
+        )
+        remote_result[-1] = (
+            last_remote_addr,
+            last_remote_len + remote_len,
+            last_remote_dev,
+        )
+
+    def _compact_homogeneous_blocks_first_data(
+        self,
+        local_block_descs_ids: np.ndarray,
+        remote_block_descs_ids: np.ndarray,
+        local_blocks_data: list[tuple[int, int, int]],
+        remote_blocks_data: list[tuple[int, int, int]],
+        local_desc_num_blocks: int,
+        remote_desc_num_blocks: int,
+    ) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]] | None:
+        """Build full-page descriptors for homogeneous blocks-first transfers."""
+
+        assert self.transfer_topo is not None
+        if self.transfer_topo.is_kv_layout_blocks_first is False:
+            return None
+        if self.num_regions % 2 != 0:
+            return None
+
+        pair_to_position: dict[tuple[int, int], int] = {}
+        for position, (local_desc_id, remote_desc_id) in enumerate(
+            zip(local_block_descs_ids, remote_block_descs_ids, strict=True)
+        ):
+            pair_to_position[(int(local_desc_id), int(remote_desc_id))] = position
+
+        skipped_positions: set[int] = set()
+        local_result: list[tuple[int, int, int]] = []
+        remote_result: list[tuple[int, int, int]] = []
+
+        for position, (local_desc_id_raw, remote_desc_id_raw) in enumerate(
+            zip(local_block_descs_ids, remote_block_descs_ids, strict=True)
+        ):
+            if position in skipped_positions:
+                continue
+
+            local_desc_id = int(local_desc_id_raw)
+            remote_desc_id = int(remote_desc_id_raw)
+            local_region = local_desc_id // local_desc_num_blocks
+            local_block = local_desc_id % local_desc_num_blocks
+            remote_region = remote_desc_id // remote_desc_num_blocks
+            remote_block = remote_desc_id % remote_desc_num_blocks
+
+            can_pair_kv = (
+                local_region < self.num_regions
+                and remote_region < self.num_regions
+                and local_region % 2 == 0
+                and remote_region % 2 == 0
+                and local_region + 1 < self.num_regions
+                and remote_region + 1 < self.num_regions
+            )
+            if can_pair_kv is True:
+                local_v_desc_id = (
+                    (local_region + 1) * local_desc_num_blocks + local_block
+                )
+                remote_v_desc_id = (
+                    (remote_region + 1) * remote_desc_num_blocks + remote_block
+                )
+                v_position = pair_to_position.get(
+                    (local_v_desc_id, remote_v_desc_id)
+                )
+                if v_position is not None and v_position not in skipped_positions:
+                    local_k = local_blocks_data[local_desc_id]
+                    local_v = local_blocks_data[local_v_desc_id]
+                    remote_k = remote_blocks_data[remote_desc_id]
+                    remote_v = remote_blocks_data[remote_v_desc_id]
+                    local_contiguous = (
+                        local_k[0] + local_k[1] == local_v[0]
+                        and local_k[2] == local_v[2]
+                    )
+                    remote_contiguous = (
+                        remote_k[0] + remote_k[1] == remote_v[0]
+                        and remote_k[2] == remote_v[2]
+                    )
+                    same_lengths = (
+                        local_k[1] == remote_k[1]
+                        and local_v[1] == remote_v[1]
+                    )
+                    if (
+                        local_contiguous is True
+                        and remote_contiguous is True
+                        and same_lengths is True
+                    ):
+                        self._append_coalesced_descriptor_pair(
+                            local_result,
+                            remote_result,
+                            (local_k[0], local_k[1] + local_v[1], local_k[2]),
+                            (remote_k[0], remote_k[1] + remote_v[1], remote_k[2]),
+                        )
+                        skipped_positions.add(v_position)
+                        continue
+
+            self._append_coalesced_descriptor_pair(
+                local_result,
+                remote_result,
+                local_blocks_data[local_desc_id],
+                remote_blocks_data[remote_desc_id],
+            )
+
+        return local_result, remote_result
+
+    def _pop_done_transfers(
+        self, transfers: dict[str, list[TransferHandle]]
+    ) -> set[str]:
         """
         Pop completed xfers by checking for DONE state.
         Args:
@@ -1884,6 +2076,7 @@ class NixlConnectorWorker:
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
                         self.nixl_wrapper.release_xfer_handle(handle)
+                        self._release_compact_xfer_dlists(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
                         continue
@@ -1928,6 +2121,7 @@ class NixlConnectorWorker:
         self._failed_recv_reqs.put(req_id)
         if handle is not None:
             self.nixl_wrapper.release_xfer_handle(handle)
+            self._release_compact_xfer_dlists(handle)
         self.xfer_stats.record_failed_transfer()
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
@@ -2073,15 +2267,22 @@ class NixlConnectorWorker:
                 # Remote tp_size > local tp_size: we must perform multiple
                 # reads. Get the memory chunk onto which we will write to.
                 local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[tp_ratio][i]
+                local_blocks_data = self.src_blocks_data_by_tp_ratio[tp_ratio][i]
             else:
                 # Single read from remote, we write to the whole memory region.
                 # Also handle remote block size different from local block size.
                 local_xfer_side_handle = self.src_xfer_handles_by_block_size[
                     remote_block_size
                 ]
+                local_blocks_data = self.src_blocks_data_by_block_size[
+                    remote_block_size
+                ]
 
             # Destination handle: remote_engine_id -> remote_rank -> handle.
             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
+                spec.remote_rank
+            ]
+            remote_blocks_data = self.dst_blocks_data[meta.remote.engine_id][
                 spec.remote_rank
             ]
 
@@ -2092,6 +2293,8 @@ class NixlConnectorWorker:
                 remote_request_id=meta.remote.request_id,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
+                local_blocks_data=local_blocks_data,
+                remote_blocks_data=remote_blocks_data,
             )
 
         if self.use_mla and tp_ratio < 0 and read_specs:
@@ -2111,6 +2314,8 @@ class NixlConnectorWorker:
         remote_request_id: str,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
+        local_blocks_data: list[tuple[int, int, int]],
+        remote_blocks_data: list[tuple[int, int, int]],
     ):
         """
         Post a READ point-to-point xfer request from a single local worker to
@@ -2216,7 +2421,59 @@ class NixlConnectorWorker:
 
         # Prepare transfer with Nixl.
         handle = None
+        compact_dlist_handles: tuple[Any, ...] | None = None
         try:
+            if self.compact_per_request_dlists is True:
+                local_desc_num_blocks = self.dst_num_blocks[self.engine_id]
+                if block_size_ratio is not None:
+                    local_desc_num_blocks = int(
+                        local_desc_num_blocks * block_size_ratio
+                    )
+                remote_desc_num_blocks = self.dst_num_blocks[dst_engine_id]
+                compacted_data = None
+                if self.transfer_topo.tp_ratio(remote_info.remote_tp_size) == 1:
+                    compacted_data = self._compact_homogeneous_blocks_first_data(
+                        local_block_descs_ids=local_block_descs_ids,
+                        remote_block_descs_ids=remote_block_descs_ids,
+                        local_blocks_data=local_blocks_data,
+                        remote_blocks_data=remote_blocks_data,
+                        local_desc_num_blocks=local_desc_num_blocks,
+                        remote_desc_num_blocks=remote_desc_num_blocks,
+                    )
+                if compacted_data is None:
+                    local_xfer_data = [
+                        local_blocks_data[int(desc_id)]
+                        for desc_id in local_block_descs_ids
+                    ]
+                    remote_xfer_data = [
+                        remote_blocks_data[int(desc_id)]
+                        for desc_id in remote_block_descs_ids
+                    ]
+                else:
+                    local_xfer_data, remote_xfer_data = compacted_data
+                local_descs = self.nixl_wrapper.get_xfer_descs(
+                    local_xfer_data, self.nixl_memory_type
+                )
+                remote_descs = self.nixl_wrapper.get_xfer_descs(
+                    remote_xfer_data, self.nixl_memory_type
+                )
+                local_xfer_side_handle = self.nixl_wrapper.prep_xfer_dlist(
+                    "NIXL_INIT_AGENT", local_descs
+                )
+                remote_xfer_side_handle = self.nixl_wrapper.prep_xfer_dlist(
+                    self._remote_agents[dst_engine_id][remote_rank], remote_descs
+                )
+                compact_dlist_handles = (
+                    local_xfer_side_handle,
+                    remote_xfer_side_handle,
+                )
+                local_block_descs_ids = np.arange(
+                    len(local_xfer_data), dtype=np.int64
+                )
+                remote_block_descs_ids = np.arange(
+                    len(remote_xfer_data), dtype=np.int64
+                )
+
             handle = self.nixl_wrapper.make_prepped_xfer(
                 "READ",
                 local_xfer_side_handle,
@@ -2225,6 +2482,8 @@ class NixlConnectorWorker:
                 remote_block_descs_ids,
                 notif_msg=notif_id,
             )
+            if compact_dlist_handles is not None:
+                self._compact_xfer_dlist_handles[id(handle)] = compact_dlist_handles
 
             # Begin async xfer.
             self.nixl_wrapper.transfer(handle)
@@ -2241,6 +2500,8 @@ class NixlConnectorWorker:
                 dst_engine_id=dst_engine_id,
                 remote_rank=remote_rank,
             )
+            if compact_dlist_handles is not None and handle is None:
+                self._release_dlist_handles(compact_dlist_handles)
             self._handle_failed_transfer(request_id, handle)
 
     def get_mapped_blocks(
@@ -2462,18 +2723,25 @@ class NixlConnectorWorker:
         for handles in self._recving_transfers.values():
             for handle in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
+                self._release_compact_xfer_dlists(handle)
         self._recving_transfers.clear()
+        for side_handles in self._compact_xfer_dlist_handles.values():
+            self._release_dlist_handles(side_handles)
+        self._compact_xfer_dlist_handles.clear()
         for handle in self.src_xfer_handles_by_block_size.values():
             self.nixl_wrapper.release_dlist_handle(handle)
         self.src_xfer_handles_by_block_size.clear()
+        self.src_blocks_data_by_block_size.clear()
         for handles in self.src_xfer_handles_by_tp_ratio.values():
             for handle in handles:
                 self.nixl_wrapper.release_dlist_handle(handle)
         self.src_xfer_handles_by_tp_ratio.clear()
+        self.src_blocks_data_by_tp_ratio.clear()
         for dst_xfer_side_handles in self.dst_xfer_side_handles.values():
             for dst_xfer_side_handle in dst_xfer_side_handles.values():
                 self.nixl_wrapper.release_dlist_handle(dst_xfer_side_handle)
         self.dst_xfer_side_handles.clear()
+        self.dst_blocks_data.clear()
         for remote_agents in self._remote_agents.values():
             for agent_name in remote_agents.values():
                 self.nixl_wrapper.remove_remote_agent(agent_name)
