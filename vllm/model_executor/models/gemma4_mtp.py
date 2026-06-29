@@ -47,7 +47,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
-from .gemma4 import Gemma4MLP, _get_text_config
+from .gemma4 import (
+    Gemma4MLP,
+    _get_gemma4_text_attn_backend,
+    _get_text_config,
+)
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -228,6 +232,7 @@ class Gemma4MTPAttention(nn.Module):
             quant_config=quant_config,
             logits_soft_cap=attn_logits_soft_cap,
             per_layer_sliding_window=sliding_window,
+            attn_backend=_get_gemma4_text_attn_backend(config),
             prefix=f"{prefix}.attn",
         )
 
@@ -278,7 +283,6 @@ class Gemma4MTPDecoderLayer(nn.Module):
             if is_full_attention
             else config.head_dim
         )
-
         use_k_eq_v = is_full_attention and getattr(config, "attention_k_eq_v", False)
         if use_k_eq_v:
             num_kv_heads = getattr(

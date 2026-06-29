@@ -189,19 +189,157 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
 
 class Gemma4Config(VerifyAndUpdateConfig):
     @staticmethod
+    def _get_quantization_config(hf_config: "PretrainedConfig") -> dict | None:
+        """Return the Gemma4 quantization config when present.
+
+        :param hf_config: Hugging Face model configuration.
+        :returns: Quantization configuration dictionary when available.
+        """
+
+        quantization_config = getattr(hf_config, "quantization_config", None)
+        if isinstance(quantization_config, dict):
+            return quantization_config
+
+        text_config = getattr(hf_config, "text_config", None)
+        if text_config is None:
+            return None
+        text_quantization_config = getattr(text_config, "quantization_config", None)
+        if isinstance(text_quantization_config, dict):
+            return text_quantization_config
+        return None
+
+    @staticmethod
+    def _uses_modelopt_fp8_kv(vllm_config: "VllmConfig") -> bool:
+        """Return whether the checkpoint resolves Gemma4 attention to FP8 KV.
+
+        :param vllm_config: Active vLLM configuration.
+        :returns: ``True`` when the ModelOpt checkpoint declares FP8 KV cache.
+        """
+
+        quantization_config = Gemma4Config._get_quantization_config(
+            vllm_config.model_config.hf_config
+        )
+        if quantization_config is None:
+            return False
+        if quantization_config.get("quant_method") != "modelopt":
+            return False
+        kv_cache_scheme = quantization_config.get("kv_cache_scheme")
+        if isinstance(kv_cache_scheme, dict) is False:
+            return False
+        return (
+            kv_cache_scheme.get("type") == "float"
+            and kv_cache_scheme.get("num_bits") == 8
+        )
+
+    @staticmethod
+    def _local_head_counts_are_trtllm_compatible(
+        total_num_heads: int,
+        total_num_kv_heads: int,
+        tensor_parallel_size: int,
+    ) -> bool:
+        """Return whether local query/KV heads satisfy TRTLLM GQA.
+
+        :param total_num_heads: Global query head count.
+        :param total_num_kv_heads: Global KV head count for one layer group.
+        :param tensor_parallel_size: Tensor parallel world size.
+        :returns: ``True`` when local heads can use TRTLLM attention.
+        """
+
+        if total_num_heads <= 0 or total_num_kv_heads <= 0:
+            return False
+        if total_num_heads % tensor_parallel_size != 0:
+            return False
+        if total_num_kv_heads >= tensor_parallel_size:
+            if total_num_kv_heads % tensor_parallel_size != 0:
+                return False
+        elif tensor_parallel_size % total_num_kv_heads != 0:
+            return False
+
+        local_num_heads = total_num_heads // tensor_parallel_size
+        local_num_kv_heads = max(1, total_num_kv_heads // tensor_parallel_size)
+        return local_num_heads % local_num_kv_heads == 0
+
+    @staticmethod
+    def _gemma4_trtllm_gen_rejection_reasons(vllm_config: "VllmConfig") -> list[str]:
+        """Return reasons the Gemma4 TRTLLM-GEN backend cannot be selected.
+
+        :param vllm_config: Active vLLM configuration.
+        :returns: Rejection reasons. An empty list means the backend can be selected.
+        """
+
+        reasons: list[str] = []
+        hf_text_config = vllm_config.model_config.hf_text_config
+        cache_config = vllm_config.cache_config
+        attention_config = vllm_config.attention_config
+        parallel_config = vllm_config.parallel_config
+
+        if cache_config is None:
+            reasons.append("cache config is not available")
+            return reasons
+        if Gemma4Config._uses_modelopt_fp8_kv(vllm_config) is False:
+            reasons.append("checkpoint does not declare ModelOpt FP8 KV cache")
+        if cache_config.cache_dtype not in ("auto", "fp8", "fp8_e4m3"):
+            reasons.append(f"cache dtype is {cache_config.cache_dtype}")
+        skip_layers = cache_config.kv_cache_dtype_skip_layers
+        if skip_layers is not None and len(skip_layers) > 0:
+            reasons.append("kv_cache_dtype_skip_layers is not supported")
+        if attention_config.disable_flashinfer_q_quantization:
+            reasons.append("disable_flashinfer_q_quantization is enabled")
+        if attention_config.use_trtllm_attention is False:
+            reasons.append("use_trtllm_attention is explicitly disabled")
+        if parallel_config.decode_context_parallel_size > 1:
+            reasons.append("decode context parallelism is not supported")
+        if vllm_config.use_v2_model_runner:
+            reasons.append("V2 model runner grouping is not enabled for this backend")
+
+        total_num_heads = getattr(hf_text_config, "num_attention_heads", 0)
+        sliding_num_kv_heads = getattr(hf_text_config, "num_key_value_heads", 0)
+        full_num_kv_heads = (
+            getattr(hf_text_config, "num_global_key_value_heads", sliding_num_kv_heads)
+            if getattr(hf_text_config, "attention_k_eq_v", False)
+            else sliding_num_kv_heads
+        )
+        for name, total_num_kv_heads in (
+            ("sliding", sliding_num_kv_heads),
+            ("full", full_num_kv_heads),
+        ):
+            if (
+                Gemma4Config._local_head_counts_are_trtllm_compatible(
+                    total_num_heads,
+                    total_num_kv_heads,
+                    parallel_config.tensor_parallel_size,
+                )
+                is False
+            ):
+                reasons.append(f"{name} attention local GQA is not TRTLLM-compatible")
+
+        from vllm import envs
+        from vllm.utils.flashinfer import supports_trtllm_attention
+
+        if envs.VLLM_BATCH_INVARIANT:
+            reasons.append("VLLM_BATCH_INVARIANT is enabled")
+        if supports_trtllm_attention() is False:
+            reasons.append("FlashInfer TRTLLM attention support is unavailable")
+        return reasons
+
+    @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        """Configure attention for heterogeneous head dimensions.
+        """Configure Gemma4 attention for heterogeneous head dimensions.
 
-        Gemma4 uses different head dimensions for sliding window
-        (head_dim) vs full attention (global_head_dim) layers. The
-        default FA3 on Hopper cannot handle head_dim > 256, which
-        causes mixed backend selection and numerical divergence.
+        Gemma4 uses different head dimensions for sliding window (head_dim)
+        vs full attention (global_head_dim) layers. Mixing attention kernels
+        across those layers causes numerical divergence, so a single uniform
+        path is selected for the whole model.
 
-        When FA4 is available we force it for ALL layers, giving a
-        uniform kernel path and avoiding the mixed FA3+FA4 penalty.
-        When FA4 is not available we fall back to Triton.
+        When the checkpoint and runtime are compatible (e.g. a ModelOpt FP8 KV
+        checkpoint on Blackwell), text attention uses the Gemma4 FlashInfer
+        TRTLLM-GEN override while non-text attention stays on TRITON_ATTN.
+        Otherwise FA4 is forced for all layers when available (giving a uniform
+        kernel path and avoiding the mixed FA3/FA4 penalty), falling back to
+        TRITON_ATTN when FA4 is not available.
         """
         hf_text_config = vllm_config.model_config.hf_text_config
+        setattr(hf_text_config, "use_flashinfer_trtllm_gen_attention", False)
         head_dim = getattr(hf_text_config, "head_dim", None)
         global_head_dim = getattr(hf_text_config, "global_head_dim", None)
 
@@ -212,6 +350,34 @@ class Gemma4Config(VerifyAndUpdateConfig):
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         max_head_dim = max(head_dim, global_head_dim)
+
+        if vllm_config.attention_config.backend is None:
+            rejection_reasons = Gemma4Config._gemma4_trtllm_gen_rejection_reasons(
+                vllm_config
+            )
+            if len(rejection_reasons) == 0:
+                from vllm.v1.attention.backends.utils import set_kv_cache_layout
+
+                setattr(hf_text_config, "use_flashinfer_trtllm_gen_attention", True)
+                set_kv_cache_layout("HND")
+                vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+                logger.info(
+                    "Gemma4 model has heterogeneous head dimensions "
+                    "(head_dim=%d, global_head_dim=%d). Using "
+                    "FLASHINFER_GEMMA4_TRTLLM_GEN for text attention and "
+                    "TRITON_ATTN for non-text attention with HND KV cache "
+                    "layout.",
+                    head_dim,
+                    global_head_dim,
+                )
+                return
+
+            logger.info(
+                "Gemma4 FLASHINFER_GEMMA4_TRTLLM_GEN backend unavailable; "
+                "falling back to FA4/TRITON_ATTN selection. Rejection "
+                "reasons: %s.",
+                "; ".join(rejection_reasons),
+            )
 
         if is_fa_version_supported(4) and max_head_dim <= 512:
             if (

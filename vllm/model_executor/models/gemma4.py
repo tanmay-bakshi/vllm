@@ -21,6 +21,7 @@
 from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
+from typing import TYPE_CHECKING
 
 import regex as re
 import torch
@@ -83,6 +84,29 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backend import AttentionBackend
+
+
+def _get_gemma4_text_attn_backend(
+    config: object,
+) -> type["AttentionBackend"] | None:
+    """Return the explicit backend for Gemma4 text attention.
+
+    :param config: Gemma4 text model configuration.
+    :returns: Attention backend class when a text-specific override is enabled.
+    """
+
+    if getattr(config, "use_flashinfer_trtllm_gen_attention", False) is not True:
+        return None
+
+    logger.info_once("Using Gemma4 FlashInfer TRTLLM-GEN for text attention.")
+    from vllm.v1.attention.backends.gemma4_flashinfer_trtllm_gen import (
+        Gemma4FlashInferTRTLLMGenBackend,
+    )
+
+    return Gemma4FlashInferTRTLLMGenBackend
 
 
 def _remap_gemma4_expert_weight_name(name: str) -> str:
@@ -499,6 +523,7 @@ class Gemma4Attention(nn.Module):
             logits_soft_cap=attn_logits_soft_cap,
             per_layer_sliding_window=sliding_window,
             kv_sharing_target_layer_name=kv_sharing_target_layer_name,
+            attn_backend=_get_gemma4_text_attn_backend(config),
             prefix=f"{prefix}.attn",
         )
 
@@ -1705,6 +1730,8 @@ class Gemma4ForCausalLM(
         skip = [
             "audio_tower.",
             "vision_tower.",
+            "audio_embedder.",
+            "vision_embedder.",
             "embed_audio.",
             "embed_vision.",
         ]
