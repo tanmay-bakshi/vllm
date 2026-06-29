@@ -4,6 +4,7 @@
 import asyncio
 import io
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -120,6 +121,9 @@ class OpenAIServingChat(OpenAIServing):
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
         self.enable_log_outputs = enable_log_outputs
         self.enable_log_deltas = enable_log_deltas
+        self.gemma4_request_trace_enabled = (
+            os.environ.get("VLLM_GEMMA4_REQUEST_TRACE", "0") == "1"
+        )
 
         # set up reasoning parser
         self.reasoning_parser_cls = ParserManager.get_reasoning_parser(
@@ -176,6 +180,34 @@ class OpenAIServingChat(OpenAIServing):
         # Please use the Responses API instead.
         self.supports_code_interpreter = False
         self.python_tool = None
+
+    def _log_gemma4_request_trace(
+        self,
+        event: str,
+        request_id: str,
+        started: float,
+        extra: dict[str, Any],
+    ) -> None:
+        """Log request timing trace data when enabled.
+
+        :param event: Trace event name.
+        :param request_id: vLLM request id.
+        :param started: Monotonic start timestamp.
+        :param extra: Additional JSON-safe metadata.
+        """
+
+        if self.gemma4_request_trace_enabled is False:
+            return
+        payload = {
+            "event": event,
+            "request_id": request_id,
+            "elapsed_seconds": time.perf_counter() - started,
+        }
+        payload.update(extra)
+        logger.info(
+            "GEMMA4 request trace %s",
+            json.dumps(payload, sort_keys=True),
+        )
 
     def warmup(self) -> None:
         self.renderer.warmup(
@@ -246,6 +278,10 @@ class OpenAIServingChat(OpenAIServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        trace_started = time.perf_counter()
+        request_id = (
+            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+        )
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -257,14 +293,20 @@ class OpenAIServingChat(OpenAIServing):
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
             )
         result = await self.render_chat_request(request)
+        render_finished = time.perf_counter()
         if isinstance(result, ErrorResponse):
+            self._log_gemma4_request_trace(
+                "chat_render_error",
+                request_id,
+                trace_started,
+                {
+                    "render_seconds": render_finished - trace_started,
+                    "stream": request.stream is True,
+                },
+            )
             return result
 
         conversation, engine_inputs = result
-
-        request_id = (
-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
-        )
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
@@ -280,8 +322,12 @@ class OpenAIServingChat(OpenAIServing):
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[RequestOutput, None]] = []
+        trace_prompt_tokens: int | None = None
+        trace_max_tokens: int | None = None
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
+            if prompt_token_ids is not None:
+                trace_prompt_tokens = len(prompt_token_ids)
 
             # If we are creating sub requests for multiple prompts, ensure that they
             # have unique request ids.
@@ -299,6 +345,7 @@ class OpenAIServingChat(OpenAIServing):
                 self.override_max_tokens,
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
             )
+            trace_max_tokens = max_tokens
 
             sampling_params: SamplingParams | BeamSearchParams
             if request.use_beam_search:
@@ -367,6 +414,21 @@ class OpenAIServingChat(OpenAIServing):
 
         assert len(generators) == 1
         (result_generator,) = generators
+        setup_finished = time.perf_counter()
+        self._log_gemma4_request_trace(
+            "chat_engine_request_created",
+            request_id,
+            trace_started,
+            {
+                "render_seconds": render_finished - trace_started,
+                "setup_seconds": setup_finished - render_finished,
+                "stream": request.stream is True,
+                "use_beam_search": request.use_beam_search is True,
+                "kv_transfer_params_present": request.kv_transfer_params is not None,
+                "prompt_tokens": trace_prompt_tokens,
+                "max_tokens": trace_max_tokens,
+            },
+        )
 
         if request.stream:
             return self.chat_completion_stream_generator(
@@ -874,10 +936,25 @@ class OpenAIServingChat(OpenAIServing):
 
                             # check to see if there's anything left to stream
                             remaining_call = expected_call.replace(actual_call, "", 1)
-                            # set that as a delta message
-                            delta_message = self._create_remaining_args_delta(
-                                delta_message, remaining_call, index
-                            )
+                            if len(remaining_call) > 0:
+                                remaining_delta = self._create_remaining_args_delta(
+                                    delta_message, remaining_call, index
+                                )
+                                if len(delta_message.tool_calls) <= 1:
+                                    delta_message = remaining_delta
+                                else:
+                                    replacement = remaining_delta.tool_calls[0]
+                                    replaced = False
+                                    tool_calls = []
+                                    for tool_call in delta_message.tool_calls:
+                                        if tool_call.index == index:
+                                            tool_calls.append(replacement)
+                                            replaced = True
+                                        else:
+                                            tool_calls.append(tool_call)
+                                    if not replaced:
+                                        tool_calls.append(replacement)
+                                    delta_message.tool_calls = tool_calls
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
@@ -1016,13 +1093,20 @@ class OpenAIServingChat(OpenAIServing):
     ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
+        engine_wait_started = time.perf_counter()
+        first_engine_output_seconds: float | None = None
 
         try:
             async for res in result_generator:
+                if first_engine_output_seconds is None:
+                    first_engine_output_seconds = (
+                        time.perf_counter() - engine_wait_started
+                    )
                 final_res = res
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
 
+        engine_finished = time.perf_counter()
         if final_res is None:
             return self.create_error_response(
                 "No output received from the engine.",
@@ -1404,6 +1488,22 @@ class OpenAIServingChat(OpenAIServing):
             ),
             prompt_text=prompt_text,
             kv_transfer_params=final_res.kv_transfer_params,
+        )
+        response_created = time.perf_counter()
+        self._log_gemma4_request_trace(
+            "chat_full_response_complete",
+            request_id,
+            engine_wait_started,
+            {
+                "engine_wait_seconds": engine_finished - engine_wait_started,
+                "first_engine_output_seconds": first_engine_output_seconds,
+                "response_assembly_seconds": response_created - engine_finished,
+                "prompt_tokens": num_prompt_tokens,
+                "completion_tokens": num_generated_tokens,
+                "choice_count": len(choices),
+                "finish_reasons": [choice.finish_reason for choice in choices],
+                "kv_transfer_params_present": final_res.kv_transfer_params is not None,
+            },
         )
 
         # Log complete response if output logging is enabled

@@ -578,6 +578,14 @@ class Gemma4ToolParser(ToolParser):
                 return DeltaMessage(content=text)
         return None
 
+    def _ensure_tool_state(self, tool_id: int) -> None:
+        """Ensure streaming state exists for ``tool_id``."""
+        while len(self.prev_tool_call_arr) <= tool_id:
+            self.prev_tool_call_arr.append({})
+            self.streamed_args_for_tool.append("")
+        if self.current_tool_id < tool_id:
+            self.current_tool_id = tool_id
+
     def _extract_partial_call(self, current_text: str) -> tuple[str | None, str]:
         """Extract function name and raw argument string from partial text.
 
@@ -620,6 +628,17 @@ class Gemma4ToolParser(ToolParser):
         diffs against the previously-streamed JSON to emit only the new
         fragment.
         """
+        active_tool_id = current_text.count(self.tool_call_start_token) - 1
+        if active_tool_id < 0:
+            return None
+        previous_tool_id = self.current_tool_id
+        self._ensure_tool_state(active_tool_id)
+        if previous_tool_id != active_tool_id:
+            self.current_tool_id = active_tool_id
+            self.current_tool_name_sent = (
+                "name" in self.prev_tool_call_arr[self.current_tool_id]
+            )
+
         func_name, args_part = self._extract_partial_call(current_text)
 
         if func_name is None:
@@ -658,38 +677,46 @@ class Gemma4ToolParser(ToolParser):
         Performs a final parse of the complete tool call and flushes
         any remaining un-streamed argument fragments.
         """
-        if self.current_tool_id < 0 or self.current_tool_id >= len(
-            self.prev_tool_call_arr
-        ):
-            logger.debug(
-                "Tool call end detected but no active tool call (current_tool_id=%d)",
-                self.current_tool_id,
-            )
-            return None
-
-        # Parse the complete tool call using regex for accuracy
+        tool_call_deltas: list[DeltaToolCall] = []
         all_matches = self.tool_call_regex.findall(current_text)
-        if self.current_tool_id < len(all_matches):
-            _, args_str = all_matches[self.current_tool_id]
+        for tool_id, (func_name, args_str) in enumerate(all_matches):
+            self._ensure_tool_state(tool_id)
+            tool_state = self.prev_tool_call_arr[tool_id]
             final_args = _parse_gemma4_args(args_str)
             final_args_json = json.dumps(final_args, ensure_ascii=False)
+            prev_streamed = self.streamed_args_for_tool[tool_id]
+            already_named = tool_state.get("name") == func_name
 
-            prev_streamed = self.streamed_args_for_tool[self.current_tool_id]
-            if len(final_args_json) > len(prev_streamed):
+            if final_args_json.startswith(prev_streamed):
                 diff = final_args_json[len(prev_streamed) :]
-                self.streamed_args_for_tool[self.current_tool_id] = final_args_json
-                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = final_args
+            else:
+                prefix = find_common_prefix(prev_streamed, final_args_json)
+                self.streamed_args_for_tool[tool_id] = prefix
+                diff = final_args_json[len(prefix) :]
 
-                return DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_id,
-                            function=DeltaFunctionCall(arguments=diff).model_dump(
-                                exclude_none=True
-                            ),
-                        )
-                    ]
+            if already_named and len(diff) == 0:
+                continue
+
+            tool_state["name"] = func_name
+            tool_state["arguments"] = final_args
+            self.streamed_args_for_tool[tool_id] = final_args_json
+
+            tool_call_deltas.append(
+                DeltaToolCall(
+                    index=tool_id,
+                    id=None if already_named else make_tool_call_id(),
+                    type=None if already_named else "function",
+                    function=DeltaFunctionCall(
+                        name=None if already_named else func_name,
+                        arguments=diff if len(diff) > 0 else None,
+                    ).model_dump(exclude_none=True),
                 )
+            )
+
+        if len(tool_call_deltas) > 0:
+            self.current_tool_id = len(all_matches) - 1
+            self.current_tool_name_sent = True
+            return DeltaMessage(tool_calls=tool_call_deltas)
 
         return None
 

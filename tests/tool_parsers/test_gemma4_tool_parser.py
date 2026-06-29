@@ -413,6 +413,29 @@ class TestStreamingExtraction:
                         return name
         return None
 
+    def _collect_tool_calls(
+        self, results: list[tuple[Any, str]]
+    ) -> dict[int, dict[str, str | None]]:
+        """Collect streamed tool calls by index."""
+        calls: dict[int, dict[str, str | None]] = {}
+        for delta, _ in results:
+            if delta is None or len(delta.tool_calls) == 0:
+                continue
+            for tc in delta.tool_calls:
+                call = calls.setdefault(tc.index, {"name": None, "arguments": ""})
+                func = tc.function if isinstance(tc.function, dict) else tc.function
+                if isinstance(func, dict):
+                    name = func.get("name")
+                    arguments = func.get("arguments")
+                else:
+                    name = getattr(func, "name", None)
+                    arguments = getattr(func, "arguments", None)
+                if isinstance(name, str):
+                    call["name"] = name
+                if isinstance(arguments, str):
+                    call["arguments"] = f"{call['arguments']}{arguments}"
+        return calls
+
     def test_basic_streaming_single_tool(self, parser, mock_request):
         """Simulate the exact streaming scenario from the bug report.
 
@@ -441,6 +464,56 @@ class TestStreamingExtraction:
         assert args_text, "No arguments were streamed"
         parsed_args = json.loads(args_text)
         assert parsed_args == {"location": "Paris, France"}
+
+    def test_streaming_complete_tool_call_in_one_chunk(self, parser, mock_request):
+        """A complete tool call in one delta must include both name and args."""
+        chunks = [
+            '<|tool_call>call:getStationInfo{location:<|"|>Milano<|"|>}<tool_call|>'
+        ]
+
+        results = self._simulate_streaming(parser, mock_request, chunks)
+        calls = self._collect_tool_calls(results)
+
+        assert set(calls) == {0}
+        assert calls[0]["name"] == "getStationInfo"
+        assert json.loads(calls[0]["arguments"]) == {"location": "Milano"}
+
+    def test_streaming_multiple_complete_tool_calls_in_one_chunk(
+        self, parser, mock_request
+    ):
+        """Multiple completed calls in one delta must all be streamed."""
+        chunks = [
+            '<|tool_call>call:getStationInfo{location:<|"|>Milano<|"|>}<tool_call|>'
+            '<|tool_call>call:getStationInfo{location:<|"|>Piacenza<|"|>}<tool_call|>'
+        ]
+
+        results = self._simulate_streaming(parser, mock_request, chunks)
+        calls = self._collect_tool_calls(results)
+
+        assert set(calls) == {0, 1}
+        assert calls[0]["name"] == "getStationInfo"
+        assert calls[1]["name"] == "getStationInfo"
+        assert json.loads(calls[0]["arguments"]) == {"location": "Milano"}
+        assert json.loads(calls[1]["arguments"]) == {"location": "Piacenza"}
+
+    def test_streaming_second_call_complete_in_first_call_end_chunk(
+        self, parser, mock_request
+    ):
+        """The final first-call chunk may also contain a full second call."""
+        chunks = [
+            "<|tool_call>",
+            'call:getStationInfo{location:<|"|>Milano<|"|>}',
+            '<tool_call|><|tool_call>call:getStationInfo{location:<|"|>Piacenza<|"|>}<tool_call|>',
+        ]
+
+        results = self._simulate_streaming(parser, mock_request, chunks)
+        calls = self._collect_tool_calls(results)
+
+        assert set(calls) == {0, 1}
+        assert calls[0]["name"] == "getStationInfo"
+        assert calls[1]["name"] == "getStationInfo"
+        assert json.loads(calls[0]["arguments"]) == {"location": "Milano"}
+        assert json.loads(calls[1]["arguments"]) == {"location": "Piacenza"}
 
     def test_streaming_multi_arg(self, parser, mock_request):
         """Streaming with multiple arguments."""
