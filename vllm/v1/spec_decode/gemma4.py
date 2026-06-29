@@ -9,6 +9,7 @@ with the target model via cross-model KV sharing.
 
 from collections import defaultdict
 from copy import copy
+import os
 
 import torch
 import torch.nn as nn
@@ -22,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -57,6 +59,42 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
         self._centroids_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._centroids_inputs: dict[int, torch.Tensor] = {}
         self._centroids_outputs: dict[int, torch.Tensor] = {}
+        self.adaptive_mtp_enabled = os.environ.get(
+            "VLLM_GEMMA4_ADAPTIVE_MTP", "0"
+        ) == "1"
+        self.adaptive_mtp_long_context_threshold = self._read_positive_int_env(
+            "VLLM_GEMMA4_ADAPTIVE_MTP_LONG_CONTEXT_THRESHOLD", 4096
+        )
+        self.adaptive_mtp_long_context_depth = self._read_positive_int_env(
+            "VLLM_GEMMA4_ADAPTIVE_MTP_LONG_CONTEXT_DEPTH", 2
+        )
+        self.adaptive_mtp_high_batch_threshold = self._read_positive_int_env(
+            "VLLM_GEMMA4_ADAPTIVE_MTP_HIGH_BATCH_THRESHOLD", 64
+        )
+        self.adaptive_mtp_high_batch_depth = self._read_positive_int_env(
+            "VLLM_GEMMA4_ADAPTIVE_MTP_HIGH_BATCH_DEPTH", 4
+        )
+        if self.adaptive_mtp_enabled:
+            logger.info_once(
+                "Gemma4 adaptive MTP depth enabled: max=%d "
+                "long_context_threshold=%d long_context_depth=%d "
+                "high_batch_threshold=%d high_batch_depth=%d",
+                self.num_speculative_tokens,
+                self.adaptive_mtp_long_context_threshold,
+                self.adaptive_mtp_long_context_depth,
+                self.adaptive_mtp_high_batch_threshold,
+                self.adaptive_mtp_high_batch_depth,
+            )
+
+    @staticmethod
+    def _read_positive_int_env(name: str, default: int) -> int:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        parsed = int(value)
+        if parsed < 1:
+            raise ValueError(f"{name} must be >= 1, got {parsed}")
+        return parsed
 
     def set_per_group_block_table(self, gid: int, block_table: torch.Tensor) -> None:
         self._per_group_block_tables[gid] = block_table
@@ -66,6 +104,86 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
         # The proposer uses draft_hidden_states for compute_logits and
         # backbone_hidden_states for the hidden-state feedback buffer.
         return True
+
+    def _get_effective_num_speculative_tokens(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> int:
+        if not self.adaptive_mtp_enabled:
+            return self.num_speculative_tokens
+
+        effective_depth = self.num_speculative_tokens
+        is_long_context = (
+            common_attn_metadata.max_seq_len
+            >= self.adaptive_mtp_long_context_threshold
+        )
+        if is_long_context:
+            effective_depth = min(effective_depth, self.adaptive_mtp_long_context_depth)
+
+        batch_size = common_attn_metadata.batch_size()
+        if batch_size >= self.adaptive_mtp_high_batch_threshold:
+            effective_depth = min(effective_depth, self.adaptive_mtp_high_batch_depth)
+
+        effective_depth = max(1, min(self.num_speculative_tokens, effective_depth))
+        if effective_depth != self.num_speculative_tokens:
+            logger.debug(
+                "Gemma4 adaptive MTP depth selected %d of %d "
+                "(batch_size=%d max_seq_len=%d)",
+                effective_depth,
+                self.num_speculative_tokens,
+                batch_size,
+                common_attn_metadata.max_seq_len,
+            )
+        return effective_depth
+
+    def propose(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        sampling_metadata: SamplingMetadata,
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
+        slot_mappings: dict[str, torch.Tensor]
+        | list[dict[str, torch.Tensor]]
+        | None = None,
+    ) -> torch.Tensor:
+        effective_depth = self._get_effective_num_speculative_tokens(
+            common_attn_metadata
+        )
+        configured_depth = self.num_speculative_tokens
+        if effective_depth == configured_depth:
+            return super().propose(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=token_indices_to_sample,
+                common_attn_metadata=common_attn_metadata,
+                sampling_metadata=sampling_metadata,
+                mm_embed_inputs=mm_embed_inputs,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                slot_mappings=slot_mappings,
+            )
+
+        self.num_speculative_tokens = effective_depth
+        try:
+            return super().propose(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=token_indices_to_sample,
+                common_attn_metadata=common_attn_metadata,
+                sampling_metadata=sampling_metadata,
+                mm_embed_inputs=mm_embed_inputs,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                slot_mappings=slot_mappings,
+            )
+        finally:
+            self.num_speculative_tokens = configured_depth
 
     def build_per_group_and_layer_attn_metadata(
         self,
@@ -140,15 +258,30 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
         )
 
     def _create_draft_vllm_config(self) -> VllmConfig:
-        """Preserve the target's forced TRITON_ATTN backend for draft layers.
+        """Preserve the target's Gemma4 attention policy for draft layers.
 
-        Gemma4 forces TRITON_ATTN due to heterogeneous head dimensions
-        (head_dim=256 sliding, global_head_dim=512 full). The base class
-        resets attention_config.backend to None for draft models, causing
-        sliding layers to fall back to FLASH_ATTN which cannot handle
-        KV-shared cache. Override to carry the target's backend through.
+        Draft layers share the target's text-attention override and global
+        fallback backend so target and assistant metadata builders stay aligned.
         """
         base = super()._create_draft_vllm_config()
+        use_flashinfer_trtllm_gen = (
+            getattr(
+                self.vllm_config.model_config.hf_text_config,
+                "use_flashinfer_trtllm_gen_attention",
+                False,
+            )
+            is True
+        )
+        setattr(
+            base.model_config.hf_text_config,
+            "use_flashinfer_trtllm_gen_attention",
+            use_flashinfer_trtllm_gen,
+        )
+        setattr(
+            self.speculative_config.draft_model_config.hf_text_config,
+            "use_flashinfer_trtllm_gen_attention",
+            use_flashinfer_trtllm_gen,
+        )
         target_backend = self.vllm_config.attention_config.backend
         if target_backend is not None:
             base = replace(
