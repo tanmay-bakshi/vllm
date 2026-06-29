@@ -6,7 +6,11 @@ import pytest
 
 from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+from vllm.v1.spec_decode.dynamic.utils import (
+    build_dynamic_sd_schedule_lookup,
+    resolve_dynamic_sd_num_speculative_tokens,
+    validate_and_normalize_dynamic_sd_schedule,
+)
 from vllm.v1.structured_output import StructuredOutputManager
 
 
@@ -216,3 +220,122 @@ def test_scheduler_passes_max_num_seqs_as_dsd_runtime_batch_limit():
     assert len(scheduler.dynamic_sd_lookup) == 17
     assert len(output.num_scheduled_tokens) == 16
     assert output.num_spec_tokens_to_schedule == 3
+
+
+# Sequence-length Dynamic SD schedule.
+
+
+def _resolve_seq_len(
+    schedule: list[tuple[int, int, int]],
+    seq_len: int,
+    *,
+    runtime_num_speculative_tokens: int = 6,
+) -> int:
+    normalized = validate_and_normalize_dynamic_sd_schedule(
+        schedule, field_name="num_speculative_tokens_per_seq_len"
+    )
+    return resolve_dynamic_sd_num_speculative_tokens(
+        normalized, seq_len, runtime_num_speculative_tokens
+    )
+
+
+def test_seq_len_schedule_reduces_k_for_long_context():
+    schedule = [(4096, 262144, 2), (1, 4095, 6)]
+    assert _resolve_seq_len(schedule, 1) == 6
+    assert _resolve_seq_len(schedule, 4095) == 6
+    assert _resolve_seq_len(schedule, 4096) == 2
+    assert _resolve_seq_len(schedule, 262144) == 2
+    assert _resolve_seq_len(schedule, 10**6) == 2
+
+
+def test_seq_len_schedule_returns_full_k_below_first_range():
+    # seq_len 0 (no decoding requests scheduled) keeps the configured depth.
+    assert _resolve_seq_len([(1, 100, 2)], 0) == 6
+
+
+def test_seq_len_schedule_carries_forward_across_gaps():
+    schedule = [(1, 16, 6), (64, 128, 2)]
+    assert _resolve_seq_len(schedule, 30) == 6
+    assert _resolve_seq_len(schedule, 200) == 2
+
+
+def test_seq_len_schedule_clamps_to_runtime_max():
+    assert _resolve_seq_len([(1, 100000, 5)], 50, runtime_num_speculative_tokens=3) == 3
+
+
+def test_seq_len_schedule_validation_uses_field_name():
+    with pytest.raises(
+        ValueError, match="num_speculative_tokens_per_seq_len.*must start at 1"
+    ):
+        validate_and_normalize_dynamic_sd_schedule(
+            [(2, 16, 3)], field_name="num_speculative_tokens_per_seq_len"
+        )
+
+
+def _make_scheduler_with_seq_len_schedule(
+    seq_len_schedule: list[tuple[int, int, int]],
+    *,
+    batch_size_schedule: list[tuple[int, int, int]] | None = None,
+    max_num_seqs: int = 8,
+    max_num_batched_tokens: int = 8192,
+    runtime_num_speculative_tokens: int = 3,
+) -> Scheduler:
+    base_scheduler = create_scheduler(
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        num_speculative_tokens=runtime_num_speculative_tokens,
+    )
+
+    speculative_config = base_scheduler.vllm_config.speculative_config
+    assert speculative_config is not None
+    speculative_config.num_speculative_tokens_per_seq_len = seq_len_schedule
+    speculative_config.num_speculative_tokens_per_batch_size = batch_size_schedule
+
+    return Scheduler(
+        vllm_config=base_scheduler.vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        block_size=base_scheduler.block_size,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(base_scheduler.vllm_config),
+    )
+
+
+def test_scheduler_seq_len_schedule_reduces_k_for_long_context():
+    scheduler = _make_scheduler_with_seq_len_schedule(
+        [(1, 99, 3), (100, 100000, 1)],
+        max_num_batched_tokens=4096,
+        runtime_num_speculative_tokens=3,
+    )
+    assert scheduler.dynamic_sd_seq_len_schedule is not None
+
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=200)
+
+    assert output.num_spec_tokens_to_schedule == 1
+
+
+def test_scheduler_seq_len_schedule_keeps_full_k_for_short_context():
+    scheduler = _make_scheduler_with_seq_len_schedule(
+        [(1, 99, 3), (100, 100000, 1)],
+        runtime_num_speculative_tokens=3,
+    )
+
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=20)
+
+    assert output.num_spec_tokens_to_schedule == 3
+
+
+def test_scheduler_composes_batch_size_and_seq_len_schedules():
+    # The batch-size schedule alone would allow K=3, but the long context
+    # forces the smaller K=1 to win.
+    scheduler = _make_scheduler_with_seq_len_schedule(
+        [(1, 99, 3), (100, 100000, 1)],
+        batch_size_schedule=[(1, 256, 3)],
+        max_num_batched_tokens=4096,
+        runtime_num_speculative_tokens=3,
+    )
+    assert scheduler.dynamic_sd_lookup is not None
+    assert scheduler.dynamic_sd_seq_len_schedule is not None
+
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=200)
+
+    assert output.num_spec_tokens_to_schedule == 1

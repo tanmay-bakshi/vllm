@@ -165,6 +165,15 @@ class SpeculativeConfig:
     Each entry is ``(range_start, range_end, num_speculative_tokens)`` with an
     inclusive batch-size range.
     """
+    num_speculative_tokens_per_seq_len: list[tuple[int, int, int]] | None = None
+    """Sequence-length schedule used to dynamically choose speculative-token count.
+
+    Each entry is ``(range_start, range_end, num_speculative_tokens)`` with an
+    inclusive range over the longest sequence length in the running batch.
+    When combined with ``num_speculative_tokens_per_batch_size``, the smaller
+    speculative-token count wins so long contexts and large batches both shrink
+    the verification length.
+    """
 
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -1113,7 +1122,10 @@ class SpeculativeConfig:
         return self.method == "dflash"
 
     def uses_dynamic_speculative_decoding(self) -> bool:
-        return self.num_speculative_tokens_per_batch_size is not None
+        return (
+            self.num_speculative_tokens_per_batch_size is not None
+            or self.num_speculative_tokens_per_seq_len is not None
+        )
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

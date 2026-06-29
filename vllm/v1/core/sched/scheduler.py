@@ -57,7 +57,12 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+from vllm.v1.spec_decode.dynamic.utils import (
+    DynamicSDSchedule,
+    build_dynamic_sd_schedule_lookup,
+    resolve_dynamic_sd_num_speculative_tokens,
+    validate_and_normalize_dynamic_sd_schedule,
+)
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -230,12 +235,20 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        self.dynamic_sd_seq_len_schedule: DynamicSDSchedule | None = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
+                )
+            if speculative_config.num_speculative_tokens_per_seq_len:
+                self.dynamic_sd_seq_len_schedule = (
+                    validate_and_normalize_dynamic_sd_schedule(
+                        speculative_config.num_speculative_tokens_per_seq_len,
+                        field_name="num_speculative_tokens_per_seq_len",
+                    )
                 )
             if speculative_config.use_eagle():
                 self.use_eagle = True
@@ -384,6 +397,25 @@ class Scheduler(SchedulerInterface):
                 # keep alignment to block_size
                 num_new_tokens = num_new_tokens // block_size * block_size
         return num_new_tokens
+
+    def _max_scheduled_decode_seq_len(
+        self, num_scheduled_tokens: dict[str, int]
+    ) -> int:
+        """Largest sequence length among decoding requests scheduled this step.
+
+        Prefill chunks are skipped since they do not run speculative decoding;
+        the result drives the sequence-length Dynamic SD schedule and is 0 when
+        no decoding request is scheduled.
+        """
+        max_seq_len = 0
+        for req_id, scheduled in num_scheduled_tokens.items():
+            request = self.requests[req_id]
+            if request.is_prefill_chunk:
+                continue
+            seq_len = request.num_computed_tokens + scheduled
+            if seq_len > max_seq_len:
+                max_seq_len = seq_len
+        return max_seq_len
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -801,7 +833,11 @@ class Scheduler(SchedulerInterface):
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
                     if (
-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        (
+                            self.num_spec_tokens > 0
+                            and self.dynamic_sd_lookup is None
+                            and self.dynamic_sd_seq_len_schedule is None
+                        )
                         and num_new_tokens == 1
                         and (scheduled_running_reqs and not prefill_scheduled)
                     ):
@@ -1073,12 +1109,24 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
-        # Dynamic speculative decoding: compute optimal K
+        # Dynamic speculative decoding: choose the verification length K from the
+        # batch size and/or the longest scheduled sequence, taking the smaller K
+        # when both schedules apply.
         num_spec_tokens_to_schedule = self.num_spec_tokens
-        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                len(num_scheduled_tokens)
-            ]
+        if len(num_scheduled_tokens) > 0:
+            if self.dynamic_sd_lookup is not None:
+                num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                    len(num_scheduled_tokens)
+                ]
+            if self.dynamic_sd_seq_len_schedule is not None:
+                num_spec_tokens_to_schedule = min(
+                    num_spec_tokens_to_schedule,
+                    resolve_dynamic_sd_num_speculative_tokens(
+                        self.dynamic_sd_seq_len_schedule,
+                        self._max_scheduled_decode_seq_len(num_scheduled_tokens),
+                        self.num_spec_tokens,
+                    ),
+                )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
