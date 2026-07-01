@@ -82,17 +82,14 @@ class DFlashProposer(SpecDecodeBaseProposer):
             base.model_config.model_arch_config = replace(arch, is_mm_prefix_lm=False)
         return replace(
             base,
+            # DFlash draft attention is non-causal and symmetric-windowed, which
+            # only FlashAttention expresses faithfully -- and FlashAttention does
+            # not support an fp8 KV cache. The drafter is small, so give it its
+            # own bf16 KV cache rather than inheriting the target's fp8 layout.
+            cache_config=replace(base.cache_config, cache_dtype="auto"),
             attention_config=replace(
                 base.attention_config,
                 use_non_causal=not self.dflash_causal,
-                # The drafter shares the target's fp8 KV cache layout. Its head
-                # dims make FlashInfer advertise quantized-query support, so the
-                # layer would quantize the drafter's queries to fp8 -- but the
-                # non-causal DFlash attention path runs without TRTLLM and expects
-                # a model-dtype (bf16) query, so the fp8 query fails the dtype
-                # check. Disable query quantization to keep bf16 queries while
-                # leaving the fp8 KV block layout aligned with the target.
-                disable_flashinfer_q_quantization=True,
             ),
         )
 

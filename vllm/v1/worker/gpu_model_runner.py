@@ -4,11 +4,12 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
@@ -871,10 +872,15 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
+        # T1: auxiliary stream (and held input references) used to overlap the
+        # draft proposal with the current step's sampled-token emission.
+        self.draft_propose_stream: torch.cuda.Stream | None = None
+        self._draft_propose_input_refs: tuple | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
             self.draft_token_ids_copy_stream = torch.cuda.Stream()
+            self.draft_propose_stream = torch.cuda.Stream()
             self.draft_token_ids_cpu = torch.empty(
                 (self.max_num_reqs, self.num_spec_tokens),
                 dtype=torch.int64,
@@ -4075,6 +4081,14 @@ class GPUModelRunner(
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
 
+        # T1: a prior step's draft proposal may still be running on the
+        # auxiliary stream. Ensure it has finished before this forward reuses
+        # the shared input/metadata buffers, then drop the references that kept
+        # its GPU inputs alive across the async boundary.
+        if self.draft_propose_stream is not None:
+            torch.cuda.current_stream().wait_stream(self.draft_propose_stream)
+            self._draft_propose_input_refs = None
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -4326,6 +4340,10 @@ class GPUModelRunner(
                 num_tokens_unpadded,
                 ubatch_slices_padded,
             )
+        _fwd_dbg = os.environ.get("DFLASH_FWD_DBG") is not None
+        if _fwd_dbg:
+            torch.cuda.synchronize()
+            _tf = time.perf_counter()
         with (
             set_forward_context(
                 attn_metadata,
@@ -4352,6 +4370,13 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        if _fwd_dbg:
+            torch.cuda.synchronize()
+            logger.info(
+                "DFLASH_FWD forward_ms=%.2f sched_toks=%d",
+                (time.perf_counter() - _tf) * 1000.0,
+                scheduler_output.total_num_scheduled_tokens,
+            )
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4507,11 +4532,48 @@ class GPUModelRunner(
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("gpu_model_runner: draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output,
+            _ttft_dbg = os.environ.get("DFLASH_TTFT_DBG") is not None
+            if _ttft_dbg:
+                torch.cuda.synchronize()
+                _t0 = time.perf_counter()
+            # T1: run the proposal (context-KV precompute + draft forward) on an
+            # auxiliary stream so the current step's sampled tokens can be copied
+            # to host and emitted without waiting for it. The draft-token CPU
+            # copy machinery keys off current_stream(), so it correctly chains
+            # off the auxiliary stream here.
+            aux_stream = (
+                None
+                if os.environ.get("DFLASH_NO_OVERLAP") is not None
+                else self.draft_propose_stream
+            )
+            default_stream = torch.cuda.current_stream()
+            with (
+                torch.cuda.stream(aux_stream)
+                if aux_stream is not None
+                else nullcontext()
+            ):
+                if aux_stream is not None:
+                    aux_stream.wait_stream(default_stream)
+                with record_function_or_nullcontext("gpu_model_runner: draft"):
+                    self._draft_token_ids = self.propose_draft_token_ids(
+                        scheduler_output,
+                        sampled_token_ids,
+                        self.input_batch.sampling_metadata,
+                        hidden_states,
+                        sample_hidden_states,
+                        aux_hidden_states,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                        slot_mappings,
+                    )
+                    self._copy_draft_token_ids_to_cpu(scheduler_output)
+            if aux_stream is not None:
+                # Keep the proposal's GPU inputs alive across the async boundary
+                # so the caching allocator cannot recycle them while the
+                # auxiliary stream is still reading; released by the next
+                # execute_model after it waits on the stream.
+                self._draft_propose_input_refs = (
                     sampled_token_ids,
-                    self.input_batch.sampling_metadata,
                     hidden_states,
                     sample_hidden_states,
                     aux_hidden_states,
@@ -4519,7 +4581,13 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
-                self._copy_draft_token_ids_to_cpu(scheduler_output)
+            if _ttft_dbg:
+                torch.cuda.synchronize()
+                logger.info(
+                    "DFLASH_TTFT propose_ms=%.2f sched_toks=%d",
+                    (time.perf_counter() - _t0) * 1000.0,
+                    scheduler_output.total_num_scheduled_tokens,
+                )
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
@@ -4598,6 +4666,9 @@ class GPUModelRunner(
                 self._draft_prob_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
+        _bk_dbg = os.environ.get("DFLASH_BK_DBG") is not None
+        if _bk_dbg:
+            _tbk = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4612,6 +4683,12 @@ class GPUModelRunner(
                 sampler_output,
                 logits,
                 hidden_states,
+                scheduler_output.total_num_scheduled_tokens,
+            )
+        if _bk_dbg:
+            logger.info(
+                "DFLASH_TTFT bookkeep_ms=%.2f sched_toks=%d",
+                (time.perf_counter() - _tbk) * 1000.0,
                 scheduler_output.total_num_scheduled_tokens,
             )
 

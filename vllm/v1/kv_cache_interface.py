@@ -230,6 +230,18 @@ class FullAttentionSpec(AttentionSpec):
     cache layout itself.
     """
 
+    dedicated_kv_pool: bool = False
+    """
+    Whether this layer's KV cache must be allocated in its own physical
+    tensor(s) instead of being hybrid-shared with other KV-cache groups. Set
+    for the DFlash draft layers, whose bf16 / FlashAttention layout is
+    incompatible with the fp8 / TRTLLM-GEN target layers they would otherwise
+    be packed alongside (the shared raw tensor would be viewed differently by
+    each backend, corrupting the target). Like ``non_causal``, this is carried
+    on the spec so the engine core can act on it before the scheduler is built;
+    it does not change the per-layer KV cache layout itself.
+    """
+
     def __post_init__(self):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
@@ -291,6 +303,9 @@ class FullAttentionSpec(AttentionSpec):
             # If any layer in the group is non-causal, treat the group as
             # non-causal so the engine core disables incompatible scheduling.
             non_causal=any(spec.non_causal for spec in specs),
+            # A group is dedicated if any of its layers requires a private
+            # (non-shared) KV pool; in practice the draft group is homogeneous.
+            dedicated_kv_pool=any(spec.dedicated_kv_pool for spec in specs),
         )
         for spec in specs:
             for f in fields(AttentionSpec):

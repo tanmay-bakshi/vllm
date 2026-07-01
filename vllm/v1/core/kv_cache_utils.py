@@ -947,6 +947,78 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     return num_blocks
 
 
+def _split_shared_dedicated_groups(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> tuple[list[KVCacheGroupSpec], list[KVCacheGroupSpec]]:
+    """Partition groups into hybrid-shared groups and dedicated-pool groups.
+
+    A group is dedicated when its spec sets ``dedicated_kv_pool`` (the DFlash
+    draft group, whose bf16/FlashAttention layout cannot be hybrid-shared with
+    the fp8/TRTLLM target tensors). Dedicated groups get one private tensor per
+    layer instead of being packed alongside other groups.
+    """
+    dedicated = [
+        g
+        for g in kv_cache_groups
+        if getattr(g.kv_cache_spec, "dedicated_kv_pool", False)
+    ]
+    shared = [
+        g
+        for g in kv_cache_groups
+        if not getattr(g.kv_cache_spec, "dedicated_kv_pool", False)
+    ]
+    return shared, dedicated
+
+
+def _general_case_block_layout(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> tuple[int, int, int, list[KVCacheGroupSpec], list[KVCacheGroupSpec]]:
+    """Per-block byte layout for the General-case pool.
+
+    Shared groups pack the i-th layer of every shared group into one tensor;
+    dedicated groups contribute one private tensor per layer. Returns
+    ``(bytes_per_block, shared_group_size, shared_page_size, shared_groups,
+    dedicated_groups)``.
+    """
+    shared_groups, dedicated_groups = _split_shared_dedicated_groups(kv_cache_groups)
+    shared_group_size = (
+        max(len(g.layer_names) for g in shared_groups) if len(shared_groups) > 0 else 0
+    )
+    shared_page_size = (
+        get_uniform_page_size([g.kv_cache_spec for g in shared_groups])
+        if len(shared_groups) > 0
+        else 0
+    )
+    bytes_per_block = shared_page_size * shared_group_size
+    for g in dedicated_groups:
+        bytes_per_block += g.kv_cache_spec.page_size_bytes * len(g.layer_names)
+    if len(dedicated_groups) > 0:
+        logger.info(
+            "DFLASH_KVDBG shared: group_size=%d page=%d bytes; bytes_per_block=%d",
+            shared_group_size,
+            shared_page_size,
+            bytes_per_block,
+        )
+        for g in dedicated_groups:
+            sp = g.kv_cache_spec
+            logger.info(
+                "DFLASH_KVDBG dedicated: layers=%d block_size=%d page=%d "
+                "padded=%s real=%d",
+                len(g.layer_names),
+                sp.block_size,
+                sp.page_size_bytes,
+                getattr(sp, "page_size_padded", None),
+                getattr(sp, "real_page_size_bytes", -1),
+            )
+    return (
+        bytes_per_block,
+        shared_group_size,
+        shared_page_size,
+        shared_groups,
+        dedicated_groups,
+    )
+
+
 def _pool_bytes_per_block(
     vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
 ) -> int:
@@ -964,9 +1036,7 @@ def _pool_bytes_per_block(
         # buckets = {page_size: [[layer_names], [layer_names], ...]}
         buckets = _bucket_layers_by_page_size(kv_cache_groups)
         return sum(ps * len(slots) for ps, slots in buckets.items())
-    group_size = max(len(g.layer_names) for g in kv_cache_groups)
-    page_size = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
-    return page_size * group_size
+    return _general_case_block_layout(kv_cache_groups)[0]
 
 
 def get_num_blocks(
@@ -1367,31 +1437,45 @@ def get_kv_cache_config_from_groups(
         )
     else:
         # General case:
-        # We will have group_size memory pools, each is shared by one layer from
-        # each group. As layers of different groups have different block table,
-        # they will use different parts of the shared Tensor.
-        # The memory layout for 3 groups (full.0, full.1), (sw.0, sw.2),
-        # (sw.1, padding) will be: (group_size = 2)
-        # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
-        # full.1, sw.2: share another Tensor with size=available_memory//2
-        group_size = max(len(group.layer_names) for group in kv_cache_groups)
-
-        page_size = get_uniform_page_size(
-            [group.kv_cache_spec for group in kv_cache_groups]
-        )
-        assert group_size > 0, "group_size must be greater than 0"
-        num_blocks = get_num_blocks(
-            vllm_config, group_size, available_memory, page_size
-        )
+        # Shared groups pack one layer from each group into a shared memory
+        # pool, distinguished by block table (so layers of different groups use
+        # different parts of the shared Tensor). Dedicated groups (e.g. the
+        # DFlash draft) instead get one private tensor per layer so their
+        # backend/dtype-specific layout can never alias another group's memory.
+        # The memory layout for 3 shared groups (full.0, full.1), (sw.0, sw.2),
+        # (sw.1, padding) is: (shared_group_size = 2)
+        # full.0, sw.0, sw.1: share a Tensor with size=page_size*num_blocks
+        # full.1, sw.2: share another Tensor with size=page_size*num_blocks
+        (
+            bytes_per_block,
+            shared_group_size,
+            shared_page_size,
+            shared_groups,
+            dedicated_groups,
+        ) = _general_case_block_layout(kv_cache_groups)
+        assert bytes_per_block > 0, "bytes_per_block must be greater than 0"
+        # num_layers=1 so the divisor is exactly bytes_per_block (one block's
+        # worth of every shared slot plus every dedicated layer).
+        num_blocks = get_num_blocks(vllm_config, 1, available_memory, bytes_per_block)
         kv_cache_tensors = []
-        for i in range(group_size):
-            shared_by = []
-            for j in range(len(kv_cache_groups)):
-                if i < len(kv_cache_groups[j].layer_names):
-                    shared_by.append(kv_cache_groups[j].layer_names[i])
+        for i in range(shared_group_size):
+            shared_by = [
+                group.layer_names[i]
+                for group in shared_groups
+                if i < len(group.layer_names)
+            ]
             kv_cache_tensors.append(
-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+                KVCacheTensor(size=shared_page_size * num_blocks, shared_by=shared_by)
             )
+        for group in dedicated_groups:
+            layer_page_size = group.kv_cache_spec.page_size_bytes
+            for layer_name in group.layer_names:
+                kv_cache_tensors.append(
+                    KVCacheTensor(
+                        size=layer_page_size * num_blocks,
+                        shared_by=[layer_name],
+                    )
+                )
 
     return KVCacheConfig(
         num_blocks=num_blocks,

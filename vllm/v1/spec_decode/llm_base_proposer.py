@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 from importlib.util import find_spec
@@ -579,6 +580,12 @@ class SpecDecodeBaseProposer:
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 sample_hidden_states, sampling_metadata
             )
+            if os.environ.get("DFLASH_DBG") is not None:
+                _b = next_token_ids.flatten()[:4].tolist()
+                _d = draft_token_ids.view(-1, self.num_speculative_tokens)[
+                    0, :8
+                ].tolist()
+                logger.info("DFLASH_DBG bonus=%s draft0=%s", _b, _d)
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
