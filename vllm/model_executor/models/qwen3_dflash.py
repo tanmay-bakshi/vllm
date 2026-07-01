@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
+from dataclasses import replace
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +35,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, SlidingWindowSpec
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
@@ -45,6 +47,77 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+_DFLASH_VALID_LAYER_TYPES = frozenset({"full_attention", "sliding_attention"})
+
+
+def _get_dflash_layer_types(config: Qwen3Config) -> tuple[str, ...]:
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is None:
+        return ("full_attention",) * config.num_hidden_layers
+    if len(layer_types) != config.num_hidden_layers:
+        raise ValueError(
+            f"DFlash layer_types length {len(layer_types)} does not match "
+            f"num_hidden_layers {config.num_hidden_layers}."
+        )
+    invalid = set(layer_types) - _DFLASH_VALID_LAYER_TYPES
+    if len(invalid) > 0:
+        raise ValueError(f"Invalid DFlash layer_type(s): {sorted(invalid)}.")
+    if (
+        "sliding_attention" in layer_types
+        and getattr(config, "sliding_window", None) is None
+    ):
+        raise ValueError(
+            "DFlash sliding_attention layers require `sliding_window` in config."
+        )
+    return tuple(layer_types)
+
+
+class DFlashAttention(Attention):
+    """Attention with DFlash-specific KV allocation and window semantics.
+
+    DFlash draft attention is non-causal (bidirectional block diffusion), so a
+    sliding-window layer must use a SYMMETRIC window: each query/mask token has
+    to attend to every other token within the window in both directions. The
+    default decoder window is left-only, which would silently make the block
+    semi-causal; widen it to match the trained drafter (and z-lab's SGLang
+    reference, which runs these layers as ENCODER_ONLY).
+
+    The KV cache spec is widened from sliding-window to full attention because
+    DFlash writes the entire context KV before drafting and never evicts old
+    context blocks, so a windowed cache spec would be incorrect.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("use_mm_prefix", False)
+        super().__init__(*args, **kwargs)
+        window = getattr(self.impl, "sliding_window", None)
+        if isinstance(window, tuple) and window[0] >= 0 and window[1] == 0:
+            self.impl.sliding_window = (window[0], window[0])
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        if spec is None:
+            return None
+        # Widen sliding-window layers to full attention (DFlash writes the whole
+        # context up front and never evicts old blocks) and mark every draft
+        # layer for a dedicated KV pool: its bf16/FlashAttention layout must not
+        # be hybrid-shared with the fp8/TRTLLM-GEN target tensors.
+        if isinstance(spec, SlidingWindowSpec):
+            return FullAttentionSpec(
+                block_size=spec.block_size,
+                num_kv_heads=spec.num_kv_heads,
+                head_size=spec.head_size,
+                head_size_v=spec.head_size_v,
+                dtype=spec.dtype,
+                kv_quant_mode=spec.kv_quant_mode,
+                page_size_padded=spec.page_size_padded,
+                dedicated_kv_pool=True,
+            )
+        if isinstance(spec, FullAttentionSpec):
+            return replace(spec, dedicated_kv_pool=True)
+        return spec
 
 
 class DFlashQwen3Attention(nn.Module):
@@ -66,6 +139,7 @@ class DFlashQwen3Attention(nn.Module):
         attention_bias: bool = False,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
+        sliding_window: int | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
     ) -> None:
@@ -109,13 +183,14 @@ class DFlashQwen3Attention(nn.Module):
             max_position=max_position,
             rope_parameters=rope_parameters,
         )
-        self.attn = Attention(
+        self.attn = DFlashAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
+            per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
         )
@@ -158,12 +233,17 @@ class DFlashQwen3DecoderLayer(nn.Module):
         config: Qwen3Config,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
+        layer_type: str = "full_attention",
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_type = layer_type
         set_default_rope_theta(config, default_theta=1000000)
         attn_type = AttentionType.DECODER
+        sliding_window = (
+            config.sliding_window if layer_type == "sliding_attention" else None
+        )
 
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
@@ -175,6 +255,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             cache_config=cache_config,
             quant_config=quant_config,
+            sliding_window=sliding_window,
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
@@ -243,6 +324,15 @@ class DFlashQwen3Model(nn.Module):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
+        # Gemma scales token embeddings by sqrt(hidden_size). DFlash reuses the
+        # target's (scaled) embeddings for the mask/noise tokens, so the draft
+        # embedding path must apply the same normalizer.
+        target_config = vllm_config.model_config.hf_text_config
+        self.embed_normalizer: float | None = None
+        if str(getattr(target_config, "model_type", "")).startswith("gemma4"):
+            self.embed_normalizer = target_config.hidden_size**0.5
+
+        self.layer_types = _get_dflash_layer_types(self.config)
         self.layers = nn.ModuleList(
             [
                 DFlashQwen3DecoderLayer(
@@ -251,6 +341,7 @@ class DFlashQwen3Model(nn.Module):
                     cache_config=current_vllm_config.cache_config,
                     quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
+                    layer_type=self.layer_types[layer_idx],
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
@@ -284,7 +375,10 @@ class DFlashQwen3Model(nn.Module):
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        embeds = self.embed_tokens(input_ids)
+        if self.embed_normalizer is not None:
+            return embeds * self.embed_normalizer
+        return embeds
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
