@@ -8,7 +8,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
@@ -871,10 +871,15 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
+        # Auxiliary stream (and held input references) used to overlap the
+        # draft proposal with the current step's sampled-token emission.
+        self.draft_propose_stream: torch.cuda.Stream | None = None
+        self._draft_propose_input_refs: tuple | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
             self.draft_token_ids_copy_stream = torch.cuda.Stream()
+            self.draft_propose_stream = torch.cuda.Stream()
             self.draft_token_ids_cpu = torch.empty(
                 (self.max_num_reqs, self.num_spec_tokens),
                 dtype=torch.int64,
@@ -4075,6 +4080,14 @@ class GPUModelRunner(
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
 
+        # A prior step's draft proposal may still be running on the
+        # auxiliary stream. Ensure it has finished before this forward reuses
+        # the shared input/metadata buffers, then drop the references that kept
+        # its GPU inputs alive across the async boundary.
+        if self.draft_propose_stream is not None:
+            torch.cuda.current_stream().wait_stream(self.draft_propose_stream)
+            self._draft_propose_input_refs = None
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -4507,11 +4520,40 @@ class GPUModelRunner(
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("gpu_model_runner: draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output,
+            # Run the proposal (context-KV precompute + draft forward) on an
+            # auxiliary stream so the current step's sampled tokens can be copied
+            # to host and emitted without waiting for it. The draft-token CPU
+            # copy machinery keys off current_stream(), so it correctly chains
+            # off the auxiliary stream here.
+            aux_stream = self.draft_propose_stream
+            default_stream = torch.cuda.current_stream()
+            with (
+                torch.cuda.stream(aux_stream)
+                if aux_stream is not None
+                else nullcontext()
+            ):
+                if aux_stream is not None:
+                    aux_stream.wait_stream(default_stream)
+                with record_function_or_nullcontext("gpu_model_runner: draft"):
+                    self._draft_token_ids = self.propose_draft_token_ids(
+                        scheduler_output,
+                        sampled_token_ids,
+                        self.input_batch.sampling_metadata,
+                        hidden_states,
+                        sample_hidden_states,
+                        aux_hidden_states,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                        slot_mappings,
+                    )
+                    self._copy_draft_token_ids_to_cpu(scheduler_output)
+            if aux_stream is not None:
+                # Keep the proposal's GPU inputs alive across the async boundary
+                # so the caching allocator cannot recycle them while the
+                # auxiliary stream is still reading; released by the next
+                # execute_model after it waits on the stream.
+                self._draft_propose_input_refs = (
                     sampled_token_ids,
-                    self.input_batch.sampling_metadata,
                     hidden_states,
                     sample_hidden_states,
                     aux_hidden_states,
@@ -4519,7 +4561,6 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
-                self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
