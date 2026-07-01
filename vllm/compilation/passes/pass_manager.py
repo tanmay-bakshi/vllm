@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import inspect
 from collections.abc import Callable
 from typing import Any, ParamSpec, TypeVar
 
@@ -60,6 +61,26 @@ from .utility.fix_functionalization import FixFunctionalizationPass
 from .utility.noop_elimination import NoOpEliminationPass
 
 logger = init_logger(__name__)
+
+
+@functools.cache
+def _flashinfer_allreduce_fusion_supported() -> bool:
+    """Whether the installed FlashInfer's ``allreduce_fusion`` accepts
+    ``weight_bias``.
+
+    vLLM passes ``weight_bias`` to fold Gemma-style ``(1 + gamma)`` RMSNorm
+    scaling into the fused all-reduce + RMSNorm kernel. FlashInfer builds
+    without that parameter cannot express the ``+1``, so the fusion must be
+    skipped (falling back to unfused all-reduce + RMSNorm) to stay correct.
+    """
+    try:
+        from flashinfer import comm as flashinfer_comm
+    except ImportError:
+        return False
+    fusion = getattr(flashinfer_comm, "allreduce_fusion", None)
+    if fusion is None:
+        return False
+    return "weight_bias" in inspect.signature(fusion).parameters
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -154,7 +175,14 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 self.passes += [RocmAiterTritonAddRMSNormPadFusionPass(config)]
 
             if self.pass_config.fuse_allreduce_rms:
-                if rocm_aiter_ops.is_enabled():
+                if not _flashinfer_allreduce_fusion_supported():
+                    logger.warning_once(
+                        "Disabling allreduce+RMSNorm fusion: the installed "
+                        "FlashInfer allreduce_fusion() lacks the weight_bias "
+                        "parameter required for Gemma-style (1 + gamma) RMSNorm. "
+                        "Falling back to unfused all-reduce + RMSNorm."
+                    )
+                elif rocm_aiter_ops.is_enabled():
                     self.passes += [RocmAiterAllReduceFusionPass(config)]
                 else:
                     self.passes += [AllReduceFusionPass(config)]
