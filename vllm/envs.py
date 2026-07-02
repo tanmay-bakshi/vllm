@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_MODELOPT_EXCLUDED_ONLINE_FP8: str = ""
+    VLLM_GEMMA4_LM_HEAD_FP8: bool = False
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -581,6 +582,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of running them unquantized in the checkpoint dtype. Empty = disabled.
     "VLLM_MODELOPT_EXCLUDED_ONLINE_FP8": lambda: os.getenv(
         "VLLM_MODELOPT_EXCLUDED_ONLINE_FP8", ""
+    ),
+    # Serve the gemma4 (tied) lm_head logits GEMM from a per-channel FP8
+    # shadow copy of the embedding weight. Embedding lookups stay in the
+    # checkpoint dtype.
+    "VLLM_GEMMA4_LM_HEAD_FP8": lambda: bool(
+        int(os.getenv("VLLM_GEMMA4_LM_HEAD_FP8", "0"))
     ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on

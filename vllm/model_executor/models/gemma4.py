@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING
 
 import regex as re
 import torch
+
+import vllm.envs as envs
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
@@ -50,6 +52,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -1523,6 +1526,47 @@ class Gemma4Model(nn.Module, EagleModelMixin):
         return loaded_params
 
 
+class Gemma4Fp8LMHeadMethod(UnquantizedLinearMethod):
+    """Serves the (tied) lm_head logits GEMM from a per-channel FP8 shadow.
+
+    Gemma4 ties lm_head to embed_tokens, so the weight itself must stay in
+    the checkpoint dtype for embedding lookups. This method builds an FP8
+    copy (per-vocab-row weight scales, dynamic per-token activation
+    quantization) after weights load and uses it only for logits. The
+    logits GEMM is decode-bandwidth-bound on the 262K vocab, so halving
+    the weight bytes roughly halves its latency. Gated by
+    VLLM_GEMMA4_LM_HEAD_FP8.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm import _custom_ops as ops
+
+        qweight, scale = ops.scaled_fp8_quant(
+            layer.weight.data, use_per_token_if_dynamic=True
+        )
+        layer.fp8_shadow_weight = qweight.t()  # (hidden, vocab_shard)
+        layer.fp8_shadow_scale = scale  # (vocab_shard, 1)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        shadow = getattr(layer, "fp8_shadow_weight", None)
+        if shadow is None:
+            return super().apply(layer, x, bias)
+        from vllm import _custom_ops as ops
+
+        xq, xs = ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
+        out = ops.cutlass_scaled_mm(
+            xq, shadow, xs, layer.fp8_shadow_scale, x.dtype
+        )
+        if bias is not None:
+            out = out + bias
+        return out
+
+
 class Gemma4ForCausalLM(
     nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts, SupportsEagle3
 ):
@@ -1577,6 +1621,12 @@ class Gemma4ForCausalLM(
         )
         if config.tie_word_embeddings:
             self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+        if envs.VLLM_GEMMA4_LM_HEAD_FP8:
+            logger.info_once(
+                "Using per-channel FP8 shadow for gemma4 lm_head "
+                "(VLLM_GEMMA4_LM_HEAD_FP8)"
+            )
+            self.lm_head.quant_method = Gemma4Fp8LMHeadMethod()
 
         self.logits_processor = LogitsProcessor(
             config.vocab_size,
