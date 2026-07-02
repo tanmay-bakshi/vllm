@@ -5,10 +5,11 @@ from __future__ import annotations
 import copy
 import inspect
 import itertools
+import json
 import weakref
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
-from functools import lru_cache
+from functools import lru_cache, wraps
 from typing import TYPE_CHECKING, Any, Final, Literal, cast, overload
 
 import jinja2
@@ -416,6 +417,35 @@ def _iter_nodes_assign_content_item(root: jinja2.nodes.Node):
         if isinstance(loop_iter, jinja2.nodes.Name) and loop_iter.name == "content":
             assert isinstance(loop_target, jinja2.nodes.Name)
             yield loop_ast, loop_target.name
+
+
+def _register_hf_chat_template_filters() -> None:
+    """Register extra Jinja filters required by tool-calling chat templates.
+
+    Transformers' ``_compile_jinja_template`` only exposes ``tojson``. Chat
+    templates that round-trip serialized tool-call arguments and tool responses
+    (e.g. gemma4) additionally rely on ``fromjson`` to parse those JSON strings
+    back into objects, and otherwise abort rendering with "No filter named
+    'fromjson' found". Wrap the compiler so every compiled template's
+    environment resolves ``fromjson`` to ``json.loads``.
+    """
+    import transformers.utils.chat_template_utils as hf_chat_utils
+
+    compile_template = hf_chat_utils._compile_jinja_template
+    if getattr(compile_template, "_vllm_extra_filters", False):
+        return
+
+    @wraps(compile_template)
+    def _compile_with_extra_filters(chat_template: str) -> jinja2.Template:
+        compiled = compile_template(chat_template)
+        compiled.environment.filters.setdefault("fromjson", json.loads)
+        return compiled
+
+    _compile_with_extra_filters._vllm_extra_filters = True
+    hf_chat_utils._compile_jinja_template = _compile_with_extra_filters
+
+
+_register_hf_chat_template_filters()
 
 
 def _try_extract_ast(chat_template: str) -> jinja2.nodes.Template | None:
