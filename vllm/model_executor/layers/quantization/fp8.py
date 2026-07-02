@@ -8,6 +8,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -67,6 +68,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
     kFp8Static128BlockSym,
+    kFp8StaticChannelSym,
     kFp8StaticTensorSym,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
@@ -76,6 +78,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 )
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
+    ModelWeightParameter,
     PerTensorScaleParameter,
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
@@ -486,6 +489,69 @@ class Fp8LinearMethod(LinearMethodBase):
                 return torch.nn.functional.linear(x, weight_bf16.t(), bias)
 
         return self.fp8_linear.apply_weights(layer, x, bias)
+
+
+class OnlineFp8LinearMethod(Fp8LinearMethod):
+    """Linear method that quantizes high-precision checkpoint weights to FP8
+    at load time (per-output-channel weight scales, dynamic per-token
+    activation quantization).
+
+    Fp8LinearMethod only supports checkpoints that already serialize FP8
+    weights and scales: with is_checkpoint_fp8_serialized=False it loads the
+    high-precision weight into an fp8-dtype parameter and applies an
+    uninitialized weight_scale, producing inf/NaN outputs. This subclass
+    restores an online path: the checkpoint weight is loaded in its original
+    dtype and quantized in process_weights_after_loading.
+    """
+
+    def __init__(self, quant_config: Fp8Config):
+        super().__init__(quant_config)
+        assert not self.block_quant
+        assert not self.act_q_static
+        self.weight_quant_key = kFp8StaticChannelSym
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        # Replace the fp8-dtype weight parameter with a loadable
+        # high-precision one; it is quantized after loading.
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                sum(output_partition_sizes),
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        qweight, weight_scale = ops.scaled_fp8_quant(
+            layer.weight.data, use_per_token_if_dynamic=True
+        )
+        replace_parameter(layer, "weight", qweight.t().data)
+        replace_parameter(layer, "weight_scale", weight_scale.data)
+        layer.input_scale = None
+        self.fp8_linear.process_weights_after_loading(layer)
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):

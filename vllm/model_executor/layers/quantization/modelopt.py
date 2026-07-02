@@ -188,6 +188,33 @@ class ModelOptQuantConfigBase(QuantizationConfig):
 
         # handle exclusion
         if self.is_layer_excluded(prefix):
+            # Optionally quantize excluded linear layers (which the checkpoint
+            # ships in high precision) to FP8 online at load time. Gated by
+            # VLLM_MODELOPT_EXCLUDED_ONLINE_FP8, a substring that the module
+            # prefix must contain (e.g. "self_attn").
+            online_fp8_pattern = envs.VLLM_MODELOPT_EXCLUDED_ONLINE_FP8
+            if (
+                online_fp8_pattern
+                and online_fp8_pattern in prefix
+                and isinstance(layer, LinearBase)
+                and not isinstance(layer, ParallelLMHead)
+            ):
+                from vllm.model_executor.layers.quantization.fp8 import (
+                    Fp8Config,
+                    OnlineFp8LinearMethod,
+                )
+
+                logger.info_once(
+                    "Quantizing modelopt-excluded layers matching %r "
+                    "to FP8 online (VLLM_MODELOPT_EXCLUDED_ONLINE_FP8)",
+                    online_fp8_pattern,
+                )
+                return OnlineFp8LinearMethod(
+                    Fp8Config(
+                        is_checkpoint_fp8_serialized=False,
+                        activation_scheme="dynamic",
+                    )
+                )
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             return None
