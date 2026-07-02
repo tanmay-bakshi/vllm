@@ -88,6 +88,12 @@ class ParserEngineConfig:
 
     tool_args_json: bool = True
 
+    # Coerce parsed arg values to the request tool's JSON-schema types.
+    # Parsers whose converter already emits correctly-typed values (e.g.
+    # gemma4, which distinguishes strings from bare scalars in its own
+    # format) set this False so correct values are not re-coerced.
+    fix_arg_types: bool = True
+
     arg_structural_chars: frozenset[str] | None = None
 
     # Prevents trailing-whitespace accumulation across multi-turn conversations.

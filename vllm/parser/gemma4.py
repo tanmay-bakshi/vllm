@@ -77,20 +77,32 @@ logger = init_logger(__name__)
 # Gemma4 argument parser
 # ---------------------------------------------------------------------------
 
-_PARTIAL_DELIM_SUFFIXES = tuple(
-    STRING_DELIM[:k] for k in range(len(STRING_DELIM), 0, -1)
-)
+def _parse_gemma4_value(value_str: str) -> object:
+    """Parse a single Gemma4 value (after key:) into a Python object."""
+    value_str = value_str.strip()
+    if not value_str:
+        return value_str
 
+    # Boolean
+    if value_str == "true":
+        return True
+    if value_str == "false":
+        return False
 
-def _strip_partial_delim(value: str) -> str:
-    """Strip a trailing partial ``STRING_DELIM`` prefix from *value*.
+    # Null
+    if value_str.lower() in ("null", "none", "nil"):
+        return None
 
-    Prevents partial delimiters from leaking into the streamed JSON diff.
-    """
-    for suffix in _PARTIAL_DELIM_SUFFIXES:
-        if value.endswith(suffix):
-            return value[: -len(suffix)]
-    return value
+    # Number (int or float)
+    try:
+        if "." in value_str:
+            return float(value_str)
+        return int(value_str)
+    except ValueError:
+        pass
+
+    # Bare string (no <|"|> delimiters — shouldn't happen but be safe)
+    return value_str
 
 
 def _parse_gemma4_args(args_str: str, *, partial: bool = False) -> dict:
@@ -131,9 +143,7 @@ def _parse_gemma4_args(args_str: str, *, partial: bool = False) -> dict:
         if i >= n:
             break
         key = args_str[key_start:i].strip()
-        if key.startswith(STRING_DELIM) and key.endswith(STRING_DELIM):
-            key = key[_DELIM_LEN:-_DELIM_LEN]
-        i += 1
+        i += 1  # skip ':'
 
         if i >= n:
             if not partial:
@@ -152,11 +162,8 @@ def _parse_gemma4_args(args_str: str, *, partial: bool = False) -> dict:
             val_start = i
             end_pos = args_str.find(STRING_DELIM, i)
             if end_pos == -1:
-                # Unterminated string — take rest, strip partial delimiter.
-                value = args_str[val_start:]
-                if partial:
-                    value = _strip_partial_delim(value)
-                result[key] = value
+                # Unterminated string — take rest
+                result[key] = args_str[val_start:]
                 break
             result[key] = args_str[val_start:end_pos]
             i = end_pos + _DELIM_LEN
@@ -219,12 +226,15 @@ def _parse_gemma4_args(args_str: str, *, partial: bool = False) -> dict:
                     i,
                 )
                 break
-            raw_val = args_str[val_start:i].strip()
-            if partial and raw_val.endswith("."):
-                # Digits may still arrive (e.g. "108." -> "108.2");
-                # withhold to avoid corrupting the streaming diff.
-                break
-            result[key] = raw_val
+            if partial:
+                raw_val = args_str[val_start:i].strip()
+                if raw_val.endswith("."):
+                    # Trailing dot means decimal digits may still arrive
+                    # (e.g. "108." may become "108.2"). Parsing now would
+                    # yield float("108.") == 108.0, whose json repr "108.0"
+                    # corrupts the streaming diff when the true digit lands.
+                    break
+            result[key] = _parse_gemma4_value(args_str[val_start:i])
 
     return result
 
@@ -302,10 +312,11 @@ def _parse_gemma4_array(arr_str: str, *, partial: bool = False) -> list:
                     i,
                 )
                 break
-            raw_val = arr_str[val_start:i].strip()
-            if partial and raw_val.endswith("."):
-                break
-            items.append(raw_val)
+            if partial:
+                raw_val = arr_str[val_start:i].strip()
+                if raw_val.endswith("."):
+                    break
+            items.append(_parse_gemma4_value(arr_str[val_start:i]))
 
     return items
 
@@ -411,6 +422,7 @@ def gemma4_config() -> ParserEngineConfig:
         },
         arg_converter=_gemma4_arg_converter,
         tool_args_json=False,
+        fix_arg_types=False,
         arg_structural_chars=frozenset(",:{}[]<"),
         drop_tokens=frozenset(_GEMMA4_MODEL_DROP_TOKENS - used_tokens),
     )

@@ -362,7 +362,14 @@ class ParserEngine(Parser):
         Nested objects and arrays are recursed into when the schema
         defines ``properties`` or ``items``.  Without a schema, values
         stay as strings.
+
+        Skipped entirely when the parser's converter already emits
+        correctly-typed values (``fix_arg_types=False``), so that correct
+        scalars are never re-coerced (e.g. an int silently turned into a
+        string because its schema property omits a type).
         """
+        if not self.parser_engine_config.fix_arg_types:
+            return args_json
         if not self._tools or not func_name:
             return args_json
         try:
