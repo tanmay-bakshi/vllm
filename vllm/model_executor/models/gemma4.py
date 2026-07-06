@@ -1793,10 +1793,12 @@ class Gemma4ForCausalLM(
 
 
 # --- Env-gated megakernel decode path (VLLM_GEMMA4_MEGAKERNEL=1) ---
-# Patches a gated wrapper onto Gemma4Model.forward at import time; C1/
-# small-batch pure-decode steps then run the fused 3-launch-per-layer
-# megakernel chain under self-managed cudagraphs, everything else falls
-# through to the stock path. With the flag unset this block is inert.
+# Gates Gemma4Model.__call__ at import time (above the
+# support_torch_compile dispatch, so it coexists with VLLM_COMPILE +
+# piecewise/FULL cudagraphs); small-batch pure-decode steps then run
+# the fused 3-launch-per-layer megakernel chain under vLLM's own
+# cudagraphs, everything else falls through to the stock (compiled)
+# path. With the flag unset this block is inert.
 import os as _mk_os  # noqa: E402
 
 if _mk_os.environ.get("VLLM_GEMMA4_MEGAKERNEL", "0") == "1":

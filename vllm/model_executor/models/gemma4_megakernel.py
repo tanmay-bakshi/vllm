@@ -15,8 +15,12 @@ reproducibility envelope, DFlash acceptance through graph replays,
 TPOT C1 TP1 1.449ms w/ DFlash (3.05x stock same-workload); M in
 {1..64} kernel checks; C>1 via per-row block tables.
 
-install() wraps Gemma4Model.forward with a gated runner: pure-decode
-single-sequence steps of a prepared batch size run every layer as
+install() wraps Gemma4Model.__call__ (the support_torch_compile
+dispatch) with a gated runner; it coexists with every
+CompilationMode, including VLLM_COMPILE + FULL_AND_PIECEWISE, so the
+stock path above the mega set keeps its inductor fusions and
+piecewise graphs (q=1 bootstrap steps included). Pure-decode
+uniform-batch steps of a prepared shape run every layer as
   B3 (post-ff norm+residual+ls -> input norm -> qkv FP8 -> head norms
       + RoPE -> q fp8 + paged KV append)
   -> trtllm-gen decode core (same call/metadata as the deployed backend)
@@ -206,36 +210,29 @@ class MegaRunner:
         self.log_every = int(os.environ.get("MK_LOG_EVERY", "0"))
 
     # ---------- one-shot KV tensor harvest ----------
-    # layer.kv_cache[0] read at model-forward start is a one-block stub
-    # for at least some layers; the live tensors are observably bound by
-    # the time each Attention.forward runs (probe-verified). Harvest them
-    # with self-removing pre-hooks during one sacrificial stock step.
-    def _harvest(self, model):
-        self.kv_map = {}
-        handles = []
-
-        def mk_hook(attn, lname, idx):
-            def hook(module, args):
-                kvc = attn.kv_cache[0] if isinstance(
-                    attn.kv_cache, (list, tuple)) else attn.kv_cache
-                self.kv_map[lname] = kvc
-                if idx < 6:
-                    _log(f"harvest[{lname}]: {tuple(kvc.shape)} "
-                         f"stride={tuple(kvc.stride())} "
-                         f"n={len(attn.kv_cache) if isinstance(attn.kv_cache, (list, tuple)) else 1}")
-                for h in handles_for[lname]:
-                    h.remove()
-                return None
-            return hook
-
-        handles_for = {}
-        for i, layer in enumerate(model.layers):
+    # Direct attribute reads at gate time. The old harvest fired
+    # forward_pre_hooks during one sacrificial stock step; under
+    # VLLM_COMPILE the stock step runs guard-dropped compiled code
+    # where dynamically-added module hooks never fire, so hooks are
+    # structurally unusable here. attn.kv_cache[ve] is bound by
+    # bind_kv_cache before any decode step, and validity is enforced
+    # by _kv_ok on every gated step exactly as before (stub detection
+    # + data_ptr movement), so a stale or early read self-heals: stay
+    # stock this step, re-read on the next.
+    def _harvest_now(self, model):
+        kv_map = {}
+        for layer in model.layers:
             attn = layer.self_attn.attn
-            lname = attn.layer_name
-            h = attn.register_forward_pre_hook(mk_hook(attn, lname, i))
-            handles_for[lname] = [h]
-            handles.append(h)
-        _log("kv harvest hooks installed (one stock step)")
+            kvc = attn.kv_cache[0] if isinstance(
+                attn.kv_cache, (list, tuple)) else attn.kv_cache
+            if kvc is None or kvc.numel() == 0:
+                return False   # not bound yet; stay stock
+            kv_map[attn.layer_name] = kvc
+        self.kv_map = kv_map
+        kvc = kv_map[model.layers[0].self_attn.attn.layer_name]
+        _log(f"kv harvest (direct): {len(kv_map)} layers, layer0 "
+             f"{tuple(kvc.shape)} stride={tuple(kvc.stride())}")
+        return True
 
     # ---------- async kernel compiles ----------
     def _compile_facts(self, model, md_all):
@@ -278,6 +275,18 @@ class MegaRunner:
 
         def work():
             try:
+                # Bind the CUDA primary context to this fresh thread
+                # BEFORE any DSL work: the occupancy probe
+                # (flashinfer get_max_active_clusters) uses the driver
+                # API, and on a context-less thread it silently falls
+                # back to sm_count -- baking an oversubscribed
+                # persistent grid whose progressive-release gates
+                # deadlock the first launch (100% GPU spin at the
+                # first mega warmup; found on the first mode-3 boot,
+                # where this trigger path first ran compiles off the
+                # main thread).
+                torch.cuda.set_device(0)
+                torch.cuda.current_stream().synchronize()
                 self._pre = _compile_shapes(m_set, facts, pdl, "async")
                 _log("async compiles done")
             except Exception:
@@ -354,6 +363,12 @@ class MegaRunner:
 
     # ---------- gate ----------
     def _gate(self, model, intermediate_tensors):
+        """(md_all, (q, r)) for a pure uniform-batch decode step of ANY
+        shape, else None. m_set eligibility is step()'s check, after
+        the KV guards: the async-compile trigger must fire on stub-KV
+        steps of any uniform shape (with capture-size lists whose
+        largest sizes exceed the mega set, the memory-profiling
+        dummies are the only pre-real-KV uniform steps we ever see)."""
         if intermediate_tensors is not None:
             return None
         from vllm.forward_context import get_forward_context
@@ -371,11 +386,47 @@ class MegaRunner:
         if r < 1 or t % max(r, 1) != 0:
             self.fb["multi_seq"] += 1
             return None
-        q = t // r
-        if (q, r) not in self.m_set:
+        return md_all, (t // r, r)
+
+    # ---------- per-step decision tree ----------
+    def step(self, model, input_ids, positions, inputs_embeds, md_all,
+             key):
+        """One gated uniform-decode step. Returns the model output if
+        the mega chain ran, None to fall through to the stock path
+        (which under VLLM_COMPILE is the compiled forward; the runner
+        never touches it)."""
+        capturing = torch.cuda.is_current_stream_capturing()
+        if not self.prepared and capturing:
+            # never harvest/prep/compile inside a capture; vLLM's
+            # warmup passes for each size run first and prep there
+            return None
+        if self.kv_map is None and not self._harvest_now(model):
+            return None
+        if not self._kv_ok(model, md_all):
+            # profiling stub, or the engine re-bound its KV cache:
+            # start the kernel compiles in the background (compile
+            # facts from this metadata are boot-invariant), then
+            # forget the harvest and serve stock; a later step
+            # re-reads the live tensors
+            self._start_async_compiles(model, md_all)
+            self._reset_prep()
+            return None
+        if key not in self.m_set:
             self.fb["m"] += 1
             return None
-        return md_all, (q, r)
+        over = (self.native and self.bake_max
+                and key[0] * key[1] > self.bake_max)
+        if over and capturing:
+            # bisect knob: bake this size STOCK; its warmups below
+            # still ran prep + the eager chain
+            return None
+        if not self.prepared:
+            self.prepare(model)
+        out = self.run(model, input_ids, positions, inputs_embeds,
+                       md_all, key)
+        # bake_max warmups keep the stock kernels for this size warmed
+        # too: discard the chain's output and let the caller run stock
+        return None if over else out
 
     # ---------- weight/kernel prep (once, lazy) ----------
     def prepare(self, model):
@@ -809,93 +860,61 @@ class MegaRunner:
 
 
 RUNNER = MegaRunner()
-_ORIG = None
+_ORIG_CALL = None
 
 
 def install():
-    global _ORIG
+    """Gate Gemma4Model.__call__ — NOT forward. Under VLLM_COMPILE the
+    support_torch_compile machinery owns forward: torch.compile binds
+    self.forward at model init, and the bytecode-hook dispatch swaps
+    Gemma4Model.forward.__code__ per call, so a forward wrapper would
+    be dynamo-traced (raw-pointer kernel launches, forward-context
+    reads: untraceable) and would poison original_code_object(). The
+    __call__ wrapper sits above all of that: dynamo never sees it,
+    compiled dispatch is delegated untouched, and vLLM's FULL
+    cudagraph capture — which enters through model.__call__ — records
+    whatever the gate picks: the mega chain for m_set shapes, the
+    compiled stock forward for everything else. At CompilationMode
+    NONE the decorator's __call__ routes straight to forward, so the
+    same wrapper covers the uncompiled config too."""
+    global _ORIG_CALL
     from vllm.model_executor.models import gemma4 as g4
-    if _ORIG is not None:
+    if _ORIG_CALL is not None:
         return
-    _ORIG = g4.Gemma4Model.forward
+    _ORIG_CALL = g4.Gemma4Model.__call__
 
-    def fwd(self, input_ids, positions, intermediate_tensors,
-            inputs_embeds=None, per_layer_inputs=None, **kwargs):
+    def gated_call(self, input_ids, positions, intermediate_tensors=None,
+                   inputs_embeds=None, per_layer_inputs=None, **kwargs):
         r = RUNNER
-        if (r.enabled and not r.prepared
-                and torch.cuda.is_current_stream_capturing()):
-            # never harvest/compile inside a capture; the warmup dummy
-            # runs before capture handle prep
-            return _ORIG(self, input_ids, positions, intermediate_tensors,
-                         inputs_embeds, per_layer_inputs, **kwargs)
-        if r.enabled and not r.prep_failed:
+        if (r.enabled and not r.prep_failed
+                and not torch.compiler.is_compiling()):
             g = r._gate(self, intermediate_tensors)
             if g is not None:
-                md_all, m = g
-                over = (r.native and r.bake_max
-                        and m[0] * m[1] > r.bake_max)
-                if over and torch.cuda.is_current_stream_capturing():
-                    # bisect knob: bake this size STOCK; its warmups
-                    # below still ran the mega chain at this size
-                    return _ORIG(self, input_ids, positions,
-                                 intermediate_tensors, inputs_embeds,
-                                 per_layer_inputs, **kwargs)
-                if r.kv_map is None:
-                    # sacrificial stock step harvests live KV tensors
-                    r._harvest(self)
-                    if r.native:
-                        # vLLM captures sizes largest-first, so a
-                        # sacrificial step would bake a stock graph for
-                        # the first mega-eligible size; fire the hooks
-                        # inline (discarding the output) so this same
-                        # warmup can prep and run the chain
-                        _ORIG(self, input_ids, positions,
-                              intermediate_tensors, inputs_embeds,
-                              per_layer_inputs, **kwargs)
-                if (r.kv_map is not None
-                        and len(r.kv_map) < len(list(self.layers))):
-                    pass  # hooks still pending; stay on stock
-                elif r.kv_map is not None:
-                    if not r._kv_ok(self, md_all):
-                        # profiling stub, or the engine re-bound its KV
-                        # cache: start the kernel compiles in the
-                        # background (compile facts from this metadata
-                        # are boot-invariant), then forget the harvest
-                        # and serve this step stock; a later step
-                        # re-harvests the live tensors
-                        r._start_async_compiles(self, md_all)
-                        r._reset_prep()
-                    else:
-                        if not r.prepared:
-                            try:
-                                r.prepare(self)
-                            except Exception:
-                                r.prep_failed = True
-                                import traceback
-                                traceback.print_exc()
-                                raise
-                        out = r.run(self, input_ids, positions,
-                                    inputs_embeds, md_all, m)  # m=(q,r)
-                        if over:
-                            # capture will bake stock at this size, so
-                            # keep the stock kernels warmed here too
-                            return _ORIG(self, input_ids, positions,
-                                         intermediate_tensors,
-                                         inputs_embeds,
-                                         per_layer_inputs, **kwargs)
-                        return out
-        return _ORIG(self, input_ids, positions, intermediate_tensors,
-                     inputs_embeds, per_layer_inputs, **kwargs)
+                md_all, key = g
+                try:
+                    out = r.step(self, input_ids, positions,
+                                 inputs_embeds, md_all, key)
+                except Exception:
+                    r.prep_failed = True
+                    import traceback
+                    traceback.print_exc()
+                    raise
+                if out is not None:
+                    return out
+        return _ORIG_CALL(self, input_ids, positions,
+                          intermediate_tensors, inputs_embeds,
+                          per_layer_inputs, **kwargs)
 
-    g4.Gemma4Model.forward = fwd
-    _log("Gemma4Model.forward patched (RUNNER.enabled="
+    g4.Gemma4Model.__call__ = gated_call
+    _log("Gemma4Model.__call__ gated (RUNNER.enabled="
          f"{RUNNER.enabled})")
 
 
 def enable_megakernel():
-    """Import-time entry (gemma4.py, VLLM_GEMMA4_MEGAKERNEL=1): patch
-    Gemma4Model.forward and arm the runner. Weight prep + kernel
-    compiles stay lazy (first gated decode step, ~80-150s once)."""
+    """Import-time entry (gemma4.py, VLLM_GEMMA4_MEGAKERNEL=1): gate
+    Gemma4Model.__call__ and arm the runner. Weight prep + kernel
+    compiles stay lazy (first gated decode step, ~80-150s once;
+    async-compiled during boot when profiling-stub steps are seen)."""
     install()
     RUNNER.enabled = True
     _log("megakernel decode path ENABLED "
