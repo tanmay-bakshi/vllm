@@ -504,7 +504,20 @@ class InputBatch:
         # _prepare_input_ids.
         start_index = self.num_tokens_no_spec[req_index]
         end_token_index = start_index + num_spec_tokens
-        self.token_ids_cpu[req_index, start_index:end_token_index] = spec_token_ids
+        # Sync scheduling can pad new decode requests with INVALID_TOKEN_ID
+        # (-1) drafts (scheduler pad_spec_decode) and nothing overwrites the
+        # placeholders before the embedding gather, unlike async scheduling
+        # (see _prepare_input_ids). Clamp only the input-ids copy: the
+        # rejection compare below keeps the real ids, so a placeholder draft
+        # can never match a sampled token and is always rejected.
+        if min(spec_token_ids) < 0:
+            self.token_ids_cpu[req_index, start_index:end_token_index] = [
+                t if t >= 0 else 0 for t in spec_token_ids
+            ]
+        else:
+            self.token_ids_cpu[req_index, start_index:end_token_index] = (
+                spec_token_ids
+            )
         self.is_token_ids[req_index, start_index:end_token_index] = True
         cur_spec_token_ids.extend(spec_token_ids)
 
