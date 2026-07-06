@@ -76,6 +76,7 @@ class _LP:
     """Per-layer prepared state (buffers referenced by raw pointers in
     the arg lists MUST be kept alive here)."""
     __slots__ = ("flavor", "lname", "b3_args", "b2_args", "bt_idx",
+                 "fl3_idx", "fl2_idx",
                  "kvc_hnd", "window_left", "hd", "q_size", "keep")
 
 
@@ -97,6 +98,12 @@ class MegaRunner:
         self.graph_steps = 0
         self.eager_steps = 0
         self.no_capture = os.environ.get("MK_NO_CAPTURE", "0") == "1"
+        # native mode: vLLM's FULL_DECODE_ONLY cudagraphs capture the
+        # chain; the runner never builds its own graphs or guards. Run
+        # the engine WITHOUT enforce-eager and with
+        # -cc {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}.
+        self.native = os.environ.get("MK_NATIVE", "0") == "1"
+        self.native_captured = set()
         self._last_mds = None
         self._last_m = 0
         ms = os.environ.get("MK_MSET")
@@ -242,11 +249,19 @@ class MegaRunner:
         ks_o = int(os.environ.get("MK_KSPLIT_O", "3"))
         ks_d = int(os.environ.get("MK_KSPLIT", "2"))
         t2_slots = (N2 // 128) * ks_d
-        s.flags3 = {f: torch.zeros(2048, dtype=torch.int32, device=dev)
-                    for f in fc}
-        s.flags2 = {f: torch.zeros(2 * INTER // 128 + t2_slots + 2 + 2048,
-                                   dtype=torch.int32, device=dev)
-                    for f in fc}
+        # The kernels' progressive-release gates poll persistent epoch
+        # counters whose arithmetic assumes every launch on a counter set
+        # has the same m_real. Sharing a set across compiled shapes
+        # deadlocks the first larger-shape launch after smaller-shape
+        # traffic (poll target runs ahead of the cumulative release) and
+        # opens gates early in the other direction. One set per shape.
+        s.flags3 = {(f, q, r): torch.zeros(2048, dtype=torch.int32,
+                                           device=dev)
+                    for f in fc for (q, r) in s.m_set}
+        s.flags2 = {(f, q * r): torch.zeros(
+                        2 * INTER // 128 + t2_slots + 2 + 2048,
+                        dtype=torch.int32, device=dev)
+                    for f in fc for (q, r) in s.m_set}
         # trtllm-gen workspace: internal split scheduling scales with
         # max_seq_len (graphs capture at the 8192 upper bound); deployed
         # allocates 413MB for this config -- match it with headroom
@@ -358,9 +373,10 @@ class MegaRunner:
                 c["cs"].data_ptr(), s.pos_i32.data_ptr(),
                 0,  # block table ptr, patched per step (bt_idx)
                 s.q8[f].data_ptr(), kvc.data_ptr(),
-                scales, s.flags3[f].data_ptr(),
+                scales, 0,  # flags3 ptr, patched per shape (fl3_idx)
             ]
             lp.bt_idx = 14
+            lp.fl3_idx = 18
             lp.b2_args = [
                 s.ao[f].data_ptr(), s.aq[f].data_ptr(),
                 s.as_buf.data_ptr(),
@@ -371,8 +387,10 @@ class MegaRunner:
                 gu_q.data_ptr(), gu_s.data_ptr(),
                 s.iq.data_ptr(), s.isf.data_ptr(),
                 d_q.data_ptr(), d_s.data_ptr(),
-                s.out.data_ptr(), alpha, s.flags2[f].data_ptr(),
+                s.out.data_ptr(), alpha,
+                0,  # flags2 ptr, patched per shape (fl2_idx)
             ]
+            lp.fl2_idx = 20
             lp.keep = [wq8, wqs, wo8, wos, gu_q, gu_s, d_q, d_s, alpha,
                        scales, norms]
             s.lps.append(lp)
@@ -424,6 +442,7 @@ class MegaRunner:
         for i, (lp, md) in enumerate(zip(s.lps, mds)):
             args = lp.b3_args
             args[lp.bt_idx] = md.decode.block_tables.data_ptr()
+            args[lp.fl3_idx] = s.flags3[(lp.flavor, q, r)].data_ptr()
             s.k3[(lp.flavor, q, r)](*args)
             if i in s.tapset and i > 0:
                 s.aux_buf[i][:m].copy_(s.h[:m])
@@ -440,6 +459,8 @@ class MegaRunner:
                 q_len_per_req=q,
                 enable_pdl=s.pdl,
             )
+            lp.b2_args[lp.fl2_idx] = (
+                s.flags2[(lp.flavor, m)].data_ptr())
             s.k2[(lp.flavor, q, r)](*lp.b2_args)
             s.mo[:m].copy_(s.out[:m, :HIDDEN])
         # tail: close layer 59 + the model's final norm
@@ -480,6 +501,19 @@ class MegaRunner:
         s.pos_i32[:m].copy_(positions[:m].to(torch.int32))
         mds = [md_all[lp.lname] for lp in s.lps]
         s._last_mds, s._last_m = mds, key
+        if s.native:
+            self._chain(q, r, mds, s.cap_max_seq)
+            s.steps += 1
+            if torch.cuda.is_current_stream_capturing():
+                if key not in s.native_captured:
+                    s.native_captured.add(key)
+                    _log(f"native: chain baked into vLLM graph {key}")
+            else:
+                s.eager_steps += 1
+            hidden = s.hid[:m]
+            if s.taps:
+                return hidden, [s.aux_buf[k][:m] for k in s.taps]
+            return hidden
         if s.no_capture:
             self._chain(q, r, mds, s.cap_max_seq)
             s.eager_steps += 1
@@ -561,6 +595,12 @@ def install():
     def fwd(self, input_ids, positions, intermediate_tensors,
             inputs_embeds=None, per_layer_inputs=None, **kwargs):
         r = RUNNER
+        if (r.enabled and not r.prepared
+                and torch.cuda.is_current_stream_capturing()):
+            # never harvest/compile inside a capture; the warmup dummy
+            # runs before capture handle prep
+            return _ORIG(self, input_ids, positions, intermediate_tensors,
+                         inputs_embeds, per_layer_inputs, **kwargs)
         if r.enabled and not r.prep_failed:
             g = r._gate(self, intermediate_tensors)
             if g is not None:
@@ -568,9 +608,19 @@ def install():
                 if r.kv_map is None:
                     # sacrificial stock step harvests live KV tensors
                     r._harvest(self)
-                elif len(r.kv_map) < len(list(self.layers)):
+                    if r.native:
+                        # vLLM captures sizes largest-first, so a
+                        # sacrificial step would bake a stock graph for
+                        # the first mega-eligible size; fire the hooks
+                        # inline (discarding the output) so this same
+                        # warmup can prep and run the chain
+                        _ORIG(self, input_ids, positions,
+                              intermediate_tensors, inputs_embeds,
+                              per_layer_inputs, **kwargs)
+                if (r.kv_map is not None
+                        and len(r.kv_map) < len(list(self.layers))):
                     pass  # hooks still pending; stay on stock
-                else:
+                elif r.kv_map is not None:
                     if not r.prepared:
                         try:
                             r.prepare(self)
