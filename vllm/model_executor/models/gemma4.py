@@ -1790,3 +1790,18 @@ class Gemma4ForCausalLM(
 
         loader = AutoWeightsLoader(self, skip_substrs=skip)
         return loader.load_weights(_weight_iterator())
+
+
+# --- Env-gated megakernel decode path (VLLM_GEMMA4_MEGAKERNEL=1) ---
+# Patches a gated wrapper onto Gemma4Model.forward at import time; C1/
+# small-batch pure-decode steps then run the fused 3-launch-per-layer
+# megakernel chain under self-managed cudagraphs, everything else falls
+# through to the stock path. With the flag unset this block is inert.
+import os as _mk_os  # noqa: E402
+
+if _mk_os.environ.get("VLLM_GEMMA4_MEGAKERNEL", "0") == "1":
+    from vllm.model_executor.models.gemma4_megakernel import (  # noqa: E402
+        enable_megakernel,
+    )
+
+    enable_megakernel()
