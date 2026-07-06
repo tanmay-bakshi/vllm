@@ -105,6 +105,8 @@ class MegaRunner:
                 (int(p.split(":")[0]), int(p.split(":")[1]))
                 for p in ms.split(","))
         self.pdl = os.environ.get("MK_PDL", "0") == "1"
+        # periodic counter log for serve-mode observability (0 = off)
+        self.log_every = int(os.environ.get("MK_LOG_EVERY", "0"))
 
     # ---------- one-shot KV tensor harvest ----------
     # layer.kv_cache[0] read at model-forward start is a one-block stub
@@ -248,7 +250,8 @@ class MegaRunner:
         # trtllm-gen workspace: internal split scheduling scales with
         # max_seq_len (graphs capture at the 8192 upper bound); deployed
         # allocates 413MB for this config -- match it with headroom
-        s.ws = torch.zeros(512 * 1024 * 1024, dtype=torch.uint8, device=dev)
+        ws_mb = int(os.environ.get("MK_WS_MB", "512"))
+        s.ws = torch.zeros(ws_mb * 1024 * 1024, dtype=torch.uint8, device=dev)
 
         # ---- compile the four kernels (m_real per self.m_set) ----
         from mk_fused.fused_preattn_sm100 import Sm100PreAttnKernel
@@ -534,6 +537,10 @@ class MegaRunner:
             s.eager_steps += 1
 
         s.steps += 1
+        if s.log_every and s.steps % s.log_every == 0:
+            _log(f"steps={s.steps} graph={s.graph_steps} "
+                 f"eager={s.eager_steps} fb={s.fb} "
+                 f"graphs={sorted(s.graphs)}")
         hidden = s.hid[:m]
         if s.taps:
             return hidden, [s.aux_buf[k][:m] for k in s.taps]
