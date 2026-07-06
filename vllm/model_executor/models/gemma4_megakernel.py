@@ -49,7 +49,7 @@ if MK_ROOT not in sys.path:
 
 HIDDEN, INTER = 5376, 21504
 N2 = 5632                      # down/o_proj padded N (tile 128 x cga 4)
-MAXM = 64
+MAXM = 128
 EPS = 1e-6
 
 
