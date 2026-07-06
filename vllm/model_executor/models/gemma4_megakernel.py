@@ -104,6 +104,17 @@ class MegaRunner:
         # -cc {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}.
         self.native = os.environ.get("MK_NATIVE", "0") == "1"
         self.native_captured = set()
+        # bisect knob: in native mode, capture-pass sizes with q*r >
+        # bake_max are baked STOCK while their warmups still run prep +
+        # the eager chain (plus one stock pass so the stock kernels for
+        # that size stay warmed). Separates "prep/eager ran at big M"
+        # from "a mega graph was CAPTURED at big M". 0 = off.
+        self.bake_max = int(os.environ.get("MK_BAKE_MAX", "0"))
+        # log allocator deltas for the chain inside each capture region
+        self.cap_debug = os.environ.get("MK_CAP_DEBUG", "0") == "1"
+        # forensics: redzone guards between flags tensors + checksum log
+        # after prep and after each eager chain (first 80 eager steps)
+        self.flag_log = os.environ.get("MK_FLAG_LOG", "0") == "1"
         self._last_mds = None
         self._last_m = 0
         ms = os.environ.get("MK_MSET")
@@ -146,6 +157,58 @@ class MegaRunner:
             handles_for[lname] = [h]
             handles.append(h)
         _log("kv harvest hooks installed (one stock step)")
+
+    # ---------- KV-binding guards ----------
+    # vLLM's cudagraph memory profiling (default since v0.21) runs
+    # warmup+capture dummy passes against a TEMPORARY profiling KV
+    # cache before the real one exists, and it profiles the two
+    # LARGEST capture sizes. Any m_set covering those shapes made the
+    # runner harvest/prep there: baked kv pointers (and the
+    # compile-time kv_numel) referenced a cache freed right after
+    # profiling, so every mega launch afterwards read and wrote
+    # through dangling pointers. That was the whole "M>=96 capture
+    # poison". Guard on both sides: never prep on a stub, and reset
+    # if the live binding ever moves out from under an existing prep
+    # (sleep/wake, elastic re-init, future ordering changes).
+    def _kv_ok(self, model, md_all):
+        a = model.layers[0].self_attn.attn
+        kvc = self.kv_map.get(a.layer_name)
+        if kvc is None:
+            return False
+        live = a.kv_cache[0] if isinstance(
+            a.kv_cache, (list, tuple)) else a.kv_cache
+        if live.data_ptr() != kvc.data_ptr():
+            _log("kv binding moved from under the harvest/prep; "
+                 "resetting")
+            return False
+        if not self.prepared:
+            # stub check (once, pre-prep): a real cache must hold at
+            # least one max-len request (pages >= block-table length)
+            nb = _kv5(kvc, a.impl.num_kv_heads,
+                      a.impl.head_size).shape[0]
+            bt_len = int(md_all[a.layer_name].decode
+                         .block_tables.shape[1])
+            if nb < bt_len:
+                _log(f"kv cache is a profiling stub ({nb} pages < "
+                     f"bt_len {bt_len}); staying stock until the "
+                     "real cache is bound")
+                return False
+        return True
+
+    def _reset_prep(self):
+        self.kv_map = None
+        if self.prepared:
+            self.prepared = False
+            self.native_captured.clear()
+            self.graphs.clear()
+            self.g_guards.clear()
+            self.eager_runs.clear()
+            for attr in ("lps", "k3", "k2", "cs_keep", "ws", "flags3",
+                         "flags2", "flag_guards", "aux_buf"):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+            torch.cuda.empty_cache()
+            _log("released stale prep state; will re-harvest + re-prep")
 
     # ---------- gate ----------
     def _gate(self, model, intermediate_tensors):
@@ -255,12 +318,21 @@ class MegaRunner:
         # deadlocks the first larger-shape launch after smaller-shape
         # traffic (poll target runs ahead of the cumulative release) and
         # opens gates early in the other direction. One set per shape.
-        s.flags3 = {(f, q, r): torch.zeros(2048, dtype=torch.int32,
-                                           device=dev)
+        s.flag_guards = []
+
+        def _fl(n):
+            t = torch.zeros(n, dtype=torch.int32, device=dev)
+            # redzone right after each flags tensor: same segment in the
+            # caching allocator with high probability, so an OOB writer
+            # runs into it and the flaglog checksum exposes it
+            s.flag_guards.append(
+                torch.zeros(512, dtype=torch.int32, device=dev))
+            return t
+
+        s.flags3 = {(f, q, r): _fl(2048)
                     for f in fc for (q, r) in s.m_set}
-        s.flags2 = {(f, q * r): torch.zeros(
-                        2 * INTER // 128 + t2_slots + 2 + 2048,
-                        dtype=torch.int32, device=dev)
+        s.flags2 = {(f, q * r): _fl(
+                        2 * INTER // 128 + t2_slots + 2 + 2048)
                     for f in fc for (q, r) in s.m_set}
         # trtllm-gen workspace: internal split scheduling scales with
         # max_seq_len (graphs capture at the 8192 upper bound); deployed
@@ -426,7 +498,18 @@ class MegaRunner:
         s.cs_keep = {f: fc[f]["cs"] for f in fc}
         _log(f"aux taps: {s.taps}; cap_max_seq {s.cap_max_seq}")
         self.prepared = True
+        if s.flag_log:
+            s._flagdump("post-prep")
         _log(f"prepare done in {time.time() - t0:.0f}s")
+
+    def _flagdump(self, tag):
+        s = self
+        gsum = sum(int(t.abs().sum()) for t in s.flag_guards)
+        f3 = {f"{k[0][0]}{k[1]}:{k[2]}": int(v.abs().sum())
+              for k, v in s.flags3.items()}
+        f2 = {f"{k[0][0]}{k[1]}": int(v.abs().sum())
+              for k, v in s.flags2.items()}
+        _log(f"flaglog {tag}: guards={gsum} f3={f3} f2={f2}")
 
     # ---------- the decode step ----------
     def _chain(self, q, r, mds, max_seq):
@@ -502,14 +585,25 @@ class MegaRunner:
         mds = [md_all[lp.lname] for lp in s.lps]
         s._last_mds, s._last_m = mds, key
         if s.native:
+            cap = torch.cuda.is_current_stream_capturing()
+            st0 = torch.cuda.memory_stats() if (s.cap_debug and cap) else None
             self._chain(q, r, mds, s.cap_max_seq)
             s.steps += 1
-            if torch.cuda.is_current_stream_capturing():
+            if cap:
+                if st0 is not None:
+                    st1 = torch.cuda.memory_stats()
+                    _log(f"capdbg {key}: x_ptr={x.data_ptr():#x} "
+                         f"chain_allocs="
+                         f"{st1['allocation.all.current'] - st0['allocation.all.current']} "
+                         f"chain_bytes="
+                         f"{st1['allocated_bytes.all.current'] - st0['allocated_bytes.all.current']}")
                 if key not in s.native_captured:
                     s.native_captured.add(key)
                     _log(f"native: chain baked into vLLM graph {key}")
             else:
                 s.eager_steps += 1
+                if s.flag_log and s.eager_steps <= 80:
+                    s._flagdump(f"after-eager {key}")
             hidden = s.hid[:m]
             if s.taps:
                 return hidden, [s.aux_buf[k][:m] for k in s.taps]
@@ -605,6 +699,14 @@ def install():
             g = r._gate(self, intermediate_tensors)
             if g is not None:
                 md_all, m = g
+                over = (r.native and r.bake_max
+                        and m[0] * m[1] > r.bake_max)
+                if over and torch.cuda.is_current_stream_capturing():
+                    # bisect knob: bake this size STOCK; its warmups
+                    # below still ran the mega chain at this size
+                    return _ORIG(self, input_ids, positions,
+                                 intermediate_tensors, inputs_embeds,
+                                 per_layer_inputs, **kwargs)
                 if r.kv_map is None:
                     # sacrificial stock step harvests live KV tensors
                     r._harvest(self)
@@ -621,16 +723,31 @@ def install():
                         and len(r.kv_map) < len(list(self.layers))):
                     pass  # hooks still pending; stay on stock
                 elif r.kv_map is not None:
-                    if not r.prepared:
-                        try:
-                            r.prepare(self)
-                        except Exception:
-                            r.prep_failed = True
-                            import traceback
-                            traceback.print_exc()
-                            raise
-                    return r.run(self, input_ids, positions,
-                                 inputs_embeds, md_all, m)  # m=(q,r)
+                    if not r._kv_ok(self, md_all):
+                        # profiling stub, or the engine re-bound its KV
+                        # cache: forget the harvest (and any prep built
+                        # on it) and serve this step stock; a later
+                        # step re-harvests the live tensors
+                        r._reset_prep()
+                    else:
+                        if not r.prepared:
+                            try:
+                                r.prepare(self)
+                            except Exception:
+                                r.prep_failed = True
+                                import traceback
+                                traceback.print_exc()
+                                raise
+                        out = r.run(self, input_ids, positions,
+                                    inputs_embeds, md_all, m)  # m=(q,r)
+                        if over:
+                            # capture will bake stock at this size, so
+                            # keep the stock kernels warmed here too
+                            return _ORIG(self, input_ids, positions,
+                                         intermediate_tensors,
+                                         inputs_embeds,
+                                         per_layer_inputs, **kwargs)
+                        return out
         return _ORIG(self, input_ids, positions, intermediate_tensors,
                      inputs_embeds, per_layer_inputs, **kwargs)
 
