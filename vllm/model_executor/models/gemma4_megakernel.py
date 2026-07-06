@@ -51,10 +51,80 @@ HIDDEN, INTER = 5376, 21504
 N2 = 5632                      # down/o_proj padded N (tile 128 x cga 4)
 MAXM = 128
 EPS = 1e-6
+# compile-time KV extent: a fixed upper bound instead of the live
+# cache's numel. It is only a flat layout extent (addressing is
+# page-driven, no masking against it), so the bound makes kernel
+# compiles independent of boot state: they can start during memory
+# profiling and survive KV rebinds without recompiling.
+KV_NUMEL_BOUND = 1 << 38
 
 
 def _log(msg):
     print(f"[mk_gemma4] {msg}", flush=True)
+
+
+def _install_dsl_compile_lock():
+    """Serialize ALL cute-DSL compiles in this process. The DSL
+    front-end is thread-hostile (two concurrent compiles abort with
+    nanobind 'No current Location'), and flashinfer's NVFP4 kernels
+    compile through the same singleton, so the async prep thread must
+    never overlap them. BaseDSL._func is the shared entry for both
+    cute.compile and @cute.jit direct calls; it re-enters itself
+    during tracing, hence the RLock."""
+    import threading
+    from cutlass.base_dsl.dsl import BaseDSL
+    if getattr(BaseDSL, "_mk_compile_lock_installed", False):
+        return
+    lock = threading.RLock()
+    orig = BaseDSL._func
+
+    def locked(self, *args, **kwargs):
+        with lock:
+            return orig(self, *args, **kwargs)
+
+    BaseDSL._func = locked
+    BaseDSL._mk_compile_lock_installed = True
+    _log("cute-DSL compile lock installed (process-wide)")
+
+
+def _compile_shapes(m_set, facts, pdl, tag):
+    """Compile B3+B2 for every (q, r) x flavor. facts: flavor -> dict
+    of ints (n_qkv, heads, KV, hd, q_size, ps, bt_len, cs_numel); all
+    boot-invariant, so async-compiled kernels stay valid across KV
+    rebinds. Every cute.compile goes through the process-wide lock."""
+    import time
+    from mk_fused.fused_preattn_sm100 import Sm100PreAttnKernel
+    from mk_fused.fused_postattn_sm100 import Sm100PostAttnKernel
+    from mkbench.cutedsl_driver import (compile_fused_preattn,
+                                        compile_fused_postattn)
+    t0 = time.time()
+    k3, k2, k2_by_m = {}, {}, {}
+    for (q, r) in m_set:
+        M = q * r
+        mp = max(M, 8)
+        for f, c in facts.items():
+            if f == "global" and "MK_KSPLIT_Q" not in os.environ:
+                os.environ["MK_KSPLIT_Q"] = "2"
+            k = Sm100PreAttnKernel(
+                mp, M, c["n_qkv"], HIDDEN, c["heads"], c["KV"],
+                c["hd"], kv_numel=KV_NUMEL_BOUND,
+                cs_numel=c["cs_numel"], bt_len=c["bt_len"],
+                page_size=c["ps"], bt_stride=c["bt_len"], q_len=q,
+                mo_stride=N2,
+                cluster_shape_mn=(1, 4), enable_pdl=pdl)
+            k3[(f, q, r)] = compile_fused_preattn(k)
+            if f == "global":
+                os.environ.pop("MK_KSPLIT_Q", None)
+            if (f, M) not in k2_by_m:
+                k = Sm100PostAttnKernel(
+                    mp, M, 2 * INTER, HIDDEN, N2, INTER,
+                    c["q_size"], mma_tiler_mn=(128, 128),
+                    cluster_shape_mn=(1, 4), enable_pdl=pdl)
+                k2_by_m[(f, M)] = compile_fused_postattn(k)
+            k2[(f, q, r)] = k2_by_m[(f, M)]
+            _log(f"[{tag}] compiled B3+B2 {f} q={q} r={r} M={M} "
+                 f"({time.time() - t0:.0f}s)")
+    return k3, k2
 
 
 def _kv5(kvc: torch.Tensor, KV: int, hd: int) -> torch.Tensor:
@@ -115,6 +185,15 @@ class MegaRunner:
         # forensics: redzone guards between flags tensors + checksum log
         # after prep and after each eager chain (first 80 eager steps)
         self.flag_log = os.environ.get("MK_FLAG_LOG", "0") == "1"
+        # overlap kernel compiles with engine boot: the profiling-phase
+        # gated step starts them on a background thread (cross-boot
+        # file caching is structurally unavailable: the DSL front-end
+        # is ~80% of compile time and cute.compile hard-disables the
+        # jit cache; see SESSION_FINDINGS phase 8)
+        self.async_compile = os.environ.get("MK_ASYNC_COMPILE", "1") == "1"
+        self._compile_thread = None
+        self._compile_err = False
+        self._pre = None
         self._last_mds = None
         self._last_m = 0
         ms = os.environ.get("MK_MSET")
@@ -157,6 +236,69 @@ class MegaRunner:
             handles_for[lname] = [h]
             handles.append(h)
         _log("kv harvest hooks installed (one stock step)")
+
+    # ---------- async kernel compiles ----------
+    def _compile_facts(self, model, md_all):
+        """Flavor -> compile-relevant integers. Everything here is
+        boot-invariant (the KV extent is KV_NUMEL_BOUND), so facts read
+        from the memory-profiling phase are valid for the real engine."""
+        facts = {}
+        for layer in model.layers:
+            f = "global" if layer.is_full_attention else "local"
+            if f in facts:
+                continue
+            a = layer.self_attn
+            kvc = self.kv_map[a.attn.layer_name]
+            KV = a.attn.impl.num_kv_heads
+            hd = a.attn.impl.head_size
+            facts[f] = dict(
+                KV=KV, hd=hd, ps=_kv5(kvc, KV, hd).shape[3],
+                heads=a.attn.impl.num_heads,
+                q_size=a.attn.impl.num_heads * hd,
+                n_qkv=(a.attn.impl.num_heads + 2 * KV) * hd,
+                bt_len=int(md_all[a.attn.layer_name].decode
+                           .block_tables.shape[1]),
+                cs_numel=a.rotary_emb.cos_sin_cache.numel(),
+            )
+        return facts
+
+    def _start_async_compiles(self, model, md_all):
+        if (not self.async_compile or self._compile_thread is not None
+                or self.prepared or self.kv_map is None):
+            return
+        import threading
+        try:
+            _install_dsl_compile_lock()
+            facts = self._compile_facts(model, md_all)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            return
+        m_set, pdl = self.m_set, self.pdl
+
+        def work():
+            try:
+                self._pre = _compile_shapes(m_set, facts, pdl, "async")
+                _log("async compiles done")
+            except Exception:
+                self._compile_err = True
+                import traceback
+                traceback.print_exc()
+
+        self._compile_thread = threading.Thread(
+            target=work, daemon=True, name="mk-compile")
+        self._compile_thread.start()
+        _log(f"async kernel compiles started ({len(m_set)} shapes x "
+             f"{len(facts)} flavors)")
+
+    def _join_async_compiles(self):
+        t = self._compile_thread
+        if t is None:
+            return None
+        if t.is_alive():
+            _log("waiting for async compiles...")
+        t.join()
+        return None if self._compile_err else self._pre
 
     # ---------- KV-binding guards ----------
     # vLLM's cudagraph memory profiling (default since v0.21) runs
@@ -340,38 +482,10 @@ class MegaRunner:
         ws_mb = int(os.environ.get("MK_WS_MB", "512"))
         s.ws = torch.zeros(ws_mb * 1024 * 1024, dtype=torch.uint8, device=dev)
 
-        # ---- compile the four kernels (m_real per self.m_set) ----
-        from mk_fused.fused_preattn_sm100 import Sm100PreAttnKernel
-        from mk_fused.fused_postattn_sm100 import Sm100PostAttnKernel
-        from mkbench.cutedsl_driver import (compile_fused_preattn,
-                                            compile_fused_postattn)
-        s.k3, s.k2 = {}, {}
-        k2_by_m = {}
-        for (q, r) in self.m_set:
-            M = q * r
-            mp = max(M, 8)
-            for f in fc:
-                c = fc[f]
-                if f == "global" and "MK_KSPLIT_Q" not in os.environ:
-                    os.environ["MK_KSPLIT_Q"] = "2"
-                k = Sm100PreAttnKernel(
-                    mp, M, c["n_qkv"], HIDDEN, c["heads"], c["KV"],
-                    c["hd"], kv_numel=c["kv_numel"],
-                    cs_numel=c["cs"].numel(), bt_len=c["bt_len"],
-                    page_size=c["ps"], bt_stride=c["bt_len"], q_len=q,
-                    cluster_shape_mn=(1, 4), enable_pdl=self.pdl)
-                s.k3[(f, q, r)] = compile_fused_preattn(k)
-                if f == "global":
-                    os.environ.pop("MK_KSPLIT_Q", None)
-                if (f, M) not in k2_by_m:
-                    k = Sm100PostAttnKernel(
-                        mp, M, 2 * INTER, HIDDEN, N2, INTER,
-                        c["q_size"], mma_tiler_mn=(128, 128),
-                        cluster_shape_mn=(1, 4), enable_pdl=self.pdl)
-                    k2_by_m[(f, M)] = compile_fused_postattn(k)
-                s.k2[(f, q, r)] = k2_by_m[(f, M)]
-                _log(f"compiled B3+B2 {f} q={q} r={r} M={M} "
-                     f"({time.time() - t0:.0f}s)")
+        # ---- kernels compile at the END of prepare: weight prep runs
+        # first so it overlaps the async compile thread's tail
+        for f in fc:
+            fc[f]["cs_numel"] = fc[f]["cs"].numel()
 
         # ---- per-layer weights + arg lists ----
         s.lps = []
@@ -436,7 +550,7 @@ class MegaRunner:
                          wpf2_prev=wpf2_prev.contiguous())
 
             lp.b3_args = [
-                s.mo.data_ptr(), s.r2.data_ptr(),
+                s.out.data_ptr(), s.r2.data_ptr(),
                 norms["wpf2_prev"].data_ptr(), norms["win"].data_ptr(),
                 s.h.data_ptr(), s.xq8.data_ptr(), s.xs.data_ptr(),
                 wq8.data_ptr(), wqs.data_ptr(),
@@ -497,6 +611,14 @@ class MegaRunner:
         # them out from under the baked pointers. (7-round bisect.)
         s.cs_keep = {f: fc[f]["cs"] for f in fc}
         _log(f"aux taps: {s.taps}; cap_max_seq {s.cap_max_seq}")
+        pre = self._join_async_compiles()
+        if pre is not None:
+            s.k3, s.k2 = pre
+            _log(f"kernels: adopted async-compiled set "
+                 f"({time.time() - t0:.0f}s into prepare)")
+        else:
+            _install_dsl_compile_lock()
+            s.k3, s.k2 = _compile_shapes(self.m_set, fc, self.pdl, "prep")
         self.prepared = True
         if s.flag_log:
             s._flagdump("post-prep")
@@ -518,7 +640,9 @@ class MegaRunner:
         q = tokens per request, r = requests, T = q*r total rows."""
         s = self
         m = q * r
-        s.mo[:m].zero_()
+        # B3 reads B2's padded out directly (mo_stride=N2); zeroed rows
+        # are the layer-0 "mo = 0" entry
+        s.out[:m].zero_()
         s.r2[:m].copy_(s.xin[:m])
         if 0 in s.tapset:
             s.aux_buf[0][:m].copy_(s.xin[:m])
@@ -545,8 +669,9 @@ class MegaRunner:
             lp.b2_args[lp.fl2_idx] = (
                 s.flags2[(lp.flavor, m)].data_ptr())
             s.k2[(lp.flavor, q, r)](*lp.b2_args)
-            s.mo[:m].copy_(s.out[:m, :HIDDEN])
-        # tail: close layer 59 + the model's final norm
+        # tail: close layer 59 + the model's final norm. One contiguous
+        # staging copy for rms_norm's input contract (was per-layer).
+        s.mo[:m].copy_(s.out[:m, :HIDDEN])
         s._ops.rms_norm(s.xt[:m], s.mo[:m], s.w_pff_last, EPS)
         s.xt[:m].add_(s.r2[:m])
         s.xt[:m].mul_(s.ls_last)
@@ -725,9 +850,12 @@ def install():
                 elif r.kv_map is not None:
                     if not r._kv_ok(self, md_all):
                         # profiling stub, or the engine re-bound its KV
-                        # cache: forget the harvest (and any prep built
-                        # on it) and serve this step stock; a later
-                        # step re-harvests the live tensors
+                        # cache: start the kernel compiles in the
+                        # background (compile facts from this metadata
+                        # are boot-invariant), then forget the harvest
+                        # and serve this step stock; a later step
+                        # re-harvests the live tensors
+                        r._start_async_compiles(self, md_all)
                         r._reset_prep()
                     else:
                         if not r.prepared:
