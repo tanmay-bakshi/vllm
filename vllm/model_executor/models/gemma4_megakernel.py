@@ -476,11 +476,10 @@ class MegaRunner:
         s.flags2 = {(f, q * r): _fl(
                         2 * INTER // 128 + t2_slots + 2 + 2048)
                     for f in fc for (q, r) in s.m_set}
-        # trtllm-gen workspace: internal split scheduling scales with
-        # max_seq_len (graphs capture at the 8192 upper bound); deployed
-        # allocates 413MB for this config -- match it with headroom
-        ws_mb = int(os.environ.get("MK_WS_MB", "512"))
-        s.ws = torch.zeros(ws_mb * 1024 * 1024, dtype=torch.uint8, device=dev)
+        # trtllm-gen workspace is allocated AFTER cap_max_seq is known
+        # (see below): its demand scales with the baked max_seq_len, and
+        # an undersized buffer corrupts long-context attention SILENTLY
+        # before it eventually IMAs at higher concurrency.
 
         # ---- kernels compile at the END of prepare: weight prep runs
         # first so it overlaps the async compile thread's tail
@@ -604,6 +603,15 @@ class MegaRunner:
         s.aux_buf = {k: torch.zeros(MAXM, HIDDEN, dtype=torch.bfloat16,
                                     device=dev) for k in s.taps}
         s.cap_max_seq = max(c["bt_len"] * c["ps"] for c in fc.values())
+        # trtllm-gen workspace: 512MB per 8192 of cap_max_seq, floor
+        # 1024MB (deployed reference 413MB@8192; 1024MB at max_seq 65536
+        # produced silent long-context garbage then an IMA at C4).
+        # MK_WS_MB > 0 overrides.
+        ws_mb = int(os.environ.get("MK_WS_MB", "0")) or max(
+            1024, s.cap_max_seq // 8192 * 512)
+        s.ws = torch.zeros(ws_mb * 1024 * 1024, dtype=torch.uint8,
+                           device=dev)
+        _log(f"trtllm workspace {ws_mb}MB (cap_max_seq {s.cap_max_seq})")
         # KEEPALIVE for the cos_sin caches: their data_ptrs are baked
         # into every B3 arg list, but fc is a local — without this ref
         # they get freed to the allocator cache and the first
