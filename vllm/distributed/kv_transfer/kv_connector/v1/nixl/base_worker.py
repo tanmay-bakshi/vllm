@@ -360,6 +360,37 @@ class NixlBaseConnectorWorker:
             )
         self.device_kv_caches: dict[str, torch.Tensor] = {}
 
+        # Coalesced pull path (VLLM_NIXL_COALESCED_PULL=1): with remote
+        # TP > local TP, the stock pull scatters one descriptor per
+        # (block, region, K/V, remote shard) -- the local head-slice
+        # destinations are strided, so descriptors bottom out at
+        # local_block_len/|tp_ratio| bytes (16KB here) and transfers run
+        # latency-bound at ~0.25% of fabric bandwidth, with descriptor
+        # posting/reaping stalling the engine thread. This path instead
+        # reads whole remote blocks in contiguous-run descriptors into a
+        # registered staging buffer (O(regions x runs) descriptors) and
+        # re-scatters into the real cache with one strided GPU copy per
+        # (region, shard) at completion, before the request is released
+        # to the scheduler. Byte placement is identical to stock.
+        self.coalesce_pull = os.environ.get(
+            "VLLM_NIXL_COALESCED_PULL", "0") == "1"
+        self.coalesce_staging_mb = int(os.environ.get(
+            "VLLM_NIXL_COALESCED_STAGING_MB", "6144"))
+        self._staging_buf: torch.Tensor | None = None
+        self._staging_free: list[tuple[int, int]] = []
+        # req_id -> scatter plan (staging offsets + block index map)
+        self._coalesce_plans: dict[ReqId, dict] = {}
+        # canonicalized (nb, row_bytes) uint8 views of each region's
+        # physical storage (registered tensors are permuted VIEWS of the
+        # HND-contiguous base; stride-sorting recovers it). None until
+        # built; False-y build failure disables coalescing.
+        self._region_rows: list[torch.Tensor] | None = None
+        # engine_id -> rank -> (block_lens, num_blocks, device_id) from
+        # the handshake metadata (needed to build raw range descriptors)
+        self._remote_layout: dict[EngineId, dict[int, tuple]] = defaultdict(dict)
+        # region index -> registered cache tensor (scatter destinations)
+        self._region_tensors: list[torch.Tensor] = []
+
         # cpu kv buffer for xfer
         # used when device memory can not be registered under nixl
         self.host_xfer_buffers: dict[str, torch.Tensor] = {}
@@ -1060,6 +1091,7 @@ class NixlBaseConnectorWorker:
                     "Registering layer %s with cache shape: %s", layer_name, cache.shape
                 )
                 seen_base_addresses.append(base_addr)
+                self._region_tensors.append(cache)
                 # Only record non-Mamba page sizes.
                 if isinstance(layer_spec, MambaSpec):
                     self.block_len_per_layer.append(
@@ -1514,6 +1546,13 @@ class NixlBaseConnectorWorker:
         self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
             nixl_agent_meta.kv_caches_base_addr
         )
+        # Retain per-region layout facts for the coalesced pull path
+        # (raw range descriptors are built from these at transfer time).
+        self._remote_layout[engine_id][remote_tp_rank] = (
+            list(nixl_agent_meta.block_lens),
+            nixl_agent_meta.num_blocks,
+            nixl_agent_meta.device_id,
+        )
         self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
 
         # This is 1 when P and D `--tensor-parallel-size` match. Otherwise,
@@ -1880,6 +1919,126 @@ class NixlBaseConnectorWorker:
                 indices=indices,
             )
 
+    # ------------------------------------------------------------------
+    # Coalesced pull: staging buffer + completion scatter
+    # ------------------------------------------------------------------
+
+    def _staging_init(self) -> bool:
+        """Lazily allocate and NIXL-register the staging buffer."""
+        if self._staging_buf is not None:
+            return True
+        size = self.coalesce_staging_mb * 1024 * 1024
+        try:
+            dev = next(iter(self.device_kv_caches.values())).device
+            self._staging_buf = torch.zeros(size, dtype=torch.uint8, device=dev)
+            self.nixl_wrapper.register_memory(
+                [(self._staging_buf.data_ptr(), size, self.device_id, "")],
+                self.nixl_memory_type,
+            )
+        except Exception:
+            logger.exception("coalesced pull: staging init failed; disabling")
+            self.coalesce_pull = False
+            self._staging_buf = None
+            return False
+        self._staging_free = [(0, size)]
+        logger.info("coalesced pull: %sMB staging registered",
+                    self.coalesce_staging_mb)
+        return True
+
+    def _staging_alloc(self, need: int) -> int | None:
+        """First-fit allocation from the staging free list."""
+        for i, (off, size) in enumerate(self._staging_free):
+            if size >= need:
+                if size == need:
+                    self._staging_free.pop(i)
+                else:
+                    self._staging_free[i] = (off + need, size - need)
+                return off
+        return None
+
+    def _staging_release(self, off: int, size: int) -> None:
+        """Return a range to the free list, merging neighbors."""
+        self._staging_free.append((off, size))
+        self._staging_free.sort()
+        merged: list[tuple[int, int]] = []
+        for o, s in self._staging_free:
+            if merged and merged[-1][0] + merged[-1][1] == o:
+                merged[-1] = (merged[-1][0], merged[-1][1] + s)
+            else:
+                merged.append((o, s))
+        self._staging_free = merged
+
+    def _coalesce_drop_plan(self, req_id: ReqId) -> None:
+        """Free a request's staging without scattering (failure path)."""
+        plan = self._coalesce_plans.pop(req_id, None)
+        if plan is not None:
+            self._staging_release(plan["off"], plan["size"])
+
+    def _coalesce_region_rows(self) -> bool:
+        """Canonicalize every region tensor to a (num_blocks, row_bytes)
+        uint8 view of its physical storage. Registered cache tensors are
+        permuted views of the HND-contiguous base (pages outermost);
+        stride-sorting the dims recovers it. Any region that does not
+        canonicalize this way disables the coalesced path -- checked
+        here, before any transfer is ever posted."""
+        if self._region_rows is not None:
+            return True
+        rows: list[torch.Tensor] = []
+        for i, cache in enumerate(self._region_tensors):
+            order = sorted(range(cache.dim()), key=lambda d: -cache.stride(d))
+            phys = cache.permute(order)
+            if not phys.is_contiguous() or phys.shape[0] != cache.shape[0]:
+                logger.warning(
+                    "coalesced pull: region %s not canonicalizable "
+                    "(shape %s strides %s); disabling",
+                    i, tuple(cache.shape), tuple(cache.stride()))
+                self.coalesce_pull = False
+                return False
+            flat = phys.view(torch.uint8).view(phys.shape[0], -1)
+            if flat.shape[1] != self.block_len_per_layer[i]:
+                logger.warning(
+                    "coalesced pull: region %s row bytes %s != block_len "
+                    "%s; disabling", i, flat.shape[1],
+                    self.block_len_per_layer[i])
+                self.coalesce_pull = False
+                return False
+            rows.append(flat)
+        self._region_rows = rows
+        return True
+
+    def _coalesced_scatter(self, req_id: ReqId) -> None:
+        """Distribute a completed request's staged KV into the real
+        cache: per (region, shard) one strided-view copy, staging
+        (n_pos, K/V, chunk) -> cache rows [K: slots 0..R-1 | V: slots
+        0..R-1] at the shard's slot. Runs on the current stream, so it
+        is ordered before any later attention over these blocks --
+        same contract as the existing post-receive processing."""
+        plan = self._coalesce_plans.pop(req_id, None)
+        if plan is None:
+            return
+        try:
+            assert self._staging_buf is not None
+            assert self._region_rows is not None
+            idx = torch.tensor(plan["lpos"], device=self._staging_buf.device,
+                               dtype=torch.long)
+            n_pos, n_ranks = plan["n_pos"], plan["n_ranks"]
+            for i, flat in enumerate(self._region_rows):
+                blen = plan["blens"][i]
+                chunk = blen // 2
+                base = plan["off"] + plan["region_off"][i]
+                reg = self._staging_buf[base:base + n_ranks * n_pos * blen]
+                reg = reg.view(n_ranks, n_pos, 2, chunk)
+                dest = flat.view(flat.shape[0], 2, n_ranks, chunk)
+                for r in range(n_ranks):
+                    dest[:, :, plan["slots"][r], :][idx] = reg[r]
+        finally:
+            # The scatter kernels read staging asynchronously while UCX
+            # writes for the NEXT user of this range are not
+            # stream-ordered: the range must not be reused until the
+            # copies have executed. (Future: event-deferred free list.)
+            torch.cuda.synchronize()
+            self._staging_release(plan["off"], plan["size"])
+
     def get_finished(self) -> tuple[set[str], set[str]]:
         """
         Get requests that are done sending or recving on this specific worker.
@@ -1928,6 +2087,10 @@ class NixlBaseConnectorWorker:
                 continue
 
             assert meta.remote is not None
+            if req_id in self._coalesce_plans:
+                # coalesced pull: staged bytes -> real cache before the
+                # scheduler sees the request as loaded
+                self._coalesced_scatter(req_id)
             if self.use_host_buffer:
                 self.sync_recved_kv_to_device(req_id, meta)
 
@@ -2085,6 +2248,8 @@ class NixlBaseConnectorWorker:
         if (meta := self._recving_metadata.get(req_id)) and not self._is_hma_required:
             self._invalid_block_ids.put(set(meta.local_block_ids[0]))
         self._failed_recv_reqs.put(req_id)
+        # coalesced pull: free the staging range, skip the scatter
+        self._coalesce_drop_plan(req_id)
         if handle is not None:
             self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()

@@ -140,6 +140,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         if self.use_mla and tp_ratio < 0:
             assert len(read_specs) == 1
 
+        # Coalesced pull fast path (see base_worker state comment): all
+        # gates must hold or we fall through to the stock per-descriptor
+        # path, which stays authoritative.
+        if self._coalesce_gate(engine_id, tp_ratio, read_specs):
+            if self._coalesced_read_request(req_id, meta, read_specs):
+                return
+
         for i, spec in enumerate(read_specs):
             remote_block_size = remote_info.remote_block_size
             logger.debug(
@@ -185,6 +192,174 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             for rank_to_notify, agent in remote_agents.items():
                 if rank_to_notify != read_specs[0].remote_rank:
                     self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
+
+    # ------------------------------------------------------------------
+    # Coalesced pull
+    # ------------------------------------------------------------------
+
+    def _coalesce_gate(self, engine_id: str, tp_ratio: int,
+                       read_specs: list[ReadSpec]) -> bool:
+        """All conditions under which the coalesced path is proven
+        equivalent to the stock path. Anything else -> stock."""
+        if not self.coalesce_pull:
+            return False
+        if not (tp_ratio < 0 and not self.use_mla
+                and not self.use_host_buffer and not self._has_mamba):
+            return False
+        if self._physical_blocks_per_logical_kv_block != 1:
+            return False
+        if any(self._region_is_mla) or not self._region_tensors:
+            return False
+        assert self.transfer_topo is not None
+        remote_info = self.transfer_topo.get_engine_info(engine_id)
+        if self.transfer_topo.block_size_ratio(
+                remote_info.remote_block_size) != 1:
+            return False
+        layout = self._remote_layout.get(engine_id)
+        if not layout or any(s.remote_rank not in layout for s in read_specs):
+            return False
+        # uniform shard participation: every rank reads the same lists
+        # (pure SPLIT full-attention groups)
+        spec0 = read_specs[0]
+        for s in read_specs[1:]:
+            if (s.local_block_ids != spec0.local_block_ids
+                    or s.remote_block_ids != spec0.remote_block_ids):
+                return False
+        blens = layout[spec0.remote_rank][0]
+        if len(blens) != len(self._region_tensors):
+            return False
+        n_ranks = len(read_specs)
+        for i, blen in enumerate(blens):
+            # local block row must be exactly the |tp_ratio| remote
+            # shard blocks side by side, K/V halves equal
+            if blen % 2 != 0 or self.block_len_per_layer[i] != n_ranks * blen:
+                return False
+        if not self._coalesce_region_rows():
+            return False
+        return self._staging_init()
+
+    def _coalesced_read_request(self, req_id: str, meta: ReqMeta,
+                                read_specs: list[ReadSpec]) -> bool:
+        """Whole-request coalesced pull: per remote rank, one READ xfer
+        of contiguous whole-block run descriptors into staging. Returns
+        False (nothing posted) to fall back to the stock path; after the
+        first successful post, failures are routed through
+        _handle_failed_transfer and True is returned."""
+        assert meta.remote is not None and self.transfer_topo is not None
+        engine_id = meta.remote.engine_id
+        remote_info = self.transfer_topo.get_engine_info(engine_id)
+        spec0 = read_specs[0]
+        local_ids, remote_ids = self._apply_prefix_caching(
+            [list(g) for g in spec0.local_block_ids],
+            [list(g) for g in spec0.remote_block_ids],
+            remote_info.remote_physical_blocks_per_logical,
+        )
+        notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
+        if len(local_ids) == 0 or sum(len(g) for g in local_ids) == 0:
+            # full prefix hit: just release P's blocks on every rank
+            for s in read_specs:
+                agent = self._remote_agents[engine_id][s.remote_rank]
+                try:
+                    self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
+                except Exception:
+                    self.xfer_stats.record_failed_notification()
+            return True
+
+        # HMA broadcast semantics (see _compute_desc_ids): every group's
+        # blocks are transferred across every region, position-ordered.
+        lpos = np.concatenate([np.asarray(g, dtype=np.int64)
+                               for g in local_ids])
+        rpos = np.concatenate([np.asarray(g, dtype=np.int64)
+                               for g in remote_ids])
+        if len(lpos) != len(rpos):
+            return False
+        # Transfer order is free (the (remote, local) pairing is what
+        # matters): sort by remote id so run detection harvests all the
+        # adjacency the remote pool still has. The scatter index (lpos)
+        # is permuted identically, so placement is unchanged.
+        order = np.argsort(rpos, kind="stable")
+        rpos = rpos[order]
+        lpos = lpos[order]
+        n_pos = len(lpos)
+        n_ranks = len(read_specs)
+        blens = self._remote_layout[engine_id][spec0.remote_rank][0]
+        n_regions = len(blens)
+
+        # maximal consecutive remote-id runs: (start_id, count, pos0)
+        runs: list[tuple[int, int, int]] = []
+        k0 = 0
+        for k in range(1, n_pos + 1):
+            if k == n_pos or rpos[k] != rpos[k - 1] + 1:
+                runs.append((int(rpos[k0]), k - k0, k0))
+                k0 = k
+
+        region_off = [0] * n_regions
+        acc = 0
+        for i in range(n_regions):
+            region_off[i] = acc
+            acc += n_pos * n_ranks * blens[i]
+        off = self._staging_alloc(acc)
+        if off is None:
+            logger.debug(
+                "coalesced pull: staging full (%s needed), stock path "
+                "for %s", acc, req_id)
+            return False
+
+        assert self._staging_buf is not None
+        staging_base = self._staging_buf.data_ptr() + off
+        posted = False
+        try:
+            plan = self.tp_mappings[engine_id]
+            for ridx, s in enumerate(read_specs):
+                blens_r, _, rdev = self._remote_layout[engine_id][
+                    s.remote_rank]
+                assert blens_r == blens, "per-rank region layout mismatch"
+                rbases = self.kv_caches_base_addr[engine_id][s.remote_rank]
+                local_descs, remote_descs = [], []
+                for i in range(n_regions):
+                    base_i = (staging_base + region_off[i]
+                              + ridx * n_pos * blens[i])
+                    for (start, cnt, p0) in runs:
+                        ln = cnt * blens[i]
+                        local_descs.append(
+                            (base_i + p0 * blens[i], ln, self.device_id))
+                        remote_descs.append(
+                            (rbases[i] + start * blens[i], ln, rdev))
+                ld = self.nixl_wrapper.get_xfer_descs(
+                    local_descs, self.nixl_memory_type)
+                rd = self.nixl_wrapper.get_xfer_descs(
+                    remote_descs, self.nixl_memory_type)
+                agent = self._remote_agents[engine_id][s.remote_rank]
+                handle = self.nixl_wrapper.initialize_xfer(
+                    "READ", ld, rd, agent, notif_id)
+                self.nixl_wrapper.transfer(handle)
+                posted = True
+                self._recving_transfers[req_id].append(handle)
+        except Exception as e:
+            if not posted:
+                self._staging_release(off, acc)
+                logger.warning(
+                    "coalesced pull setup failed for %s (%s); stock path",
+                    req_id, e)
+                return False
+            self._log_failure(
+                failure_type="transfer_setup_failed",
+                req_id=req_id,
+                msg="coalesced pull failed mid-post; marking blocks invalid",
+                error=e,
+                dst_engine_id=engine_id,
+            )
+            self._coalesce_plans[req_id] = dict(off=off, size=acc)
+            self._handle_failed_transfer(req_id, None)
+            return True
+
+        self._coalesce_plans[req_id] = dict(
+            off=off, size=acc, n_pos=n_pos, n_ranks=n_ranks, blens=blens,
+            region_off=region_off, lpos=lpos.tolist(),
+            slots=[plan.rank_to_attention_slot.get(s.remote_rank, 0)
+                   for s in read_specs],
+        )
+        return True
 
     def _read_blocks(
         self,
