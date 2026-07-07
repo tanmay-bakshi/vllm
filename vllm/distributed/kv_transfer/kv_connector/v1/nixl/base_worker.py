@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
@@ -375,9 +375,17 @@ class NixlBaseConnectorWorker:
         self.coalesce_pull = os.environ.get(
             "VLLM_NIXL_COALESCED_PULL", "0") == "1"
         self.coalesce_staging_mb = int(os.environ.get(
-            "VLLM_NIXL_COALESCED_STAGING_MB", "6144"))
+            "VLLM_NIXL_COALESCED_STAGING_MB", "12288"))
         self._staging_buf: torch.Tensor | None = None
         self._staging_free: list[tuple[int, int]] = []
+        # requests waiting for a staging range (FIFO; serviced every
+        # get_finished as completions free ranges). Parking is safe:
+        # to the rest of the engine a parked request is
+        # indistinguishable from an in-flight transfer (blocks stay
+        # held until we report done_recving), and it beats the
+        # alternative -- falling back to the stock path costs ~20x in
+        # transfer time, while a range frees in ~100-300ms.
+        self._coalesce_pending: deque = deque()
         # req_id -> scatter plan (staging offsets + block index map)
         self._coalesce_plans: dict[ReqId, dict] = {}
         # canonicalized (nb, row_bytes) uint8 views of each region's
@@ -2141,7 +2149,16 @@ class NixlBaseConnectorWorker:
             del self._reqs_to_send[req_id]
             done_sending.add(req_id)
 
+        # coalesced pull: completed scatters freed staging; start
+        # transfers for requests parked on the staging pool
+        if self._coalesce_pending:
+            self._coalesce_service_pending()
+
         return done_sending, done_recving
+
+    def _coalesce_service_pending(self) -> None:
+        """Overridden by the pull worker; push has no pull staging."""
+        return
 
     def _sync_device_after_mamba_recv(
         self,

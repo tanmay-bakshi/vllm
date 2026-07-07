@@ -142,10 +142,31 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
         # Coalesced pull fast path (see base_worker state comment): all
         # gates must hold or we fall through to the stock per-descriptor
-        # path, which stays authoritative.
+        # path, which stays authoritative. A staging-pool miss PARKS the
+        # request (FIFO, serviced from get_finished) instead of taking
+        # the ~20x slower stock path.
         if self._coalesce_gate(engine_id, tp_ratio, read_specs):
-            if self._coalesced_read_request(req_id, meta, read_specs):
+            res = self._coalesced_read_request(req_id, meta, read_specs)
+            if res == "posted":
                 return
+            if res == "defer":
+                self._coalesce_pending.append((req_id, meta, read_specs))
+                logger.debug(
+                    "coalesced pull: parked %s for staging (%s queued)",
+                    req_id, len(self._coalesce_pending))
+                return
+
+        self._stock_read_specs(req_id, meta, read_specs)
+
+    def _stock_read_specs(self, req_id: str, meta: ReqMeta,
+                          read_specs: list[ReadSpec]) -> None:
+        """The stock per-descriptor pull for one request's read specs
+        (extracted from _read_blocks_for_req so the pending-queue
+        servicer can also route a request here)."""
+        assert meta.remote is not None and self.transfer_topo is not None
+        dst_engine_id = meta.remote.engine_id
+        remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
+        tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
 
         for i, spec in enumerate(read_specs):
             remote_block_size = remote_info.remote_block_size
@@ -238,13 +259,27 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             return False
         return self._staging_init()
 
+    def _coalesce_service_pending(self) -> None:
+        """Start transfers for requests parked on the staging pool
+        (FIFO -- strict head-of-line, so a large request cannot be
+        starved by smaller ones slipping past it)."""
+        while self._coalesce_pending:
+            req_id, meta, read_specs = self._coalesce_pending[0]
+            res = self._coalesced_read_request(req_id, meta, read_specs)
+            if res == "defer":
+                break
+            self._coalesce_pending.popleft()
+            if res == "stock":
+                self._stock_read_specs(req_id, meta, read_specs)
+
     def _coalesced_read_request(self, req_id: str, meta: ReqMeta,
-                                read_specs: list[ReadSpec]) -> bool:
+                                read_specs: list[ReadSpec]) -> str:
         """Whole-request coalesced pull: per remote rank, one READ xfer
-        of contiguous whole-block run descriptors into staging. Returns
-        False (nothing posted) to fall back to the stock path; after the
-        first successful post, failures are routed through
-        _handle_failed_transfer and True is returned."""
+        of contiguous whole-block run descriptors into staging.
+        Returns "posted" (transfers in flight, or nothing to pull, or a
+        mid-post failure already routed through _handle_failed_transfer),
+        "defer" (staging exhausted but the request fits the pool: park
+        and retry), or "stock" (nothing posted; run the stock path)."""
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
         remote_info = self.transfer_topo.get_engine_info(engine_id)
@@ -263,7 +298,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
                 except Exception:
                     self.xfer_stats.record_failed_notification()
-            return True
+            return "posted"
 
         # HMA broadcast semantics (see _compute_desc_ids): every group's
         # blocks are transferred across every region, position-ordered.
@@ -272,7 +307,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         rpos = np.concatenate([np.asarray(g, dtype=np.int64)
                                for g in remote_ids])
         if len(lpos) != len(rpos):
-            return False
+            return "stock"
         # Transfer order is free (the (remote, local) pairing is what
         # matters): sort by remote id so run detection harvests all the
         # adjacency the remote pool still has. The scatter index (lpos)
@@ -300,10 +335,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             acc += n_pos * n_ranks * blens[i]
         off = self._staging_alloc(acc)
         if off is None:
-            logger.debug(
-                "coalesced pull: staging full (%s needed), stock path "
-                "for %s", acc, req_id)
-            return False
+            if acc > self.coalesce_staging_mb * 1024 * 1024:
+                # can never fit: the stock path is the only option
+                logger.warning(
+                    "coalesced pull: request %s needs %sMB staging "
+                    "(pool %sMB); stock path", req_id, acc >> 20,
+                    self.coalesce_staging_mb)
+                return "stock"
+            return "defer"
 
         assert self._staging_buf is not None
         staging_base = self._staging_buf.data_ptr() + off
@@ -341,7 +380,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 logger.warning(
                     "coalesced pull setup failed for %s (%s); stock path",
                     req_id, e)
-                return False
+                return "stock"
             self._log_failure(
                 failure_type="transfer_setup_failed",
                 req_id=req_id,
@@ -351,7 +390,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
             self._coalesce_plans[req_id] = dict(off=off, size=acc)
             self._handle_failed_transfer(req_id, None)
-            return True
+            return "posted"
 
         self._coalesce_plans[req_id] = dict(
             off=off, size=acc, n_pos=n_pos, n_ranks=n_ranks, blens=blens,
@@ -359,7 +398,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             slots=[plan.rank_to_attention_slot.get(s.remote_rank, 0)
                    for s in read_specs],
         )
-        return True
+        return "posted"
 
     def _read_blocks(
         self,
