@@ -6,7 +6,13 @@ module is never imported). Kernels + weight-prep recipes are imported
 from the megakernel workspace (VLLM_GEMMA4_MEGAKERNEL_PATH).
 
 Knobs: MK_MSET "q:r,..." = (tokens-per-request, requests) batch shapes
-to compile+capture (default "1:1,16:1"; each pair costs ~35-70s prep);
+to SERVE (default "1:1,16:1"). Shapes with q*r > 128 run as row-block
+chains of their base-shape kernels (see BASE_ROWS) -- compile cost is
+per unique base shape only. MK_STRICT=1 (default) makes uncovered
+uniform-decode shapes a hard error (mega-only decode: under the F2b
+single-plane cache the stock path is numerically wrong, not merely
+slow); MK_STRICT_MIXED=1 extends that to non-uniform decode batches
+(default observe+log). MK_SHAPE_LOG=1 streams gate outcomes (dev).
 MK_PDL=1 enables PDL launches (measured ~nil under graphs, default 0);
 MK_NO_CAPTURE=1 forces eager chains (debug).
 
@@ -53,7 +59,34 @@ if MK_ROOT not in sys.path:
 
 HIDDEN, INTER = 5376, 21504
 N2 = 5632                      # down/o_proj padded N (tile 128 x cga 4)
-MAXM = 128
+MAXM = 512
+# Max rows per kernel launch. Shapes with q*r > BASE_ROWS run as
+# row-block CHAINS of the base-shape kernels (per-block offset
+# pointers + per-block flag sets): the M>128 single-launch redesign
+# is parked (probe_m256.py: kernels are single-wave/cadence-bound;
+# chaining costs ~2.7us/block, upper bound of the redesign ~1-3% at
+# C16/C32 only -- SESSION_FINDINGS phase 18 addendum).
+BASE_ROWS = 128
+
+
+def _rpb(key):
+    """Requests per 128-row block for a (q_len, R) shape."""
+    q, _ = key
+    return max(1, BASE_ROWS // q)
+
+
+def _nblk(key):
+    """Row blocks for a shape; chained shapes must fill blocks evenly."""
+    q, r = key
+    rpb = _rpb(key)
+    assert r <= rpb or r % rpb == 0, f"uneven row blocks for {key}"
+    return (r + rpb - 1) // rpb
+
+
+def _base_key(key):
+    """The compiled-kernel shape a (possibly chained) key launches."""
+    q, r = key
+    return (q, min(r, _rpb(key)))
 EPS = 1e-6
 # compile-time KV extent: a fixed upper bound instead of the live
 # cache's numel. It is only a flat layout extent (addressing is
@@ -103,7 +136,10 @@ def _compile_shapes(m_set, facts, pdl, tag):
                                         compile_fused_postattn)
     t0 = time.time()
     k3, k2, k2_by_m = {}, {}, {}
-    for (q, r) in m_set:
+    # chained shapes (q*r > BASE_ROWS) launch their base-shape kernels
+    # per row block: compile unique base keys only
+    bases = sorted({_base_key(k) for k in m_set})
+    for (q, r) in bases:
         M = q * r
         mp = max(M, 8)
         for f, c in facts.items():
@@ -151,7 +187,7 @@ def _kv5(kvc: torch.Tensor, KV: int, hd: int) -> torch.Tensor:
 class _LP:
     """Per-layer prepared state (buffers referenced by raw pointers in
     the arg lists MUST be kept alive here)."""
-    __slots__ = ("flavor", "lname", "b3_args", "b2_args", "bt_idx",
+    __slots__ = ("flavor", "lname", "b3_blk", "b2_blk", "bt_idx",
                  "fl3_idx", "fl2_idx",
                  "kvc_hnd", "window_left", "hd", "q_size", "keep")
 
@@ -164,7 +200,21 @@ class MegaRunner:
         self.m_set = ((1, 1), (16, 1))   # (q_len, R) pairs
         self.steps = 0
         self.kv_map = None         # layer_name -> live cache tensor
-        self.fb = {"prefill": 0, "multi_seq": 0, "m": 0}  # fallbacks
+        self.fb = {"prefill": 0, "mixed": 0, "multi_seq": 0, "m": 0,
+                   "q1": 0}  # fallback/served-odd counters
+        # F2a mega-only decode: uncovered UNIFORM decode shapes are a
+        # hard error (never silently stock) -- under the F2b
+        # single-plane cache the stock path is not merely slower, it is
+        # numerically wrong. Non-uniform decode batches (mixed q_len)
+        # default to observe-and-log until the dev-lane shape stream
+        # settles whether they occur at all (MK_STRICT_MIXED=1 makes
+        # them fatal too). Prefill-containing batches stay stock in
+        # F2a by design (dual-plane cache; admission keeps them rare).
+        self.strict = os.environ.get("MK_STRICT", "1") == "1"
+        self.strict_mixed = os.environ.get("MK_STRICT_MIXED", "0") == "1"
+        # dev observability: log every gate outcome (rate-limited)
+        self.shape_log = os.environ.get("MK_SHAPE_LOG", "0") == "1"
+        self._gate_events = 0
         # cudagraph state: one graph per m, captured after 2 eager warm
         # runs; metadata-pointer guards (per distinct KV group) trigger
         # eager fallback + recapture if vLLM rebinds its buffers
@@ -207,6 +257,9 @@ class MegaRunner:
             self.m_set = tuple(
                 (int(p.split(":")[0]), int(p.split(":")[1]))
                 for p in ms.split(","))
+        for k in self.m_set:
+            assert k[0] * k[1] <= MAXM, f"{k} exceeds MAXM={MAXM}"
+            _nblk(k)  # validates even row-block fill for chained shapes
         self.pdl = os.environ.get("MK_PDL", "0") == "1"
         # periodic counter log for serve-mode observability (0 = off)
         self.log_every = int(os.environ.get("MK_LOG_EVERY", "0"))
@@ -300,8 +353,9 @@ class MegaRunner:
         self._compile_thread = threading.Thread(
             target=work, daemon=True, name="mk-compile")
         self._compile_thread.start()
-        _log(f"async kernel compiles started ({len(m_set)} shapes x "
-             f"{len(facts)} flavors)")
+        nb = len({_base_key(k) for k in m_set})
+        _log(f"async kernel compiles started ({nb} base shapes for "
+             f"{len(m_set)} served shapes x {len(facts)} flavors)")
 
     def _join_async_compiles(self):
         t = self._compile_thread
@@ -383,13 +437,55 @@ class MegaRunner:
         md0 = md_all.get(lname0)
         if md0 is None or getattr(md0, "num_prefill_tokens", 1) != 0:
             self.fb["prefill"] += 1
+            dt = int(getattr(md0, "num_decode_tokens", 0) or 0) \
+                if md0 is not None else 0
+            if dt > 0:
+                # decode rows riding a prefill-containing batch are
+                # served stock -- fine in F2a (dual-plane), a blocker
+                # for F2b's single-plane cache: track loudly
+                self.fb["mixed"] += 1
+                n = self.fb["mixed"]
+                if n <= 50 or n % 500 == 0:
+                    _log(f"MIXED prefill+decode batch #{n}: "
+                         f"prefill_toks="
+                         f"{int(md0.num_prefill_tokens)} "
+                         f"decode_toks={dt} (served stock; F2b "
+                         f"blocker if frequent)")
+            self._shape_event("prefill", md0)
             return None
         t = int(md0.num_decode_tokens)
         r = int(getattr(md0, "num_decodes", 0))
         if r < 1 or t % max(r, 1) != 0:
             self.fb["multi_seq"] += 1
+            # non-uniform decode batches would silently leave the mega
+            # path -- always loud, fatal under MK_STRICT_MIXED
+            n = self.fb["multi_seq"]
+            if n <= 50 or n % 500 == 0:
+                _log(f"NON-UNIFORM decode batch #{n}: tokens={t} "
+                     f"decodes={r} (mega-only invariant violated; "
+                     f"served stock)")
+            if self.strict_mixed:
+                raise RuntimeError(
+                    f"[mk_gemma4] STRICT_MIXED: non-uniform decode "
+                    f"batch tokens={t} decodes={r}")
             return None
-        return md_all, (t // r, r)
+        key = (t // r, r)
+        self._shape_event("decode", md0, key)
+        return md_all, key
+
+    def _shape_event(self, kind, md0, key=None):
+        """Rate-limited gate-outcome stream (MK_SHAPE_LOG=1)."""
+        if not self.shape_log:
+            return
+        self._gate_events += 1
+        n = self._gate_events
+        if n <= 200 or n % 100 == 0:
+            pf = int(getattr(md0, "num_prefill_tokens", -1)) \
+                if md0 is not None else -1
+            dt = int(getattr(md0, "num_decode_tokens", -1)) \
+                if md0 is not None else -1
+            _log(f"shape#{n}: {kind} key={key} prefill_toks={pf} "
+                 f"decode_toks={dt}")
 
     # ---------- per-step decision tree ----------
     def step(self, model, input_ids, positions, inputs_embeds, md_all,
@@ -416,6 +512,21 @@ class MegaRunner:
             return None
         if key not in self.m_set:
             self.fb["m"] += 1
+            # odd-q uniform decodes are real traffic: trimmed final
+            # verify steps (q in 2..15) and short prompts/extends the
+            # scheduler classifies as decode (q <= reorder threshold
+            # 31). Serve them through the chain q1-ized -- never stock
+            # (under the F2b single-plane cache stock reads are WRONG).
+            if key[0] * key[1] <= MAXM and not capturing:
+                if not self.prepared:
+                    self.prepare(model)
+                return self._run_q1(model, input_ids, positions,
+                                    inputs_embeds, md_all, key)
+            if self.strict:
+                raise RuntimeError(
+                    f"[mk_gemma4] STRICT: unservable uniform-decode "
+                    f"shape {key} (capturing={capturing}); "
+                    f"m_set={sorted(self.m_set)}")
             return None
         over = (self.native and self.bake_max
                 and key[0] * key[1] > self.bake_max)
@@ -486,6 +597,26 @@ class MegaRunner:
         s.xq8 = torch.zeros(MAXM, HIDDEN, dtype=torch.uint8, device=dev)
         s.xs = torch.ones(MAXM, dtype=torch.float32, device=dev)
         s.pos_i32 = torch.zeros(MAXM, dtype=torch.int32, device=dev)
+        # q1-ized odd-q path: per-token seq_lens + expanded block
+        # tables (row i -> its request's table row). Tables are per
+        # KV-CACHE GROUP: layers of one flavor span multiple groups
+        # with DIFFERENT tables/page namespaces (13 groups here), so a
+        # per-flavor expansion cross-writes other groups' pages --
+        # self-consistent within the step but poisoning every later
+        # read plus other requests' pool pages (the dev-lane q1
+        # corruption). Pool one buffer per distinct group table.
+        s.sl_exp = torch.ones(MAXM, dtype=torch.int32, device=dev)
+        s.row_idx = torch.arange(MAXM, dtype=torch.int64, device=dev)
+        gcnt = {f: set() for f in fc}
+        for l in layers:
+            fnm = flavor_of(l)
+            gcnt[fnm].add(md_all[l.self_attn.attn.layer_name]
+                          .decode.block_tables.data_ptr())
+        s.bt_exp = {f: [torch.zeros(MAXM, fc[f]["bt_len"],
+                                    dtype=torch.int32, device=dev)
+                        for _ in gcnt[f]] for f in fc}
+        _log(f"q1 group-table pools: "
+             f"{ {f: len(v) for f, v in s.bt_exp.items()} }")
         s.qkvacc = {f: torch.zeros(MAXM, fc[f]["n_qkv"],
                                    dtype=torch.bfloat16, device=dev)
                     for f in fc}
@@ -534,11 +665,17 @@ class MegaRunner:
                 torch.zeros(512, dtype=torch.int32, device=dev))
             return t
 
-        s.flags3 = {(f, q, r): _fl(2048)
-                    for f in fc for (q, r) in s.m_set}
-        s.flags2 = {(f, q * r): _fl(
+        # one counter set per (flavor, served shape, row block): chained
+        # launches of the same compiled kernel never share epochs with
+        # another serving shape (the cross-shape sharing deadlock), and
+        # per-block sets isolate failure domains in the flaglog
+        s.flags3 = {(f, q, r, b): _fl(2048)
+                    for f in fc for (q, r) in s.m_set
+                    for b in range(_nblk((q, r)))}
+        s.flags2 = {(f, q, r, b): _fl(
                         2 * INTER // 128 + t2_slots + 2 + 2048)
-                    for f in fc for (q, r) in s.m_set}
+                    for f in fc for (q, r) in s.m_set
+                    for b in range(_nblk((q, r)))}
         # trtllm-gen workspace is allocated AFTER cap_max_seq is known
         # (see below): its demand scales with the baked max_seq_len, and
         # an undersized buffer corrupts long-context attention SILENTLY
@@ -551,6 +688,7 @@ class MegaRunner:
 
         # ---- per-layer weights + arg lists ----
         s.lps = []
+        max_nblk = max(_nblk(k) for k in s.m_set)
         FP8 = torch.float8_e4m3fn
         for i, layer in enumerate(layers):
             lw = load_layer(i)
@@ -611,7 +749,7 @@ class MegaRunner:
                          wpf=lw["ln_pf"].contiguous(),
                          wpf2_prev=wpf2_prev.contiguous())
 
-            lp.b3_args = [
+            base3 = [
                 s.out.data_ptr(), s.r2.data_ptr(),
                 norms["wpf2_prev"].data_ptr(), norms["win"].data_ptr(),
                 s.h.data_ptr(), s.xq8.data_ptr(), s.xs.data_ptr(),
@@ -619,13 +757,13 @@ class MegaRunner:
                 s.qkvacc[f].data_ptr(),
                 norms["qn"].data_ptr(), norms["kn"].data_ptr(),
                 c["cs"].data_ptr(), s.pos_i32.data_ptr(),
-                0,  # block table ptr, patched per step (bt_idx)
+                0,  # block table ptr, patched per step+block (bt_idx)
                 s.q8[f].data_ptr(), kvc.data_ptr(),
-                scales, 0,  # flags3 ptr, patched per shape (fl3_idx)
+                scales, 0,  # flags3 ptr, patched per shape+block
             ]
             lp.bt_idx = 14
             lp.fl3_idx = 18
-            lp.b2_args = [
+            base2 = [
                 s.ao[f].data_ptr(), s.aq[f].data_ptr(),
                 s.as_buf.data_ptr(),
                 wo8.data_ptr(), wos.data_ptr(), s.oacc.data_ptr(),
@@ -636,9 +774,29 @@ class MegaRunner:
                 s.iq.data_ptr(), s.isf.data_ptr(),
                 d_q.data_ptr(), d_s.data_ptr(),
                 s.out.data_ptr(), alpha,
-                0,  # flags2 ptr, patched per shape (fl2_idx)
+                0,  # flags2 ptr, patched per shape+block (fl2_idx)
             ]
             lp.fl2_idx = 20
+            # row-block variants: chained shapes launch the base-shape
+            # kernels once per 128-row block with the per-row buffers
+            # advanced by 128 rows. Weight/shared-scratch pointers (the
+            # sf swizzle buffers are 128-row-sized, produced and
+            # consumed within one stream-ordered launch) stay fixed.
+            off3 = {0: 2 * N2, 1: 2 * HIDDEN, 4: 2 * HIDDEN, 5: HIDDEN,
+                    6: 4, 9: 2 * c["n_qkv"], 13: 4,
+                    15: s.q8[f].element_size() * c["q_size"]}
+            off2 = {0: 2 * c["q_size"], 1: c["q_size"], 2: 4,
+                    5: 2 * N2, 6: 2 * HIDDEN, 8: 2 * HIDDEN,
+                    10: HIDDEN // 2, 14: INTER // 2, 18: 2 * N2}
+
+            def _blocks(base, off):
+                return [
+                    [(v + off[i] * b * BASE_ROWS) if i in off else v
+                     for i, v in enumerate(base)]
+                    for b in range(max_nblk)]
+
+            lp.b3_blk = _blocks(base3, off3)
+            lp.b2_blk = _blocks(base2, off2)
             lp.keep = [wq8, wqs, wo8, wos, gu_q, gu_s, d_q, d_s, alpha,
                        scales, norms]
             s.lps.append(lp)
@@ -698,19 +856,27 @@ class MegaRunner:
     def _flagdump(self, tag):
         s = self
         gsum = sum(int(t.abs().sum()) for t in s.flag_guards)
-        f3 = {f"{k[0][0]}{k[1]}:{k[2]}": int(v.abs().sum())
+        f3 = {f"{k[0][0]}{k[1]}:{k[2]}b{k[3]}": int(v.abs().sum())
               for k, v in s.flags3.items()}
-        f2 = {f"{k[0][0]}{k[1]}": int(v.abs().sum())
+        f2 = {f"{k[0][0]}{k[1]}:{k[2]}b{k[3]}": int(v.abs().sum())
               for k, v in s.flags2.items()}
         _log(f"flaglog {tag}: guards={gsum} f3={f3} f2={f2}")
 
     # ---------- the decode step ----------
-    def _chain(self, q, r, mds, max_seq):
+    def _chain(self, q, r, mds, max_seq, ov=None, sl=None):
         """The capturable decode step: reads xin/pos_i32 + baked
         pointers, writes hid + aux_buf. Allocation- and sync-free.
-        q = tokens per request, r = requests, T = q*r total rows."""
+        q = tokens per request, r = requests, T = q*r total rows.
+        Shapes with T > BASE_ROWS run each fused kernel as a chain of
+        row-block launches (base-shape kernels, offset pointers); the
+        trtllm core takes the full batch in one call. ov/sl (q1-ized
+        path): PER-LAYER expanded block tables + per-token seq_lens
+        replacing the engine metadata."""
         s = self
         m = q * r
+        nb = _nblk((q, r))
+        rpb = _rpb((q, r))
+        bq, br = _base_key((q, r))
         # B3 reads B2's padded out directly (mo_stride=N2); zeroed rows
         # are the layer-0 "mo = 0" entry
         s.out[:m].zero_()
@@ -718,18 +884,28 @@ class MegaRunner:
         if 0 in s.tapset:
             s.aux_buf[0][:m].copy_(s.xin[:m])
         for i, (lp, md) in enumerate(zip(s.lps, mds)):
-            args = lp.b3_args
-            args[lp.bt_idx] = md.decode.block_tables.data_ptr()
-            args[lp.fl3_idx] = s.flags3[(lp.flavor, q, r)].data_ptr()
-            s.k3[(lp.flavor, q, r)](*args)
+            if ov is not None:
+                bt_t = ov[i]
+                sl_t = sl
+            else:
+                bt_t = md.decode.block_tables
+                sl_t = md.decode.seq_lens
+            bt0 = bt_t.data_ptr()
+            btr = bt_t.stride(0) * 4  # bytes/req row
+            for b in range(nb):
+                args = lp.b3_blk[b]
+                args[lp.bt_idx] = bt0 + b * rpb * btr
+                args[lp.fl3_idx] = (
+                    s.flags3[(lp.flavor, q, r, b)].data_ptr())
+                s.k3[(lp.flavor, bq, br)](*args)
             if i in s.tapset and i > 0:
                 s.aux_buf[i][:m].copy_(s.h[:m])
             s._decode(
                 query=s.q8[lp.flavor][:m].view(s.qdt)
                 .view(m, -1, lp.hd),
                 kv_cache=lp.kvc_hnd, workspace_buffer=s.ws,
-                block_tables=md.decode.block_tables,
-                seq_lens=md.decode.seq_lens,
+                block_tables=bt_t,
+                seq_lens=sl_t,
                 max_seq_len=max_seq,
                 bmm1_scale=1.0, bmm2_scale=1.0,
                 window_left=lp.window_left,
@@ -737,9 +913,11 @@ class MegaRunner:
                 q_len_per_req=q,
                 enable_pdl=s.pdl,
             )
-            lp.b2_args[lp.fl2_idx] = (
-                s.flags2[(lp.flavor, m)].data_ptr())
-            s.k2[(lp.flavor, q, r)](*lp.b2_args)
+            for b in range(nb):
+                args2 = lp.b2_blk[b]
+                args2[lp.fl2_idx] = (
+                    s.flags2[(lp.flavor, q, r, b)].data_ptr())
+                s.k2[(lp.flavor, bq, br)](*args2)
         # tail: close layer 59 + the model's final norm. One contiguous
         # staging copy for rms_norm's input contract (was per-layer).
         s.mo[:m].copy_(s.out[:m, :HIDDEN])
@@ -750,6 +928,78 @@ class MegaRunner:
             s.aux_buf[60][:m].copy_(s.xt[:m])
         s._ops.rms_norm(s.hid[:m], s.xt[:m], s.norm_w_final,
                         s.norm_eps_final)
+
+    def _run_q1(self, model, input_ids, positions, inputs_embeds,
+                md_all, key):
+        """Serve an odd-q uniform decode step (trimmed final verify
+        steps q in 2..15; short prompts/extends <= reorder threshold
+        31 classified as decode) through the chain as a q=1 batch:
+        per-token block-table rows and per-token seq_lens (= absolute
+        position + 1) preserve exact causal attention; rows pad to the
+        next served (1, m) key against vLLM's null block (id 0, the
+        engine's own padding convention). Eager-only: these shapes are
+        rare (at most ~1 per request lifetime) and never captured."""
+        s = self
+        q, r = key
+        m = q * r
+        x = (inputs_embeds if inputs_embeds is not None
+             else model.embed_input_ids(input_ids))
+        # the model-level inputs arrive padded to the DISPATCH size
+        # (vLLM's capture-size choice, e.g. 7 -> 16), which the (q,r)
+        # metadata does not reflect: pick the chain size from the
+        # dispatch frame, copy real rows only, return the padded frame
+        xr = x.shape[0]
+        need = max(m, xr)
+        pads = sorted(k[1] for k in s.m_set if k[0] == 1
+                      and k[1] >= need)
+        if not pads:
+            raise RuntimeError(
+                f"[mk_gemma4] STRICT: uniform-decode shape {key} "
+                f"(dispatch rows {xr}) exceeds q1 coverage; add a "
+                f"(1, m>={need}) entry to MK_MSET")
+        mp = pads[0]
+        s.fb["q1"] += 1
+        n = s.fb["q1"]
+        if n <= 50 or n % 500 == 0:
+            _log(f"q1-ized decode #{n}: {key} rows={xr} -> (1, {mp})")
+        assert m <= xr <= mp, (m, xr, mp)
+        s.xin[:m].copy_(x[:m])
+        if mp > m:
+            s.xin[m:mp].zero_()
+        s.pos_i32[:m].copy_(positions[:m].to(torch.int32))
+        if mp > m:
+            s.pos_i32[m:mp].zero_()   # pad rows append to null block
+        torch.add(s.pos_i32[:m], 1, out=s.sl_exp[:m])
+        if mp > m:
+            s.sl_exp[m:mp].fill_(1)
+        row2req = torch.div(s.row_idx[:m], q, rounding_mode="floor")
+        mds = [md_all[lp.lname] for lp in s.lps]
+        # expand per DISTINCT group table (layers of a flavor span
+        # multiple KV-cache groups; ov is per layer)
+        filled = {}
+        avail = {f: list(bufs) for f, bufs in s.bt_exp.items()}
+        ov = []
+        for lp, md in zip(s.lps, mds):
+            bt = md.decode.block_tables
+            p = bt.data_ptr()
+            got = filled.get(p)
+            if got is None:
+                buf = avail[lp.flavor].pop()
+                w = bt.shape[1]
+                assert w == buf.shape[1], (lp.flavor, w, buf.shape)
+                buf[:m].copy_(bt[row2req])
+                if mp > m:
+                    buf[m:mp].zero_()     # null block
+                got = buf[:mp]
+                filled[p] = got
+            ov.append(got)
+        self._chain(1, mp, mds, s.cap_max_seq, ov=ov, sl=s.sl_exp[:mp])
+        s.steps += 1
+        s.eager_steps += 1
+        hidden = s.hid[:xr]
+        if s.taps:
+            return hidden, [s.aux_buf[k][:xr] for k in s.taps]
+        return hidden
 
     def _build_guards(self, mds):
         seen, guards = set(), []
@@ -776,7 +1026,11 @@ class MegaRunner:
         m = q * r
         x = (inputs_embeds if inputs_embeds is not None
              else model.embed_input_ids(input_ids))
-        s.xin[:m].copy_(x)
+        # eager-served shapes (e.g. (1,R) boundary steps) can arrive
+        # dispatch-padded past the metadata size: copy real rows,
+        # return the caller's padded frame (baked shapes: xr == m)
+        xr = x.shape[0]
+        s.xin[:m].copy_(x[:m])
         s.pos_i32[:m].copy_(positions[:m].to(torch.int32))
         mds = [md_all[lp.lname] for lp in s.lps]
         s._last_mds, s._last_m = mds, key
@@ -800,17 +1054,17 @@ class MegaRunner:
                 s.eager_steps += 1
                 if s.flag_log and s.eager_steps <= 80:
                     s._flagdump(f"after-eager {key}")
-            hidden = s.hid[:m]
+            hidden = s.hid[:xr]
             if s.taps:
-                return hidden, [s.aux_buf[k][:m] for k in s.taps]
+                return hidden, [s.aux_buf[k][:xr] for k in s.taps]
             return hidden
         if s.no_capture:
             self._chain(q, r, mds, s.cap_max_seq)
             s.eager_steps += 1
             s.steps += 1
-            hidden = s.hid[:m]
+            hidden = s.hid[:xr]
             if s.taps:
-                return hidden, [s.aux_buf[k][:m] for k in s.taps]
+                return hidden, [s.aux_buf[k][:xr] for k in s.taps]
             return hidden
 
         g = s.graphs.get(key)
@@ -865,9 +1119,9 @@ class MegaRunner:
             _log(f"steps={s.steps} graph={s.graph_steps} "
                  f"eager={s.eager_steps} fb={s.fb} "
                  f"graphs={sorted(s.graphs)}")
-        hidden = s.hid[:m]
+        hidden = s.hid[:xr]
         if s.taps:
-            return hidden, [s.aux_buf[k][:m] for k in s.taps]
+            return hidden, [s.aux_buf[k][:xr] for k in s.taps]
         return hidden
 
 
