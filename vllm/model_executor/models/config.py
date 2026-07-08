@@ -276,14 +276,23 @@ class Gemma4Config(VerifyAndUpdateConfig):
         if cache_config is None:
             reasons.append("cache config is not available")
             return reasons
-        if Gemma4Config._uses_modelopt_fp8_kv(vllm_config) is False:
+        # Explicit bf16 KV serving needs neither checkpoint KV scales nor
+        # query quantization; those requirements only bind the FP8 path.
+        explicit_bf16_kv = cache_config.cache_dtype == "bfloat16"
+        if (
+            explicit_bf16_kv is False
+            and Gemma4Config._uses_modelopt_fp8_kv(vllm_config) is False
+        ):
             reasons.append("checkpoint does not declare ModelOpt FP8 KV cache")
-        if cache_config.cache_dtype not in ("auto", "fp8", "fp8_e4m3"):
+        if cache_config.cache_dtype not in ("auto", "fp8", "fp8_e4m3", "bfloat16"):
             reasons.append(f"cache dtype is {cache_config.cache_dtype}")
         skip_layers = cache_config.kv_cache_dtype_skip_layers
         if skip_layers is not None and len(skip_layers) > 0:
             reasons.append("kv_cache_dtype_skip_layers is not supported")
-        if attention_config.disable_flashinfer_q_quantization:
+        if (
+            explicit_bf16_kv is False
+            and attention_config.disable_flashinfer_q_quantization
+        ):
             reasons.append("disable_flashinfer_q_quantization is enabled")
         if attention_config.use_trtllm_attention is False:
             reasons.append("use_trtllm_attention is explicitly disabled")
@@ -331,9 +340,10 @@ class Gemma4Config(VerifyAndUpdateConfig):
         across those layers causes numerical divergence, so a single uniform
         path is selected for the whole model.
 
-        When the checkpoint and runtime are compatible (e.g. a ModelOpt FP8 KV
-        checkpoint on Blackwell), text attention uses the Gemma4 FlashInfer
-        TRTLLM-GEN override while non-text attention stays on TRITON_ATTN.
+        When the checkpoint and runtime are compatible (a ModelOpt FP8 KV
+        checkpoint, or an explicit ``--kv-cache-dtype bfloat16``, on
+        Blackwell), text attention uses the Gemma4 FlashInfer TRTLLM-GEN
+        override while non-text attention stays on TRITON_ATTN.
         Otherwise FA4 is forced for all layers when available (giving a uniform
         kernel path and avoiding the mixed FA3/FA4 penalty), falling back to
         TRITON_ATTN when FA4 is not available.

@@ -12,6 +12,7 @@ from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import can_use_trtllm_attention
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
@@ -146,8 +147,8 @@ class Gemma4FlashInferTRTLLMGenBackend(FlashInferBackend):
             return reason
         if device_capability.major != 10:
             return "Gemma4 TRTLLM-GEN requires a Blackwell SM100-family GPU"
-        if _is_fp8_cache_dtype(kv_cache_dtype) is False:
-            return "Gemma4 TRTLLM-GEN requires an FP8 E4M3 KV cache"
+        if _is_fp8_cache_dtype(kv_cache_dtype) is False and kv_cache_dtype != "bfloat16":
+            return "Gemma4 TRTLLM-GEN requires an FP8 E4M3 or explicit bf16 KV cache"
         return None
 
 
@@ -235,16 +236,32 @@ class Gemma4FlashInferTRTLLMGenMetadataBuilder(FlashInferMetadataBuilder):
             raise ValueError("Gemma4 TRTLLM-GEN does not support batch-invariant mode.")
         if self.use_dcp:
             raise ValueError("Gemma4 TRTLLM-GEN does not support DCP.")
-        if _is_fp8_cache_dtype(self.cache_dtype) is False:
+        if _is_fp8_cache_dtype(self.cache_dtype):
+            # ModelOpt FP8 KV serving: queries are FP8-quantized upstream.
+            if self.q_data_type != FP8_DTYPE:
+                raise ValueError(
+                    "Gemma4 TRTLLM-GEN requires FP8 query quantization. "
+                    "Set disable_flashinfer_q_quantization=False."
+                )
+        elif self.cache_dtype == "auto":
+            # Explicit bf16 KV serving (the parent builder normalizes
+            # non-quantized cache dtypes to "auto" with the spec dtype
+            # equal to the model dtype); queries stay in the model dtype.
+            if self.q_data_type != self.kv_cache_spec.dtype:
+                raise ValueError(
+                    "Gemma4 TRTLLM-GEN bf16 KV serving requires model-dtype "
+                    f"queries, got {self.q_data_type}."
+                )
+        else:
             raise ValueError(
-                "Gemma4 TRTLLM-GEN requires ModelOpt FP8 KV cache, got "
+                "Gemma4 TRTLLM-GEN requires an FP8 E4M3 or bf16 KV cache, got "
                 f"{self.cache_dtype}."
             )
-        if self.q_data_type != FP8_DTYPE:
-            raise ValueError(
-                "Gemma4 TRTLLM-GEN requires FP8 query quantization. "
-                "Set disable_flashinfer_q_quantization=False."
-            )
+        self._expected_q_dtype = (
+            FP8_DTYPE
+            if _is_fp8_cache_dtype(self.cache_dtype)
+            else self.kv_cache_spec.dtype
+        )
         if can_use_trtllm_attention(self.num_qo_heads, self.num_kv_heads) is False:
             raise ValueError(
                 "Gemma4 TRTLLM-GEN requires TRTLLM attention support and "
@@ -283,8 +300,11 @@ class Gemma4FlashInferTRTLLMGenMetadataBuilder(FlashInferMetadataBuilder):
             )
         if metadata.decode is not None and not isinstance(metadata.decode, TRTLLMDecode):
             raise TypeError("Gemma4 TRTLLM-GEN decode metadata must be TRTLLMDecode.")
-        if metadata.q_data_type != FP8_DTYPE:
-            raise TypeError("Gemma4 TRTLLM-GEN metadata must use FP8 queries.")
+        if metadata.q_data_type != self._expected_q_dtype:
+            raise TypeError(
+                "Gemma4 TRTLLM-GEN metadata must use "
+                f"{self._expected_q_dtype} queries, got {metadata.q_data_type}."
+            )
         return metadata
 
     def build(
@@ -362,7 +382,10 @@ class Gemma4FlashInferTRTLLMGenImpl(FlashInferImpl):
             raise ValueError(
                 "Gemma4 TRTLLM-GEN requires FlashInfer TRTLLM attention support."
             )
-        if self.supports_quant_query_input is False:
+        # FP8 KV serving quantizes queries upstream; bf16 KV serving keeps
+        # queries in the model dtype (no quant-query support needed).
+        self._quantized_kv = is_quantized_kv_cache(self.kv_cache_dtype)
+        if self._quantized_kv and self.supports_quant_query_input is False:
             raise ValueError(
                 "Gemma4 TRTLLM-GEN requires quantized query input support."
             )
@@ -454,8 +477,15 @@ class Gemma4FlashInferTRTLLMGenImpl(FlashInferImpl):
                 raise TypeError(
                     "Gemma4 TRTLLM-GEN decode metadata must be TRTLLMDecode."
                 )
-            if attn_metadata.q_data_type != FP8_DTYPE:
-                raise TypeError("Gemma4 TRTLLM-GEN requires FP8 query metadata.")
+            if self._quantized_kv:
+                if attn_metadata.q_data_type != FP8_DTYPE:
+                    raise TypeError("Gemma4 TRTLLM-GEN requires FP8 query metadata.")
+            elif attn_metadata.q_data_type == FP8_DTYPE:
+                # bf16 KV serving: the parent forward asserts the metadata
+                # q dtype matches the (model-dtype) query tensor.
+                raise TypeError(
+                    "Gemma4 TRTLLM-GEN bf16 KV serving must not quantize queries."
+                )
             if _has_nonempty_mm_prefix_range(attn_metadata):
                 raise NotImplementedError(
                     "Gemma4 TRTLLM-GEN currently supports text-only requests. "
