@@ -115,7 +115,8 @@ def _compile_shapes(m_set, facts, pdl, tag):
                 cs_numel=c["cs_numel"], bt_len=c["bt_len"],
                 page_size=c["ps"], bt_stride=c["bt_len"], q_len=q,
                 mo_stride=N2,
-                cluster_shape_mn=(1, 4), enable_pdl=pdl)
+                cluster_shape_mn=(1, 4), enable_pdl=pdl,
+                kv_bf16=c.get("kv_bf16", False))
             k3[(f, q, r)] = compile_fused_preattn(k)
             if f == "global":
                 os.environ.pop("MK_KSPLIT_Q", None)
@@ -136,8 +137,9 @@ def _kv5(kvc: torch.Tensor, KV: int, hd: int) -> torch.Tensor:
     registered KV cache, whatever view shape it was registered with.
     Physical storage is contiguous with pages outermost (layout=HND
     asserted by the deployed backend); sorting dims by stride recovers
-    the contiguous base for a clean reshape."""
-    v = kvc.view(torch.float8_e4m3fn)
+    the contiguous base for a clean reshape. bf16 caches (all-bf16 KV
+    serving) are element-typed already; fp8 registers as fp8/uint8."""
+    v = kvc if kvc.dtype == torch.bfloat16 else kvc.view(torch.float8_e4m3fn)
     order = sorted(range(v.dim()), key=lambda d: -v.stride(d))
     base = v.permute(order)
     assert base.is_contiguous(), (kvc.shape, kvc.stride())
@@ -256,6 +258,7 @@ class MegaRunner:
                 bt_len=int(md_all[a.attn.layer_name].decode
                            .block_tables.shape[1]),
                 cs_numel=a.rotary_emb.cos_sin_cache.numel(),
+                kv_bf16=(kvc.dtype == torch.bfloat16),
             )
         return facts
 
@@ -470,6 +473,7 @@ class MegaRunner:
                 bt_len=int(md.decode.block_tables.shape[1]),
                 window_left=int(a.attn.impl.window_left),
                 cs=a.rotary_emb.cos_sin_cache.float().contiguous(),
+                kv_bf16=(kvc.dtype == torch.bfloat16),
             )
         _log(f"flavors: { {k: {kk: vv for kk, vv in v.items() if kk != 'cs'} for k, v in fc.items()} }")
 
@@ -485,7 +489,15 @@ class MegaRunner:
         s.qkvacc = {f: torch.zeros(MAXM, fc[f]["n_qkv"],
                                    dtype=torch.bfloat16, device=dev)
                     for f in fc}
-        s.q8 = {f: torch.zeros(MAXM, fc[f]["q_size"], dtype=torch.uint8,
+        # all-bf16 KV serving stores q/k/v bf16 (2B/elem); the trtllm
+        # core then runs its bf16 path. Both flavors share the engine's
+        # cache dtype.
+        s.kv_bf16 = all(fc[f]["kv_bf16"] for f in fc)
+        assert s.kv_bf16 or not any(fc[f]["kv_bf16"] for f in fc), fc
+        s.qdt = torch.bfloat16 if s.kv_bf16 else torch.float8_e4m3fn
+        s.q8 = {f: torch.zeros(MAXM, fc[f]["q_size"],
+                               dtype=torch.bfloat16 if s.kv_bf16
+                               else torch.uint8,
                                device=dev) for f in fc}
         s.ao = {f: torch.zeros(MAXM, fc[f]["q_size"], dtype=torch.bfloat16,
                                device=dev) for f in fc}
@@ -713,7 +725,7 @@ class MegaRunner:
             if i in s.tapset and i > 0:
                 s.aux_buf[i][:m].copy_(s.h[:m])
             s._decode(
-                query=s.q8[lp.flavor][:m].view(torch.float8_e4m3fn)
+                query=s.q8[lp.flavor][:m].view(s.qdt)
                 .view(m, -1, lp.hd),
                 kv_cache=lp.kvc_hnd, workspace_buffer=s.ws,
                 block_tables=md.decode.block_tables,
