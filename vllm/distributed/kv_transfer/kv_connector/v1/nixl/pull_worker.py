@@ -156,6 +156,18 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     req_id, len(self._coalesce_pending))
                 return
 
+        if any(self._sp_group_flags()):
+            # F2b: the stock per-descriptor path cannot express the
+            # single-plane K-half/2:1 mapping -- running it would write
+            # a dual layout into a single-plane cache. Fail the request
+            # (kv_load_failure_policy=fail) rather than corrupt.
+            logger.error(
+                "coalesced pull unavailable for %s but single-plane KV "
+                "groups exist; failing the request instead of the stock "
+                "path.", req_id)
+            self._handle_failed_transfer(req_id, None)
+            return
+
         self._stock_read_specs(req_id, meta, read_specs)
 
     def _stock_read_specs(self, req_id: str, meta: ReqMeta,
@@ -302,12 +314,34 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
         # HMA broadcast semantics (see _compute_desc_ids): every group's
         # blocks are transferred across every region, position-ordered.
-        lpos = np.concatenate([np.asarray(g, dtype=np.int64)
-                               for g in local_ids])
-        rpos = np.concatenate([np.asarray(g, dtype=np.int64)
-                               for g in remote_ids])
-        if len(lpos) != len(rpos):
-            return "stock"
+        # F2b single-plane groups (kv_planes==1): local blocks hold 2x
+        # remote tokens, so remote block k of the request expands to
+        # scatter destination (local_ids[k//2], half k%2); the scatter
+        # keeps only the K half for those positions (sp_half >= 0).
+        sp_flags = self._sp_group_flags()
+        lpos_l, rpos_l, half_l = [], [], []
+        for gi in range(len(local_ids)):
+            lg = np.asarray(local_ids[gi], dtype=np.int64)
+            rg = np.asarray(remote_ids[gi], dtype=np.int64)
+            if sp_flags[gi]:
+                if len(rg) > 2 * len(lg):
+                    return "stock"
+                k = np.arange(len(rg))
+                lpos_l.append(lg[k // 2])
+                rpos_l.append(rg)
+                half_l.append((k % 2).astype(np.int8))
+            else:
+                if len(lg) != len(rg):
+                    return "stock"
+                lpos_l.append(lg)
+                rpos_l.append(rg)
+                half_l.append(np.full(len(lg), -1, dtype=np.int8))
+        lpos = (np.concatenate(lpos_l) if lpos_l
+                else np.zeros(0, dtype=np.int64))
+        rpos = (np.concatenate(rpos_l) if rpos_l
+                else np.zeros(0, dtype=np.int64))
+        halves = (np.concatenate(half_l) if half_l
+                  else np.zeros(0, dtype=np.int8))
         # Transfer order is free (the (remote, local) pairing is what
         # matters): sort by remote id so run detection harvests all the
         # adjacency the remote pool still has. The scatter index (lpos)
@@ -315,6 +349,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         order = np.argsort(rpos, kind="stable")
         rpos = rpos[order]
         lpos = lpos[order]
+        halves = halves[order]
         n_pos = len(lpos)
         n_ranks = len(read_specs)
         blens = self._remote_layout[engine_id][spec0.remote_rank][0]
@@ -395,6 +430,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         self._coalesce_plans[req_id] = dict(
             off=off, size=acc, n_pos=n_pos, n_ranks=n_ranks, blens=blens,
             region_off=region_off, lpos=lpos.tolist(),
+            sp_half=halves.tolist(),
             slots=[plan.rank_to_attention_slot.get(s.remote_rank, 0)
                    for s in read_specs],
         )

@@ -388,6 +388,7 @@ class NixlBaseConnectorWorker:
         self._coalesce_pending: deque = deque()
         # req_id -> scatter plan (staging offsets + block index map)
         self._coalesce_plans: dict[ReqId, dict] = {}
+        self._sp_flags_cache: list[bool] | None = None
         # canonicalized (nb, row_bytes) uint8 views of each region's
         # physical storage (registered tensors are permuted VIEWS of the
         # HND-contiguous base; stride-sorting recovers it). None until
@@ -1976,6 +1977,16 @@ class NixlBaseConnectorWorker:
                 merged.append((o, s))
         self._staging_free = merged
 
+    def _sp_group_flags(self) -> list[bool]:
+        """Per-KV-cache-group single-plane flags (F2b: kv_planes==1
+        groups need K-half 2:1 pulls; the stock path is invalid)."""
+        if self._sp_flags_cache is None:
+            self._sp_flags_cache = [
+                getattr(g.kv_cache_spec, "kv_planes", 2) == 1
+                for g in self.kv_cache_config.kv_cache_groups
+            ]
+        return self._sp_flags_cache
+
     def _coalesce_drop_plan(self, req_id: ReqId) -> None:
         """Free a request's staging without scattering (failure path)."""
         plan = self._coalesce_plans.pop(req_id, None)
@@ -2030,6 +2041,17 @@ class NixlBaseConnectorWorker:
             idx = torch.tensor(plan["lpos"], device=self._staging_buf.device,
                                dtype=torch.long)
             n_pos, n_ranks = plan["n_pos"], plan["n_ranks"]
+            halves = plan.get("sp_half")
+            hv = None
+            if halves is not None and any(h >= 0 for h in halves):
+                hv = torch.tensor(halves,
+                                  device=self._staging_buf.device,
+                                  dtype=torch.long)
+                dual_m = hv < 0
+                sp_m = ~dual_m
+                idx_d = idx[dual_m]
+                idx_s = idx[sp_m]
+                h_s = hv[sp_m]
             for i, flat in enumerate(self._region_rows):
                 blen = plan["blens"][i]
                 chunk = blen // 2
@@ -2037,8 +2059,21 @@ class NixlBaseConnectorWorker:
                 reg = self._staging_buf[base:base + n_ranks * n_pos * blen]
                 reg = reg.view(n_ranks, n_pos, 2, chunk)
                 dest = flat.view(flat.shape[0], 2, n_ranks, chunk)
+                if hv is None:
+                    for r in range(n_ranks):
+                        dest[:, :, plan["slots"][r], :][idx] = reg[r]
+                    continue
+                # F2b: single-plane positions carry (local row, half);
+                # the row layout is (rank-shard, halves of 64 tok, K
+                # chunk) -- write only the staged K half. Dual positions
+                # keep the standard (K/V, rank-shard, chunk) write.
+                dest_sp = flat.view(flat.shape[0], n_ranks, 2, chunk)
                 for r in range(n_ranks):
-                    dest[:, :, plan["slots"][r], :][idx] = reg[r]
+                    sl = plan["slots"][r]
+                    if idx_d.numel():
+                        dest[:, :, sl, :][idx_d] = reg[r][dual_m]
+                    if idx_s.numel():
+                        dest_sp[idx_s, sl, h_s] = reg[r][sp_m][:, 0]
         finally:
             # The scatter kernels read staging asynchronously while UCX
             # writes for the NEXT user of this range are not
@@ -2364,11 +2399,20 @@ class NixlBaseConnectorWorker:
         # not per-token data, so trimming would corrupt the transfer.
         remote_block_ids = list(remote_block_ids)
         if not self._has_mamba:
+            sp_flags = self._sp_group_flags()
             for i, remote_group in enumerate(remote_block_ids):
                 num_local_blocks = len(local_block_ids[i])
+                # F2b single-plane groups: local blocks hold 2x remote
+                # tokens, so a fully-uncached request legitimately has
+                # len(local) ~= len(remote)/2. The end-trim must keep
+                # 2x len(local) remote blocks or it silently drops the
+                # FIRST HALF of the context (found via margin collapse +
+                # position-scrambled needle retrieval, 2026-07-08).
+                factor = 2 if sp_flags[i] else 1
+                num_keep = factor * num_local_blocks
                 assert num_local_blocks <= len(remote_group)
-                if num_local_blocks < len(remote_group):
-                    remote_block_ids[i] = remote_group[-num_local_blocks:]
+                if num_keep < len(remote_group):
+                    remote_block_ids[i] = remote_group[-num_keep:]
         else:
             # (NOTE: ZhanqiuHu) Mamba hybrid: no prefix caching support so far.HeteroTP
             # can cause different kernel block counts due to logical block rounding.

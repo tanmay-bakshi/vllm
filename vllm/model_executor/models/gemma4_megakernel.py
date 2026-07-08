@@ -152,7 +152,8 @@ def _compile_shapes(m_set, facts, pdl, tag):
                 page_size=c["ps"], bt_stride=c["bt_len"], q_len=q,
                 mo_stride=N2,
                 cluster_shape_mn=(1, 4), enable_pdl=pdl,
-                kv_bf16=c.get("kv_bf16", False))
+                kv_bf16=c.get("kv_bf16", False),
+                kv_single=c.get("single", False))
             k3[(f, q, r)] = compile_fused_preattn(k)
             if f == "global":
                 os.environ.pop("MK_KSPLIT_Q", None)
@@ -179,9 +180,12 @@ def _kv5(kvc: torch.Tensor, KV: int, hd: int) -> torch.Tensor:
     order = sorted(range(v.dim()), key=lambda d: -v.stride(d))
     base = v.permute(order)
     assert base.is_contiguous(), (kvc.shape, kvc.stride())
-    ps = v.stride(0) // (2 * KV * hd)
-    nb = v.numel() // (2 * KV * ps * hd)
-    return base.reshape(nb, 2, KV, ps, hd)
+    # F2b single-plane views bind as (nb, 1, KV, ps, hd); canonical
+    # form keeps the plane dim (size 1) so ps stays shape[3] downstream
+    planes = 1 if ((v.dim() == 5 and v.shape[1] == 1) or v.dim() == 4) else 2
+    ps = v.stride(0) // (planes * KV * hd)
+    nb = v.numel() // (planes * KV * ps * hd)
+    return base.reshape(nb, planes, KV, ps, hd)
 
 
 class _LP:
@@ -189,7 +193,8 @@ class _LP:
     the arg lists MUST be kept alive here)."""
     __slots__ = ("flavor", "lname", "b3_blk", "b2_blk", "bt_idx",
                  "fl3_idx", "fl2_idx",
-                 "kvc_hnd", "window_left", "hd", "q_size", "keep")
+                 "kvc_hnd", "kvc_sp", "inv_w", "window_left", "hd", "q_size",
+                 "keep")
 
 
 class MegaRunner:
@@ -303,8 +308,10 @@ class MegaRunner:
             kvc = self.kv_map[a.attn.layer_name]
             KV = a.attn.impl.num_kv_heads
             hd = a.attn.impl.head_size
+            v5 = _kv5(kvc, KV, hd)
             facts[f] = dict(
-                KV=KV, hd=hd, ps=_kv5(kvc, KV, hd).shape[3],
+                KV=KV, hd=hd, ps=v5.shape[3],
+                single=(v5.shape[1] == 1),
                 heads=a.attn.impl.num_heads,
                 q_size=a.attn.impl.num_heads * hd,
                 n_qkv=(a.attn.impl.num_heads + 2 * KV) * hd,
@@ -577,7 +584,8 @@ class MegaRunner:
                  f"-> hnd {tuple(v.shape)}")
             md = md_all[a.attn.layer_name]
             fc[fl] = dict(
-                KV=KV, hd=hd, ps=ps, heads=a.attn.impl.num_heads,
+                KV=KV, hd=hd, ps=ps, single=(v.shape[1] == 1),
+                heads=a.attn.impl.num_heads,
                 q_size=a.attn.impl.num_heads * hd,
                 n_qkv=(a.attn.impl.num_heads + 2 * KV) * hd,
                 kv_numel=kvc.numel(),
@@ -701,6 +709,20 @@ class MegaRunner:
             lp.window_left = c["window_left"]
             kvc = _kv5(self.kv_map[lp.lname], c["KV"], c["hd"])
             lp.kvc_hnd = kvc
+            # F2b single-plane global: the SP core reads the K plane
+            # and needs 1/w (k_norm weight is a per-layer SCALAR --
+            # asserted here; the reconstruction identity depends on it)
+            lp.kvc_sp = None
+            lp.inv_w = 1.0
+            if c.get("single"):
+                lp.kvc_sp = kvc[:, 0]
+                knw = lw["kn"].float()
+                spread = float((knw.max() - knw.min()).abs())
+                assert spread < 1e-3, (
+                    f"layer {i}: k_norm weight not scalar "
+                    f"(spread {spread}); single-plane V reconstruction "
+                    "invalid")
+                lp.inv_w = float(1.0 / knw.mean())
 
             wqkv = torch.cat([lw["wq"], lw["wk"], lw["wv"]], 0).contiguous()
             wq8, wqs = ops.scaled_fp8_quant(wqkv,
@@ -833,6 +855,22 @@ class MegaRunner:
         s.ws = torch.zeros(ws_mb * 1024 * 1024, dtype=torch.uint8,
                            device=dev)
         _log(f"trtllm workspace {ws_mb}MB (cap_max_seq {s.cap_max_seq})")
+        # F2b SP core (single-plane global flavors): scratch sized for
+        # MAXM rows x q-heads x splits; shared across the 10 global
+        # layers (stream-ordered). Compiles ride the pre-capture warmup
+        # like trtllm's lazy per-config init.
+        s.sp = None
+        s.sp_cs = None
+        for f2, c2 in fc.items():
+            if c2.get("single"):
+                from mk_fused.sp_attn_triton import SPDecode
+                s.sp = SPDecode(max_rows=MAXM * c2["heads"],
+                                cap_max_seq=s.cap_max_seq, device=dev)
+                s.sp_cs = c2["cs"]
+                assert s.sp_cs.dtype == torch.float32 \
+                    and s.sp_cs.stride(0) == 512, s.sp_cs.shape
+                _log(f"SP core armed: {f2} nsplits={s.sp.nsplits} "
+                     f"scratch={s.sp.acc.numel() * 4 // 2**20}MB")
         # KEEPALIVE for the cos_sin caches: their data_ptrs are baked
         # into every B3 arg list, but fc is a local — without this ref
         # they get freed to the allocator cache and the first
@@ -900,19 +938,30 @@ class MegaRunner:
                 s.k3[(lp.flavor, bq, br)](*args)
             if i in s.tapset and i > 0:
                 s.aux_buf[i][:m].copy_(s.h[:m])
-            s._decode(
-                query=s.q8[lp.flavor][:m].view(s.qdt)
-                .view(m, -1, lp.hd),
-                kv_cache=lp.kvc_hnd, workspace_buffer=s.ws,
-                block_tables=bt_t,
-                seq_lens=sl_t,
-                max_seq_len=max_seq,
-                bmm1_scale=1.0, bmm2_scale=1.0,
-                window_left=lp.window_left,
-                out=s.ao[lp.flavor][:m].view(m, -1, lp.hd),
-                q_len_per_req=q,
-                enable_pdl=s.pdl,
-            )
+            if lp.kvc_sp is not None:
+                # F2b: single-plane global core (V = unRoPE(K)/w)
+                s.sp(
+                    query=s.q8[lp.flavor][:m].view(s.qdt)
+                    .view(m, -1, lp.hd),
+                    kv_cache=lp.kvc_sp, block_tables=bt_t,
+                    seq_lens=sl_t, cos_sin=s.sp_cs,
+                    out=s.ao[lp.flavor][:m].view(m, -1, lp.hd),
+                    q_len_per_req=q, inv_w=lp.inv_w,
+                )
+            else:
+                s._decode(
+                    query=s.q8[lp.flavor][:m].view(s.qdt)
+                    .view(m, -1, lp.hd),
+                    kv_cache=lp.kvc_hnd, workspace_buffer=s.ws,
+                    block_tables=bt_t,
+                    seq_lens=sl_t,
+                    max_seq_len=max_seq,
+                    bmm1_scale=1.0, bmm2_scale=1.0,
+                    window_left=lp.window_left,
+                    out=s.ao[lp.flavor][:m].view(m, -1, lp.hd),
+                    q_len_per_req=q,
+                    enable_pdl=s.pdl,
+                )
             for b in range(nb):
                 args2 = lp.b2_blk[b]
                 args2[lp.fl2_idx] = (

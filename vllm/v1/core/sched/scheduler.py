@@ -1185,6 +1185,21 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        import os as _os
+        if _os.environ.get("VLLM_GEMMA4_SP_NO_RECOMPUTE", "0") == "1":
+            # F2b single-plane global KV: a preempted request would
+            # re-prefill locally through the stock path, which cannot
+            # write the single-plane cache (its own later reads would be
+            # garbage). Preemption has never been observed on the decode
+            # tier (util 0.80, router admission, capacity ~2x post-F2b);
+            # if it ever fires, die loudly rather than serve wrong bytes
+            # (same posture as MK_STRICT for unservable decode shapes).
+            raise RuntimeError(
+                "KV preemption is forbidden under single-plane global KV "
+                f"(F2b): victim={request.request_id} "
+                f"num_preemptions={request.num_preemptions}. The router "
+                "must fail over; investigate admission/capacity."
+            )
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)

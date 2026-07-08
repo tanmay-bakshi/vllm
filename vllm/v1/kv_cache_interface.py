@@ -168,6 +168,13 @@ class AttentionSpec(KVCacheSpec):
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
     indexes_kv_by_block_stride: bool = False
+    kv_planes: int = 2
+    """Number of K/V planes in the paged cache (2 = standard K+V.
+    1 = single-plane: only K is stored; used by the Gemma4 F2b global
+    k_eq_v cache where V is reconstructed from K inside the megakernel
+    chain's SP core). Page-size unification reacts to the halved
+    per-token bytes by doubling block_size, so pool block bytes stay
+    uniform."""
 
     @property
     def page_size_bytes(self) -> int:
@@ -194,7 +201,7 @@ class AttentionSpec(KVCacheSpec):
         else:
             head_dim = self.head_size
         return (
-            2
+            self.kv_planes
             * self.block_size
             * self.num_kv_heads
             * head_dim
@@ -298,6 +305,7 @@ class FullAttentionSpec(AttentionSpec):
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
+            kv_planes=specs[0].kv_planes,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             # If any layer in the group is non-causal, treat the group as
@@ -334,6 +342,10 @@ class FullAttentionSpec(AttentionSpec):
             last_dim = self.head_size // 2 + self.head_size_v // 2
         else:
             last_dim = self.head_size + self.head_size_v
+        if self.kv_planes == 1:
+            # F2b single-plane k_eq_v cache: K bytes only (bf16 path)
+            assert self.kv_quant_mode == KVQuantMode.NONE, self.kv_quant_mode
+            last_dim = self.head_size
         return (
             self.block_size * self.num_kv_heads * last_dim * get_dtype_size(self.dtype)
         )

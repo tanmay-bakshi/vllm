@@ -1922,6 +1922,23 @@ class FlashInferImpl(AttentionImpl):
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
             k_cache = kv_cache[:, 0]
+            if kv_cache.size(1) == 1:
+                # F2b single-plane cache (Gemma4 global k_eq_v): no V
+                # plane exists. Real writes go through the megakernel's
+                # B3 append; only boot dummies and forbidden stock-served
+                # batches reach this op. Write K correctly and drop V
+                # (never overwrite K bytes with V values).
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    key,
+                    k_cache,
+                    k_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._k_scale,
+                )
+                return
             v_cache = kv_cache[:, 1]
             torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key,

@@ -7200,6 +7200,18 @@ class GPUModelRunner(
                         kv_cache_spec.head_size,
                         cache_dtype_str=self.cache_config.cache_dtype,
                     )
+                    if (
+                        getattr(kv_cache_spec, "kv_planes", 2) == 1
+                        and len(kv_cache_shape) == 5
+                    ):
+                        # F2b single-plane cache: shrink the K/V plane
+                        # dim; per-block bytes already halved via the
+                        # spec so the raw tensor numel matches.
+                        kv_cache_shape = (
+                            kv_cache_shape[0],
+                            1,
+                            *kv_cache_shape[2:],
+                        )
                     try:
                         kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
                         assert len(kv_cache_stride_order) == len(kv_cache_shape)

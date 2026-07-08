@@ -628,6 +628,20 @@ class Attention(nn.Module, AttentionLayerBase):
                 tq_slot_size=tq_config.slot_size_aligned,
             )
         else:
+            import os as _os
+
+            kv_planes = 2
+            if (
+                _os.environ.get("VLLM_GEMMA4_SP_GLOBAL", "0") == "1"
+                and self.head_size == 512
+                and self.num_kv_heads == 4
+            ):
+                # F2b single-plane k_eq_v global cache: Gemma4 global
+                # layers store K only; the megakernel chain's SP core
+                # reconstructs V = unRoPE(K)/w at read time. Guarded by
+                # the exact global-layer geometry (the DFlash drafter
+                # is hd 128 / 8 kv heads and never matches).
+                kv_planes = 1
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
@@ -635,6 +649,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                kv_planes=kv_planes,
             )
 
 

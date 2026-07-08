@@ -460,6 +460,28 @@ class Gemma4FlashInferTRTLLMGenImpl(FlashInferImpl):
         :returns: Attention output tensor.
         """
 
+        if kv_cache.dim() == 5 and kv_cache.size(1) == 1:
+            # F2b single-plane global cache: the stock path can neither
+            # read nor write it (no V plane exists). Only boot-time
+            # dummy / capture-warmup traffic may land here -- router
+            # admission plus the mega chain own every real decode, and
+            # a rogue prefill would only leave its OWN pages unwritten
+            # (garbage for that request; no cross-request corruption).
+            # Zero the output, count loudly, touch nothing.
+            if attn_metadata is not None:
+                self._sp_stock_hits = getattr(self, "_sp_stock_hits", 0) + 1
+                n = self._sp_stock_hits
+                if n <= 8 or n % 1000 == 0:
+                    logger.warning(
+                        "Gemma4 single-plane layer served by STOCK "
+                        "attention (#%d): expected only for boot "
+                        "dummies; real traffic here means broken "
+                        "admission.",
+                        n,
+                    )
+            output.zero_()
+            return output
+
         if attn_metadata is not None:
             if attn_metadata.use_cascade:
                 raise ValueError(
