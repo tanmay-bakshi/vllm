@@ -310,6 +310,10 @@ class Scheduler(SchedulerInterface):
         # FIFO of (fence_seq, blocks): blocks become safe to free once
         # processed_step_seq >= fence_seq.
         self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
+        # Preempt-abort (phase 21): victims to finish through the
+        # kv-load-failure error flow in update_from_output instead of
+        # recompute-resume. Env-gated; only ever populated on PD consumers.
+        self._preempt_abort_req_ids: set[str] = set()
 
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -1207,9 +1211,46 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
+        if self.scheduler_config.async_scheduling:
+            # Async scheduling: any output frame still in flight was computed
+            # against KV blocks we are about to free; its tokens must NOT be
+            # appended when it returns (update_from_output skips exactly
+            # `async_tokens_to_discard` frames), and the resumed request must
+            # restart from the last CPU-confirmed token. placeholders > 0 is
+            # equivalent to "one frame in flight" at PP1 (spec tokens inflate
+            # the placeholder count, not the frame count).
+            request.async_tokens_to_discard = (
+                1 if request.num_output_placeholders > 0 else 0
+            )
+            request.num_output_placeholders = 0
+            # Drop from the prev-step scheduled set so a resume (even in this
+            # same schedule step) ships the authoritative all_token_ids and the
+            # worker rebuilds its token state instead of trusting a stale row.
+            self.prev_step_scheduled_req_ids.discard(request.request_id)
         request.num_preemptions += 1
+        logger.info(
+            "[preempt] victim=%s n_preempt=%d discard_frame=%d tokens_at_preempt=%d",
+            request.request_id, request.num_preemptions,
+            request.async_tokens_to_discard, request.num_tokens,
+        )
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+
+        import os as _os_pa
+        if (
+            self.connector is not None
+            and _os_pa.environ.get("VLLM_GEMMA4_PREEMPT_ABORT", "0") == "1"
+        ):
+            # PD decode tier (phase 21): do not recompute-resume; fail the
+            # request via the kv-load-failure flow (see update_from_output).
+            # Blocks were already freed (fenced) above; the request sits in
+            # no queue until finish_requests removes it from self.requests.
+            logger.warning(
+                "[preempt-abort] failing %s instead of recompute-resume",
+                request.request_id,
+            )
+            self._preempt_abort_req_ids.add(request.request_id)
+            return
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
@@ -1627,6 +1668,16 @@ class Scheduler(SchedulerInterface):
                 # In this case, we use is_finished() to check.
                 continue
 
+            if request.async_tokens_to_discard > 0:
+                # This frame was in flight when the request was preempted (or
+                # force-preempted by reset_prefix_cache): the tokens were
+                # sampled against KV that has been freed. Drop the frame
+                # whole -- including its spec-rejection accounting, which
+                # would otherwise be applied against the resumed request's
+                # fresh counters.
+                request.async_tokens_to_discard -= 1
+                continue
+
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
@@ -1815,6 +1866,31 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                     )
                 )
+
+        if self._preempt_abort_req_ids:
+            # Preempt-abort (phase 21): finish victims through the same
+            # error flow as failed KV loads so the client sees a clean,
+            # retryable failure instead of silently corrupted output.
+            abort_ids = [
+                req_id
+                for req_id in self._preempt_abort_req_ids
+                if req_id in self.requests
+                and not self.requests[req_id].is_finished()
+            ]
+            self._preempt_abort_req_ids.clear()
+            if abort_ids:
+                requests = [self.requests[req_id] for req_id in abort_ids]
+                self.finish_requests(abort_ids, RequestStatus.FINISHED_ERROR)
+                for request in requests:
+                    outputs[request.client_index].append(
+                        EngineCoreOutput(
+                            request_id=request.request_id,
+                            new_token_ids=[],
+                            finish_reason=request.get_finished_reason(),
+                            events=request.take_events(),
+                            trace_headers=request.trace_headers,
+                        )
+                    )
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
@@ -2259,7 +2335,9 @@ class Scheduler(SchedulerInterface):
                 # the engine has drained (e.g. pause_generation(keep) waited
                 # for idle), 1 for vanilla async mid-step, or 1 + spec/PP frames
                 # otherwise.
-                request.async_tokens_to_discard = request.num_output_placeholders
+                request.async_tokens_to_discard = (
+                    1 if request.num_output_placeholders > 0 else 0
+                )
                 request.num_output_placeholders = 0
 
             # Clear scheduled request ids cache. Since we are forcing preemption

@@ -534,6 +534,19 @@ class NixlBaseConnectorWorker:
             get_representative_spec_type(g.kv_cache_spec)
             for g in self.kv_cache_config.kv_cache_groups
         )
+        import os as _os_sg
+        _skip = _os_sg.environ.get("VLLM_GEMMA4_SKIP_PULL_GROUPS", "")
+        self._skip_pull_groups: set[int] = {
+            int(x) for x in _skip.split(",") if x.strip()
+        }
+        for _gi, _g in enumerate(self.kv_cache_config.kv_cache_groups):
+            logger.info(
+                "[kv-group] i=%d block_size=%s n_layers=%d first=%s skip_pull=%s",
+                _gi, getattr(_g.kv_cache_spec, "block_size", "?"),
+                len(_g.layer_names),
+                _g.layer_names[0] if _g.layer_names else "-",
+                _gi in self._skip_pull_groups,
+            )
 
         # Per-region MLA flag, 1:1 with block_len_per_layer. True -> REPLICATE
         # (MLA), False -> SPLIT (head-sharded full-attn). Mixed only for models
@@ -2401,6 +2414,10 @@ class NixlBaseConnectorWorker:
         if not self._has_mamba:
             sp_flags = self._sp_group_flags()
             for i, remote_group in enumerate(remote_block_ids):
+                if i in self._skip_pull_groups:
+                    remote_block_ids[i] = []
+                    local_block_ids[i] = []
+                    continue
                 num_local_blocks = len(local_block_ids[i])
                 # F2b single-plane groups: local blocks hold 2x remote
                 # tokens, so a fully-uncached request legitimately has
@@ -2410,6 +2427,15 @@ class NixlBaseConnectorWorker:
                 # position-scrambled needle retrieval, 2026-07-08).
                 factor = 2 if sp_flags[i] else 1
                 num_keep = factor * num_local_blocks
+                if num_local_blocks != len(remote_group):
+                    logger.info(
+                        "[prefix-trim] group=%s len_local=%d len_remote=%d "
+                        "keep=%d first_local=%s first_remote=%s",
+                        i, num_local_blocks, len(remote_group),
+                        min(num_local_blocks, len(remote_group)),
+                        local_block_ids[i][:2] if num_local_blocks else [],
+                        remote_group[:2],
+                    )
                 assert num_local_blocks <= len(remote_group)
                 if num_keep < len(remote_group):
                     remote_block_ids[i] = remote_group[-num_keep:]

@@ -156,19 +156,30 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     req_id, len(self._coalesce_pending))
                 return
 
-        if any(self._sp_group_flags()):
+        if any(self._sp_group_flags()) or self._no_stock_dma():
             # F2b: the stock per-descriptor path cannot express the
             # single-plane K-half/2:1 mapping -- running it would write
             # a dual layout into a single-plane cache. Fail the request
             # (kv_load_failure_policy=fail) rather than corrupt.
+            # Phase 21 (VLLM_GEMMA4_NIXL_NO_STOCK_DMA=1): the stock path
+            # also DMAs into local KV offsets past the NIXL/UCX
+            # large-offset defect threshold (block ids >= ~32768) and
+            # silently corrupts; fail instead -- the router retries via
+            # a fresh prefill->decode pass.
             logger.error(
-                "coalesced pull unavailable for %s but single-plane KV "
-                "groups exist; failing the request instead of the stock "
-                "path.", req_id)
+                "coalesced pull unavailable for %s (sp_groups=%s "
+                "no_stock_dma=%s); failing the request instead of the "
+                "stock path.", req_id, any(self._sp_group_flags()),
+                self._no_stock_dma())
             self._handle_failed_transfer(req_id, None)
             return
 
         self._stock_read_specs(req_id, meta, read_specs)
+
+    def _no_stock_dma(self) -> bool:
+        import os as _os_ns
+        return _os_ns.environ.get(
+            "VLLM_GEMMA4_NIXL_NO_STOCK_DMA", "0") == "1"
 
     def _stock_read_specs(self, req_id: str, meta: ReqMeta,
                           read_specs: list[ReadSpec]) -> None:
@@ -282,6 +293,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 break
             self._coalesce_pending.popleft()
             if res == "stock":
+                if self._no_stock_dma():
+                    logger.error(
+                        "coalesced drain: %s not expressible; failing "
+                        "instead of the stock path.", req_id)
+                    self._handle_failed_transfer(req_id, None)
+                    continue
                 self._stock_read_specs(req_id, meta, read_specs)
 
     def _coalesced_read_request(self, req_id: str, meta: ReqMeta,
