@@ -108,6 +108,22 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
 
+        if (
+            meta.remote.request_id in self._released_rids
+            and sum(len(g) for g in meta.local_physical_block_ids) > 0
+        ):
+            # Full-prefix-hit requests (empty local ids) read nothing
+            # and are exempt from the fence.
+            logger.error(
+                "[release-fence] refusing pull for %s: remote request %s "
+                "already released; failing (router retries with a fresh "
+                "prefill).",
+                req_id,
+                meta.remote.request_id,
+            )
+            self._handle_failed_transfer(req_id, None)
+            return
+
         meta.remote.block_ids = self._logical_to_remote_kernel_block_ids(
             meta.remote.block_ids,
             remote_info.remote_physical_blocks_per_logical,
@@ -226,12 +242,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_request_id=meta.remote.request_id,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
+                expected_consumers=meta.remote.expected_consumers,
             )
 
         if self.use_mla and tp_ratio < 0 and read_specs:
             # ..but we still need to notify the other remote ranks that we
             # have the blocks we need so they can update the request state.
-            notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
+            notif_id = (
+                f"{meta.remote.request_id}:{self.world_size}"
+                f":{meta.remote.expected_consumers}"
+            ).encode()
             remote_agents = self._remote_agents[meta.remote.engine_id]
             for rank_to_notify, agent in remote_agents.items():
                 if rank_to_notify != read_specs[0].remote_rank:
@@ -318,7 +338,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             [list(g) for g in spec0.remote_block_ids],
             remote_info.remote_physical_blocks_per_logical,
         )
-        notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
+        notif_id = (
+            f"{meta.remote.request_id}:{self.world_size}"
+            f":{meta.remote.expected_consumers}"
+        ).encode()
         if len(local_ids) == 0 or sum(len(g) for g in local_ids) == 0:
             # full prefix hit: just release P's blocks on every rank
             for s in read_specs:
@@ -455,6 +478,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
     def _read_blocks(
         self,
+        *,
+        expected_consumers: int = 1,
         read_spec: ReadSpec,
         dst_engine_id: str,
         request_id: str,
@@ -511,7 +536,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
         # Number of D TP workers that will read from dst P. Propagate info
         # on notification so that dst worker can wait before freeing blocks.
-        notif_id = f"{remote_request_id}:{self.world_size}".encode()
+        notif_id = (
+            f"{remote_request_id}:{self.world_size}:{expected_consumers}"
+        ).encode()
 
         # Full prefix cache hit: do not need to read remote blocks,
         # just notify P worker that we have the blocks we need.
@@ -613,7 +640,40 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     self._handle_heartbeat(msg[3:])
                     continue
 
-                req_id, tp_size = msg.rsplit(":", 1)
+                # Producer expired a lease: fence the rid and fail any
+                # parked pull for it (in-flight ones are handled at
+                # completion by the release fence in get_finished).
+                if msg.startswith("EXPIRED:"):
+                    rid = msg[len("EXPIRED:"):]
+                    logger.warning(
+                        "Producer expired lease for %s; fencing.", rid
+                    )
+                    self._mark_rid_released(rid)
+                    still_parked = []
+                    for item in self._coalesce_pending:
+                        p_req_id, p_meta, p_specs = item
+                        if (
+                            p_meta.remote is not None
+                            and p_meta.remote.request_id == rid
+                        ):
+                            self._handle_failed_transfer(p_req_id, None)
+                        else:
+                            still_parked.append(item)
+                    self._coalesce_pending.clear()
+                    self._coalesce_pending.extend(still_parked)
+                    continue
+
+                parts = msg.rsplit(":", 2)
+                if (
+                    len(parts) == 3
+                    and parts[1].isdigit()
+                    and parts[2].isdigit()
+                ):
+                    req_id, tp_size, expected_s = parts
+                    expected_consumers = int(expected_s)
+                else:
+                    req_id, tp_size = msg.rsplit(":", 1)
+                    expected_consumers = 1
                 if (
                     req_id not in self._reqs_to_send
                     and req_id not in self._reqs_to_process
@@ -637,10 +697,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 )
 
                 self.consumer_notification_counts_by_req[req_id] += 1
-                # Wait all consumers (D) to be done reading before freeing.
+                # Wait for all consumers (D) to be done reading before
+                # freeing: TP fan-out reads AND n>1 sibling pulls.
                 if (
                     self.consumer_notification_counts_by_req[req_id]
-                    == consumers_per_producer
+                    >= consumers_per_producer * expected_consumers
                 ):
                     notified_req_ids.add(req_id)
                     del self.consumer_notification_counts_by_req[req_id]

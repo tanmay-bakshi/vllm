@@ -156,6 +156,10 @@ class RemoteMeta:
     port: int
     engine_id: str
     request_id: str
+    # How many consumer-side requests will pull/notify for this remote
+    # request (n>1 children all pull the same rid). The producer frees
+    # its blocks only after this many completion notifications per rank.
+    expected_consumers: int = 1
 
 
 @dataclass
@@ -221,5 +225,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             request_id=kv_transfer_params["remote_request_id"],
             host=kv_transfer_params["remote_host"],
             port=kv_transfer_params["remote_port"],
+            expected_consumers=int(
+                kv_transfer_params.get("expected_consumers") or 1
+            ),
         )
         self.reqs_to_recv[request_id] = req

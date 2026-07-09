@@ -470,6 +470,18 @@ class NixlBaseConnectorWorker:
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
+        # Release fence: remote rids whose producer blocks are known to be
+        # released (own completion, sibling release, or producer EXPIRED
+        # notification). Bounded FIFO. A pull must never be issued for --
+        # nor a completion committed against -- a released rid.
+        self._released_rids: dict[str, float] = {}
+        # Consumer side: completed pulls per rid; the rid is released once
+        # this reaches the request's expected_consumers.
+        self._rid_completion_counts: dict[str, int] = {}
+        # Producer side: expired requests are held here for a grace window
+        # (blocks still pinned) so consumers can process our EXPIRED
+        # notification or finish an in-flight read before the real free.
+        self._grace_frees: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
         self._reqs_to_process: set[ReqId] = set()
 
@@ -2134,6 +2146,38 @@ class NixlBaseConnectorWorker:
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
 
+            # Release fence: this pull completed for a rid whose producer
+            # blocks were already released (all expected consumers done,
+            # or producer EXPIRED) -- the bytes may come from reused
+            # pages. Fail the request (router retries with a fresh
+            # prefill) instead of committing and publishing them.
+            # Full-prefix-hit requests (empty local ids) read nothing and
+            # are exempt.
+            if (
+                meta.remote is not None
+                and meta.remote.request_id in self._released_rids
+                and req_id not in failed_recv_reqs
+                and sum(len(g) for g in meta.local_physical_block_ids) > 0
+            ):
+                logger.error(
+                    "[release-fence] pull for %s completed after remote "
+                    "request %s was released; failing instead of "
+                    "committing.",
+                    req_id,
+                    meta.remote.request_id,
+                )
+                failed_recv_reqs.add(req_id)
+            elif meta.remote is not None and req_id not in failed_recv_reqs:
+                # Count this completion; the producer frees its blocks at
+                # expected_consumers completions, so mirror that release
+                # point locally.
+                rid = meta.remote.request_id
+                n_done = self._rid_completion_counts.get(rid, 0) + 1
+                self._rid_completion_counts[rid] = n_done
+                if n_done >= meta.remote.expected_consumers:
+                    self._rid_completion_counts.pop(rid, None)
+                    self._mark_rid_released(rid)
+
             # Skip KV sync and post-processing for failed requests
             if req_id in failed_recv_reqs:
                 logger.warning(
@@ -2195,6 +2239,29 @@ class NixlBaseConnectorWorker:
             )
             self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
+            # Notify consumers so they fail (and retry) any pull still
+            # planned or in flight for this rid, then hold the blocks
+            # for a grace window before the real free: a read that
+            # already started still lands on intact pages.
+            expired_msg = f"EXPIRED:{req_id}".encode()
+            for agents in self._remote_agents.values():
+                for agent in agents.values():
+                    try:
+                        self.nixl_wrapper.send_notif(
+                            agent, notif_msg=expired_msg
+                        )
+                    except Exception:
+                        pass
+            import os as _os
+            grace = float(
+                _os.environ.get("VLLM_GEMMA4_KV_FREE_GRACE_S", "5")
+            )
+            self._grace_frees[req_id] = now + grace
+        # Drain grace-held frees whose window elapsed.
+        for req_id in [
+            r for r, t in self._grace_frees.items() if now >= t
+        ]:
+            del self._grace_frees[req_id]
             done_sending.add(req_id)
 
         # coalesced pull: completed scatters freed staging; start
@@ -2230,6 +2297,13 @@ class NixlBaseConnectorWorker:
         Subclasses must implement this to handle mode-specific notifications.
         """
         raise NotImplementedError
+
+    def _mark_rid_released(self, rid: str) -> None:
+        import time as _t
+        self._released_rids[rid] = _t.perf_counter()
+        if len(self._released_rids) > 8192:
+            for k in list(self._released_rids)[:2048]:
+                del self._released_rids[k]
 
     def _handle_heartbeat(self, payload: str) -> None:
         """Extend leases for requests referenced in a heartbeat.
