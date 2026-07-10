@@ -108,6 +108,11 @@ class Scheduler(SchedulerInterface):
         )
         # Track requests scheduled in prior step (MRV1-only).
         self.prev_step_scheduled_req_ids: set[str] = set()
+        # Token-provenance tracer (VLLM_GEMMA4_TOKEN_TRACE=<path>):
+        # per-request per-step drafted vs generated token ids.
+        import os as _os_tt
+        _tt_path = _os_tt.environ.get("VLLM_GEMMA4_TOKEN_TRACE", "")
+        self._tok_trace = open(_tt_path, "a", buffering=1) if _tt_path else None
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -1711,6 +1716,17 @@ class Scheduler(SchedulerInterface):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+
+            if self._tok_trace is not None and generated_token_ids:
+                import time as _t_tt
+                try:
+                    self._tok_trace.write(
+                        f"{_t_tt.monotonic():.3f} {req_id} "
+                        f"d={scheduled_spec_token_ids or []} "
+                        f"g={generated_token_ids}\n"
+                    )
+                except Exception:
+                    pass
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:

@@ -504,6 +504,10 @@ class GPUModelRunner(
 
         # Async scheduling
         self.use_async_scheduling = self.scheduler_config.async_scheduling
+        import os as _os_ps
+        self._pad_sanitize = (
+            _os_ps.environ.get("VLLM_GEMMA4_PAD_SANITIZE", "0") == "1"
+        )
 
         # Sampler
         self.sampler = Sampler(
@@ -1911,6 +1915,14 @@ class GPUModelRunner(
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
+        if self._pad_sanitize:
+            # Padded CUDA-graph rows above num_reqs keep STALE gpu
+            # block-table entries from departed requests (freed pages).
+            # seq_lens pads are zeroed, but graph-baked kernels that
+            # touch padded rows would read garbage KV; point them at
+            # the null block (id 0) instead.
+            for bt in self.input_batch.block_table.block_tables:
+                bt.block_table.gpu[num_reqs:].fill_(0)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
