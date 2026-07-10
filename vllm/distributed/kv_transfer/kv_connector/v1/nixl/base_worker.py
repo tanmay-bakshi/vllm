@@ -2739,7 +2739,7 @@ class NixlBaseConnectorWorker:
                         "[prefix-trim] group=%s len_local=%d len_remote=%d "
                         "keep=%d first_local=%s first_remote=%s",
                         i, num_local_blocks, len(remote_group),
-                        min(num_local_blocks, len(remote_group)),
+                        num_keep,
                         local_block_ids[i][:2] if num_local_blocks else [],
                         remote_group[:2],
                     )

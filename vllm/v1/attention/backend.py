@@ -547,6 +547,19 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
+            positions=self.positions[:num_actual_tokens]
+            if self.positions is not None
+            else None,
+            seq_lens_cpu_upper_bound=maybe_slice_reqs(
+                self.seq_lens_cpu_upper_bound
+            ),
+            mm_req_doc_ranges={
+                k: v
+                for k, v in self.mm_req_doc_ranges.items()
+                if k < num_actual_reqs
+            }
+            if self.mm_req_doc_ranges is not None
+            else None,
         )
 
 

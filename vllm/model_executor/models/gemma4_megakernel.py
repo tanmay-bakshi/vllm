@@ -217,6 +217,14 @@ class MegaRunner:
         # F2a by design (dual-plane cache; admission keeps them rare).
         self.strict = os.environ.get("MK_STRICT", "1") == "1"
         self.strict_mixed = os.environ.get("MK_STRICT_MIXED", "0") == "1"
+        # F2b single-plane cache (VLLM_GEMMA4_SP_GLOBAL): the stock path
+        # is numerically wrong for SP groups, not merely slower — any
+        # batch that would leave the mega path must fail closed
+        # (static-review P0). Forces MK_STRICT_MIXED on.
+        self.sp_active = (
+            os.environ.get("VLLM_GEMMA4_SP_GLOBAL", "0") == "1")
+        if self.sp_active:
+            self.strict_mixed = True
         # dev observability: log every gate outcome (rate-limited)
         self.shape_log = os.environ.get("MK_SHAPE_LOG", "0") == "1"
         self._gate_events = 0
@@ -444,6 +452,13 @@ class MegaRunner:
         md0 = md_all.get(lname0)
         if md0 is None or getattr(md0, "num_prefill_tokens", 1) != 0:
             self.fb["prefill"] += 1
+            if self.sp_active and md0 is not None:
+                # includes the kv_recompute_threshold local-prefill
+                # fallback: a D running F2b must never prefill stock
+                raise RuntimeError(
+                    "[mk_gemma4] SP fail-closed: prefill-containing "
+                    "batch cannot be served stock on the single-plane "
+                    "F2b cache; keep prefill off this instance")
             dt = int(getattr(md0, "num_decode_tokens", 0) or 0) \
                 if md0 is not None else 0
             if dt > 0:

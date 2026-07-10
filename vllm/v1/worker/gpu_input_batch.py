@@ -681,12 +681,13 @@ class InputBatch:
         swap_dict_values(self.bad_words_token_ids, i1, i2)
 
         if self.allowed_token_ids_mask_cpu_tensor is not None:
-            (
-                self.allowed_token_ids_mask_cpu_tensor[i1],
-                self.allowed_token_ids_mask_cpu_tensor[i2],
-            ) = (
-                self.allowed_token_ids_mask_cpu_tensor[i2],
-                self.allowed_token_ids_mask_cpu_tensor[i1],
+            # Tuple-swapping tensor rows aliases through views: the
+            # first assignment rewrites the storage the second RHS
+            # still reads, leaving BOTH rows equal to the original i2
+            # row (one request inherits another's allowed-token mask).
+            # Advanced indexing copies, like is_token_ids above.
+            self.allowed_token_ids_mask_cpu_tensor[[i1, i2]] = (
+                self.allowed_token_ids_mask_cpu_tensor[[i2, i1]]
             )
 
     def _get_active_token_count(self, req_index: int) -> int:

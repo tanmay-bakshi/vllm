@@ -194,9 +194,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         self._stock_read_specs(req_id, meta, read_specs)
 
     def _no_stock_dma(self) -> bool:
+        # Default ON: the stock per-descriptor path silently corrupts
+        # local KV offsets past the NIXL/UCX large-offset defect
+        # threshold (block ids >= ~32768). A known-corrupt path must
+        # not be reachable by merely omitting an env var; set =0
+        # explicitly only for small-pool debugging.
         import os as _os_ns
         return _os_ns.environ.get(
-            "VLLM_GEMMA4_NIXL_NO_STOCK_DMA", "0") == "1"
+            "VLLM_GEMMA4_NIXL_NO_STOCK_DMA", "1") == "1"
 
     def _stock_read_specs(self, req_id: str, meta: ReqMeta,
                           read_specs: list[ReadSpec]) -> None:
