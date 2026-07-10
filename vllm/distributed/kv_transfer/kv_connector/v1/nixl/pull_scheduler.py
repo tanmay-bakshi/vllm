@@ -206,6 +206,9 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         # Stop heartbeating for aborted requests that never reached finished_recving:
         # normal path cleans up in update_connector_output.
         self._stop_heartbeat(request.request_id)
+        # KV-audit: let the worker retire this rid's audit state before
+        # its blocks can be reallocated to a new pull.
+        self._audit_finished_reqs.add(request.request_id)
 
         if params.get("do_remote_prefill"):
             # If do_remote_prefill is still True when the request is finished,

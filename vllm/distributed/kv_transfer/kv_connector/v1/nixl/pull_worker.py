@@ -42,6 +42,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        self._audit_retire(metadata)
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
@@ -474,6 +475,18 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             slots=[plan.rank_to_attention_slot.get(s.remote_rank, 0)
                    for s in read_specs],
         )
+        if self._audit_enabled:
+            # Immutable prompt rows for the auditor: audited groups
+            # (full-attention globals by default), minus each group's
+            # last rows (decode appends write there).
+            t = self._audit_tail_exclude
+            arows: list[int] = []
+            for gi in sorted(self._audit_groups):
+                if gi < len(local_ids) and not sp_flags[gi]:
+                    g = list(local_ids[gi])
+                    if len(g) > t:
+                        arows.extend(int(b) for b in g[:-t])
+            self._coalesce_plans[req_id]["audit_rows"] = arows
         return "posted"
 
     def _read_blocks(

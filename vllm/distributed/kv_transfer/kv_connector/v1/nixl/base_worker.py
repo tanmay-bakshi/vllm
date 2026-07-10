@@ -482,6 +482,51 @@ class NixlBaseConnectorWorker:
         # (blocks still pinned) so consumers can process our EXPIRED
         # notification or finish an in-flight read before the real free.
         self._grace_frees: dict[ReqId, float] = {}
+
+        # ---- resident-KV checksum auditor (VLLM_GEMMA4_KV_AUDIT) ----
+        # Snapshot content sums of immutable prompt rows at pull commit;
+        # re-verify periodically. Debug instrument, off by default.
+        import os as _os_audit
+        self._audit_enabled = (
+            _os_audit.environ.get("VLLM_GEMMA4_KV_AUDIT", "0") == "1"
+        )
+        self._audit_interval = int(
+            _os_audit.environ.get("VLLM_GEMMA4_KV_AUDIT_INTERVAL", "16")
+        )
+        self._audit_groups = {
+            int(x)
+            for x in _os_audit.environ.get(
+                "VLLM_GEMMA4_KV_AUDIT_GROUPS", "10,11"
+            ).split(",")
+            if x.strip()
+        }
+        self._audit_tail_exclude = int(
+            _os_audit.environ.get("VLLM_GEMMA4_KV_AUDIT_TAIL", "2")
+        )
+        self._audit_selftest = int(
+            _os_audit.environ.get("VLLM_GEMMA4_KV_AUDIT_SELFTEST", "0")
+        )
+        # rid -> dict(rows=LongTensor, sums=[n_regions, K] int64, t=float)
+        self._audit_state: dict[str, dict] = {}
+        # (rid, audit_rows, all_rows) committed this step, snapshot at
+        # the end of get_finished (after any post-receive processing).
+        self._audit_pending: list[tuple[str, list[int], list[int]]] = []
+        # physical row -> (owner rid, since, alive)
+        self._audit_row_owner: dict[int, tuple[str, float, bool]] = {}
+        # audited physical row -> rid currently auditing it
+        self._audit_row_to_rid: dict[int, str] = {}
+        self._audit_step = 0
+        self._audit_regions: list[int] | None = None
+        self._audit_snap_count = 0
+        if self._audit_enabled:
+            logger.info(
+                "[kv-audit] ENABLED interval=%d groups=%s tail=%d "
+                "selftest=%d",
+                self._audit_interval,
+                sorted(self._audit_groups),
+                self._audit_tail_exclude,
+                self._audit_selftest,
+            )
         # Set of requests that have been part of a batch, regardless of status.
         self._reqs_to_process: set[ReqId] = set()
 
@@ -2099,6 +2144,10 @@ class NixlBaseConnectorWorker:
                         dest[:, :, sl, :][idx_d] = reg[r][dual_m]
                     if idx_s.numel():
                         dest_sp[idx_s, sl, h_s] = reg[r][sp_m][:, 0]
+            if self._audit_enabled and plan.get("audit_rows"):
+                self._audit_pending.append(
+                    (req_id, plan["audit_rows"], plan["lpos"])
+                )
         finally:
             # The scatter kernels read staging asynchronously while UCX
             # writes for the NEXT user of this range are not
@@ -2269,7 +2318,191 @@ class NixlBaseConnectorWorker:
         if self._coalesce_pending:
             self._coalesce_service_pending()
 
+        self._audit_tick(failed_recv_reqs)
+
         return done_sending, done_recving
+
+    # ------------------------------------------------------------------
+    # Resident-KV checksum auditor (VLLM_GEMMA4_KV_AUDIT)
+    # ------------------------------------------------------------------
+
+    def _audit_map_regions(self) -> list[int]:
+        """Region indices serving the audited groups' layers, plus
+        region 0 as a canary. HMA broadcast pulls write every region for
+        every position, so any region detects transfer-side stomps; the
+        owning group's regions additionally detect decode-side ones."""
+        if self._audit_regions is not None:
+            return self._audit_regions
+        base_to_region = {
+            t.data_ptr(): i for i, t in enumerate(self._region_tensors)
+        }
+        regs: set[int] = {0} if self._region_tensors else set()
+        groups = self.kv_cache_config.kv_cache_groups
+        for gi in sorted(self._audit_groups):
+            if gi >= len(groups):
+                continue
+            for lname in groups[gi].layer_names:
+                cache_or_caches = self.device_kv_caches.get(lname)
+                if cache_or_caches is None:
+                    continue
+                caches = (
+                    cache_or_caches
+                    if isinstance(cache_or_caches, (list, tuple))
+                    else [cache_or_caches]
+                )
+                for c in caches:
+                    r = base_to_region.get(c.data_ptr())
+                    if r is not None:
+                        regs.add(r)
+        self._audit_regions = sorted(regs)
+        logger.info(
+            "[kv-audit] auditing regions %s for groups %s",
+            self._audit_regions,
+            sorted(self._audit_groups),
+        )
+        return self._audit_regions
+
+    def _audit_checksum(self, rows: torch.Tensor) -> torch.Tensor:
+        """:param rows: LongTensor of physical row indices.
+        :returns: [n_audit_regions, len(rows)] int64 content sums."""
+        assert self._region_rows is not None
+        outs = []
+        for r in self._audit_map_regions():
+            flat = self._region_rows[r]
+            got = flat[rows]
+            if got.shape[1] % 4 == 0:
+                sums = got.view(torch.int32).sum(dim=1, dtype=torch.int64)
+            else:
+                sums = got.sum(dim=1, dtype=torch.int64)
+            outs.append(sums)
+        return torch.stack(outs)
+
+    def _audit_drop(self, rid: str, alive: bool) -> None:
+        """Retire one rid's audit state; journal its rows as freed."""
+        st = self._audit_state.pop(rid, None)
+        if st is None:
+            return
+        now = time.perf_counter()
+        for p in st["rows"].tolist():
+            if self._audit_row_to_rid.get(p) == rid:
+                del self._audit_row_to_rid[p]
+            owner = self._audit_row_owner.get(p)
+            if owner is not None and owner[0] == rid:
+                self._audit_row_owner[p] = (rid, now, alive)
+
+    def _audit_retire(self, metadata) -> None:
+        """Drop audit state for requests the scheduler finished; their
+        rows may be legitimately reallocated from now on."""
+        if not self._audit_enabled:
+            return
+        for rid in getattr(metadata, "audit_finished", None) or ():
+            self._audit_drop(rid, alive=False)
+
+    def _audit_poison(self, req_id: str) -> None:
+        """Self-test: flip bytes in one audited row so the next verify
+        pass MUST report a mismatch (proves the instrument detects)."""
+        st = self._audit_state.get(req_id)
+        if st is None or st["rows"].numel() == 0:
+            return
+        assert self._region_rows is not None
+        r0 = self._audit_map_regions()[-1]
+        row = int(st["rows"][st["rows"].numel() // 2])
+        self._region_rows[r0][row, 128:144] ^= 0x01
+        logger.error(
+            "[kv-audit-selftest] poisoned region %d row %d of %s; a "
+            "MISMATCH report for this row must follow",
+            r0,
+            row,
+            req_id,
+        )
+
+    def _audit_tick(self, failed_recv_reqs: set[str]) -> None:
+        """Snapshot rows committed this step; periodically re-verify
+        all audited requests' immutable rows."""
+        if not self._audit_enabled or self._region_rows is None:
+            return
+        if self._audit_pending:
+            dev = self._region_rows[0].device
+            now = time.perf_counter()
+            for req_id, arows, all_rows in self._audit_pending:
+                if req_id in failed_recv_reqs or len(arows) == 0:
+                    continue
+                # ROW-TAKEOVER: this pull wrote rows another live audited
+                # request still owns -- double-assignment, the bug class
+                # itself. Report and retire the trampled entry (its
+                # content is gone; a MISMATCH would only be noise).
+                taken: dict[str, list[int]] = {}
+                for p in all_rows:
+                    old = self._audit_row_to_rid.get(p)
+                    if old is not None and old != req_id:
+                        taken.setdefault(old, []).append(p)
+                for old_rid, rows_taken in taken.items():
+                    logger.error(
+                        "[kv-audit] ROW-TAKEOVER: pull for %s wrote %d "
+                        "rows still audited for LIVE request %s "
+                        "(first=%s) -- double-assigned KV pages",
+                        req_id,
+                        len(rows_taken),
+                        old_rid,
+                        rows_taken[:8],
+                    )
+                    self._audit_drop(old_rid, alive=True)
+                rows_t = torch.tensor(
+                    sorted(set(arows)), device=dev, dtype=torch.long
+                )
+                self._audit_state[req_id] = {
+                    "rows": rows_t,
+                    "sums": self._audit_checksum(rows_t),
+                    "t": now,
+                }
+                for p in arows:
+                    self._audit_row_to_rid[p] = req_id
+                for p in all_rows:
+                    self._audit_row_owner[p] = (req_id, now, True)
+                self._audit_snap_count += 1
+                logger.info(
+                    "[kv-audit] snapshot %s: %d immutable rows x %d "
+                    "regions (%d reqs audited)",
+                    req_id,
+                    rows_t.numel(),
+                    len(self._audit_map_regions()),
+                    len(self._audit_state),
+                )
+                if (
+                    self._audit_selftest
+                    and self._audit_snap_count == self._audit_selftest
+                ):
+                    self._audit_poison(req_id)
+            self._audit_pending.clear()
+        self._audit_step += 1
+        if self._audit_step % self._audit_interval or not self._audit_state:
+            return
+        for req_id, st in list(self._audit_state.items()):
+            cur = self._audit_checksum(st["rows"])
+            bad = (cur != st["sums"]).any(dim=0)
+            n_bad = int(bad.sum())
+            if n_bad == 0:
+                continue
+            idx = bad.nonzero().flatten()[:8]
+            rows = st["rows"][idx].tolist()
+            owners = {p: self._audit_row_owner.get(p) for p in rows}
+            regions_hit = (
+                (cur[:, idx] != st["sums"][:, idx]).sum(dim=1).tolist()
+            )
+            logger.error(
+                "[kv-audit] MISMATCH req=%s rows_bad=%d/%d first=%s "
+                "region_hit_counts=%s owners=%s age=%.1fs step=%d",
+                req_id,
+                n_bad,
+                st["rows"].numel(),
+                rows,
+                regions_hit,
+                owners,
+                time.perf_counter() - st["t"],
+                self._audit_step,
+            )
+            # Re-arm to current content so each distinct stomp logs once.
+            st["sums"] = cur
 
     def _coalesce_service_pending(self) -> None:
         """Overridden by the pull worker; push has no pull staging."""

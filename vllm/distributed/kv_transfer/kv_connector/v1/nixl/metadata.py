@@ -188,6 +188,10 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
+        # KV-audit: consumer request ids that finished on the scheduler
+        # this step (any finish status). The worker retires audit state
+        # for these; unknown ids are ignored.
+        self.audit_finished: set[ReqId] = set()
 
     def _add_new_req(
         self,

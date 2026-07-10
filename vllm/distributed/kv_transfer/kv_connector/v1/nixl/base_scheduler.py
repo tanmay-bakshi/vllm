@@ -105,6 +105,8 @@ class NixlBaseConnectorScheduler:
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[ReqId, tuple[Request, BlockIds]] = {}
+        # KV-audit: rids finished since the last build_connector_meta.
+        self._audit_finished_reqs: set[ReqId] = set()
         self._reqs_need_save: dict[ReqId, Request] = {}
         # Reqs to send and their expiration time
         self._reqs_need_send: dict[ReqId, float] = {}
@@ -409,6 +411,8 @@ class NixlBaseConnectorScheduler:
         meta.reqs_to_send = self._reqs_need_send
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
+        meta.audit_finished = self._audit_finished_reqs
+        self._audit_finished_reqs = set()
 
         # Package heartbeats, throttled by heartbeat_interval.
         if self._heartbeat_by_engine:
