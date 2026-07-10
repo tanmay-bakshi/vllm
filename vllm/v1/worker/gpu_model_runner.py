@@ -508,6 +508,10 @@ class GPUModelRunner(
         self._pad_sanitize = (
             _os_ps.environ.get("VLLM_GEMMA4_PAD_SANITIZE", "0") == "1"
         )
+        # Token-provenance tracing needs real draft ids CPU-side every
+        # step (see _copy_draft_token_ids_to_cpu).
+        self._trace_force_draft_copy = bool(
+            _os_ps.environ.get("VLLM_GEMMA4_TOKEN_TRACE"))
 
         # Sampler
         self.sampler = Sampler(
@@ -1334,6 +1338,19 @@ class GPUModelRunner(
                         self.prev_num_draft_tokens.np[prev_req_index] = (
                             optimistic_num_accepted
                         )
+                    else:
+                        # Broken prev-frame linkage: the GPU seq-len
+                        # correction cannot see this row, so the verify
+                        # forward counts all prev drafts as accepted
+                        # (phase-24 residual suspect).
+                        logger.warning(
+                            "[opt-broken-linkage] %s: %d optimistic "
+                            "drafts, no prev-frame row (sched_nct=%d "
+                            "state_nct=%d n_out=%d)",
+                            req_id, optimistic_num_accepted,
+                            num_computed_tokens,
+                            req_state.num_computed_tokens,
+                            len(req_state.output_token_ids))
 
                     if is_ngram_gpu and optimistic_num_accepted > 0:
                         self.input_batch.num_tokens_no_spec[req_index] += (
@@ -1485,6 +1502,12 @@ class GPUModelRunner(
                 ) in deferred_spec_decode_corrections:
                     prev_req_index = prev_req_id_to_index.get(req_id)
                     if prev_req_index is None:
+                        logger.warning(
+                            "[opt-correction-dropped] %s: deferred spec "
+                            "correction lost (%d optimistic drafts stay "
+                            "counted as accepted; state_nct=%d)",
+                            req_id, optimistic_num_accepted,
+                            req_state.num_computed_tokens)
                         continue
                     num_accepted = valid_sampled_token_count[prev_req_index] - 1
                     correction = optimistic_num_accepted - num_accepted
@@ -3721,6 +3744,14 @@ class GPUModelRunner(
             if self.input_batch.prev_sampled_token_ids is None:
                 assert sampled_token_ids.shape[-1] == 1
                 self.input_batch.prev_sampled_token_ids = sampled_token_ids
+            for _di in invalid_req_indices_set:
+                if self.input_batch.spec_token_ids[_di]:
+                    logger.warning(
+                        "[opt-discard] %s: sampling discarded with %d "
+                        "spec tokens in flight (row %d) — will vanish "
+                        "from prev-frame map",
+                        self.input_batch.req_ids[_di],
+                        len(self.input_batch.spec_token_ids[_di]), _di)
             self.input_batch.prev_req_id_to_index = {
                 req_id: i
                 for i, req_id in enumerate(self.input_batch.req_ids)
@@ -4822,9 +4853,13 @@ class GPUModelRunner(
             self.prev_num_spec_tokens = self._draft_token_ids.shape[1]
         # Check if we need to copy draft tokens to CPU. In async scheduling,
         # we only copy when needed for structured output, penalties or bad_words.
-        if self.use_async_scheduling and not (
-            scheduler_output.has_structured_output_requests
-            or self.input_batch.sampling_metadata.output_token_ids
+        if (
+            not self._trace_force_draft_copy
+            and self.use_async_scheduling
+            and not (
+                scheduler_output.has_structured_output_requests
+                or self.input_batch.sampling_metadata.output_token_ids
+            )
         ):
             return
         # We must also set the corresponding request ids.

@@ -944,6 +944,20 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     """
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         num_blocks = vllm_config.cache_config.num_gpu_blocks_override
+    # trtllm-gen paged decode silently truncates page ids above 65,535
+    # (16-bit packed page-table entries at small page sizes): deep-
+    # context reads land on wrong pages and corrupt logits once the
+    # block free-list circulates high ids (phase 24 RCA; interventional
+    # A/B: capped 0/7,680 vs default 30/7,680, fires with 8GB workspace).
+    # Cap at the validated bound until the kernel is fixed upstream.
+    _TRTLLM_PAGE_ID_SAFE_BLOCKS = 64000
+    if num_blocks > _TRTLLM_PAGE_ID_SAFE_BLOCKS:
+        logger.warning(
+            "Clamping KV cache pool from %d to %d blocks: page ids "
+            "above 65,535 are truncated inside the trtllm-gen paged "
+            "decode kernel (silent wrong-page KV reads).",
+            num_blocks, _TRTLLM_PAGE_ID_SAFE_BLOCKS)
+        num_blocks = _TRTLLM_PAGE_ID_SAFE_BLOCKS
     return num_blocks
 
 
