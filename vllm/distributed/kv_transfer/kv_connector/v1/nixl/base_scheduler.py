@@ -107,6 +107,13 @@ class NixlBaseConnectorScheduler:
         self._reqs_need_recv: dict[ReqId, tuple[Request, BlockIds]] = {}
         # KV-audit: rids finished since the last build_connector_meta.
         self._audit_finished_reqs: set[ReqId] = set()
+        # Single-flight sibling pulls: remote registration id -> local
+        # leader request id (VLLM_GEMMA4_PULL_SINGLE_FLIGHT=1).
+        import os as _os_sf
+        self._pull_single_flight = (
+            _os_sf.environ.get("VLLM_GEMMA4_PULL_SINGLE_FLIGHT", "0") == "1"
+        )
+        self._pull_leaders: dict[str, str] = {}
         self._reqs_need_save: dict[ReqId, Request] = {}
         # Reqs to send and their expiration time
         self._reqs_need_send: dict[ReqId, float] = {}

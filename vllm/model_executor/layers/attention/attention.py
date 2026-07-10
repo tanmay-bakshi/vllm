@@ -632,6 +632,28 @@ class Attention(nn.Module, AttentionLayerBase):
 
             kv_planes = 2
             if (
+                _os.environ.get("VLLM_GEMMA4_DRAFTER_SLIDING_SPEC", "0") == "1"
+                and self.head_size == 128
+                and self.num_kv_heads == 8
+            ):
+                # DFlash drafter (only hd128/8kv layer family reaching
+                # this branch): cross-attention over a symmetric window
+                # of target hidden states. The PD tail handoff (2 blocks
+                # = 128 tokens) proves reads never exceed this window; a
+                # FullAttentionSpec here permanently zeroes the hybrid
+                # prefix-cache hit-min on PD consumers (no chain from
+                # position 0 ever exists), forcing n>1 children to each
+                # full-pull the prompt. Declare the true window instead.
+                return SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    head_size_v=self.head_size_v,
+                    dtype=self.kv_cache_torch_dtype,
+                    kv_quant_mode=quant_mode,
+                    sliding_window=128,
+                )
+            if (
                 _os.environ.get("VLLM_GEMMA4_SP_GLOBAL", "0") == "1"
                 and self.head_size == 512
                 and self.num_kv_heads == 4

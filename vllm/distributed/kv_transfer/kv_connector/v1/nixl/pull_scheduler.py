@@ -104,6 +104,23 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         self.kv_recompute_threshold,
                     )
                     return 0, False
+                if self._pull_single_flight:
+                    rid = params.get("remote_request_id")
+                    leader = self._pull_leaders.get(rid) if rid else None
+                    if rid and leader is None:
+                        self._pull_leaders[rid] = request.request_id
+                        logger.info(
+                            "[single-flight] %s leads pull of %s",
+                            request.request_id,
+                            rid,
+                        )
+                    elif leader is not None and leader != request.request_id:
+                        # A sibling is already pulling this registration:
+                        # defer (re-evaluated every step). Once the
+                        # leader's blocks commit+publish, our local hit
+                        # covers the prompt and count stops being > 0, so
+                        # this branch is never reached again.
+                        return None, False  # type: ignore[return-value]
                 return count, True
 
         # No remote prefill for this request.
@@ -209,6 +226,13 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         # KV-audit: let the worker retire this rid's audit state before
         # its blocks can be reallocated to a new pull.
         self._audit_finished_reqs.add(request.request_id)
+        if self._pull_single_flight:
+            _sf_rid = params.get("remote_request_id")
+            if _sf_rid and self._pull_leaders.get(_sf_rid) == request.request_id:
+                # Leader finished (any status). If it committed, siblings
+                # are already local-hitting; if it aborted pre-commit, the
+                # next sibling claims leadership and pulls.
+                del self._pull_leaders[_sf_rid]
 
         if params.get("do_remote_prefill"):
             # If do_remote_prefill is still True when the request is finished,
