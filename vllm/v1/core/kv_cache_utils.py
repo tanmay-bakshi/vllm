@@ -950,6 +950,13 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     # block free-list circulates high ids (phase 24 RCA; interventional
     # A/B: capped 0/7,680 vs default 30/7,680, fires with 8GB workspace).
     # Cap at the validated bound until the kernel is fixed upstream.
+    # kv_producer (prefill-only) instances are exempt: their sustained
+    # reads use the prefill kernel family, their one handoff token never
+    # enters the consumer context, and clamping them starves the
+    # producer pool (multi-payload cert regressions, phase 24).
+    _ktc = getattr(vllm_config, "kv_transfer_config", None)
+    if _ktc is not None and getattr(_ktc, "kv_role", None) == "kv_producer":
+        return num_blocks
     _TRTLLM_PAGE_ID_SAFE_BLOCKS = 64000
     if num_blocks > _TRTLLM_PAGE_ID_SAFE_BLOCKS:
         logger.warning(
