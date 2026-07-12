@@ -9,6 +9,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
+from vllm.distributed.kv_transfer.nixl_localization import NixlSourceRoster
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -265,6 +266,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         # remove the conditional below
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
         remote_num_tokens = 0
+        localization_params: dict[str, Any] = {}
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
             request_kv_blocks_ttl = self._kv_lease_duration
@@ -287,6 +289,31 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # Here we "unpad" blocks to send the actual remote blocks to be read.
             block_ids = self.get_sw_clipped_blocks(block_ids)
 
+            if is_p_node and self._localization_config.enabled:
+                self._localization_offer_generation += 1
+                offer_generation = self._localization_offer_generation
+                self._source_integrity_rosters[request.request_id] = (
+                    NixlSourceRoster(
+                        offer_generation=offer_generation,
+                        iteration=0,
+                        valid_token_extent=int(request.num_computed_tokens),
+                        group_token_capacities=tuple(
+                            int(group.kv_cache_spec.block_size)
+                            for group in self.kv_cache_config.kv_cache_groups
+                        ),
+                        block_ids=tuple(
+                            tuple(int(block_id) for block_id in group)
+                            for group in block_ids
+                        ),
+                    )
+                )
+                localization_params = {
+                    "p2d_run_id": self._localization_config.run_id,
+                    "p2d_transport_arm": self._localization_config.transport_arm,
+                    "p2d_offer_generation": offer_generation,
+                    "p2d_iteration": 0,
+                }
+
             remote_num_tokens = request.num_computed_tokens
 
         return delay_free_blocks, dict(
@@ -299,4 +326,5 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             remote_num_tokens=remote_num_tokens,
+            **localization_params,
         )

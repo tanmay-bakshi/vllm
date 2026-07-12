@@ -27,6 +27,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
+from vllm.distributed.kv_transfer.nixl_localization import (
+    GET_SOURCE_MANIFEST_MSG,
+    LocalizationError,
+    NixlLocalizationConfig,
+    NixlLocalizationWorkerMetadata,
+    NixlSourceManifest,
+    NixlSourceRoster,
+    resolve_source_manifest_request,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -100,6 +109,21 @@ class NixlBaseConnectorScheduler:
         # Background thread for handling new handshake requests.
         self._nixl_handshake_listener_t: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._localization_config = NixlLocalizationConfig.from_environment()
+        self._localization_manifest_lock = threading.RLock()
+        self._localization_manifests: dict[
+            tuple[ReqId, int], dict[int, NixlSourceManifest]
+        ] = {}
+        self._source_integrity_rosters: dict[ReqId, NixlSourceRoster] = {}
+        self._localization_offer_generation = 0
+        if self._localization_config.enabled:
+            logger.warning(
+                "P-to-D localization observer enabled: run=%s arm=%s "
+                "mode=%s. Clean results are instrumented-only evidence.",
+                self._localization_config.run_id,
+                self._localization_config.transport_arm,
+                self._localization_config.mode.value,
+            )
 
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
@@ -287,6 +311,9 @@ class NixlBaseConnectorScheduler:
                     self._stop_event,
                     self.side_channel_host,
                     self.side_channel_port,
+                    self._localization_config,
+                    self._localization_manifests,
+                    self._localization_manifest_lock,
                 ),
                 daemon=True,
                 name="nixl_handshake_listener",
@@ -301,6 +328,11 @@ class NixlBaseConnectorScheduler:
         stop_event: threading.Event,
         host: str,
         port: int,
+        localization_config: NixlLocalizationConfig,
+        localization_manifests: dict[
+            tuple[ReqId, int], dict[int, NixlSourceManifest]
+        ],
+        localization_manifest_lock: threading.RLock,
     ):
         """Background thread for getting new NIXL handshakes."""
         # NOTE(rob): this is a simple implementation. We will move
@@ -319,15 +351,79 @@ class NixlBaseConnectorScheduler:
                     if stop_event.is_set():
                         break
                     continue
-                # Decode the message which contains (GET_META_MSG, rank)
-                msg, target_tp_rank = msgspec.msgpack.decode(msg)
-                logger.debug(
-                    "Received message for tp rank %s",
-                    target_tp_rank,
+                try:
+                    request = msgspec.msgpack.decode(msg)
+                except msgspec.DecodeError:
+                    rejected = resolve_source_manifest_request(
+                        [],
+                        localization_config,
+                        localization_manifests,
+                        set(encoded_data),
+                    )
+                    sock.send_multipart(
+                        (identity, b"", msgspec.msgpack.encode(rejected))
+                    )
+                    continue
+                if (
+                    isinstance(request, (list, tuple))
+                    and len(request) > 0
+                    and request[0] == GET_META_MSG
+                ):
+                    if (
+                        len(request) != 2
+                        or type(request[1]) is not int
+                        or request[1] not in encoded_data
+                    ):
+                        rejected = resolve_source_manifest_request(
+                            [],
+                            localization_config,
+                            localization_manifests,
+                            set(encoded_data),
+                        )
+                        sock.send_multipart(
+                            (identity, b"", msgspec.msgpack.encode(rejected))
+                        )
+                        continue
+                    target_tp_rank = request[1]
+                    logger.debug(
+                        "Received handshake message for tp rank %s",
+                        target_tp_rank,
+                    )
+                    response = encoded_data[target_tp_rank]
+                    sock.send_multipart((identity, b"", response))
+                    continue
+
+                if (
+                    isinstance(request, (list, tuple))
+                    and len(request) > 0
+                    and request[0] == GET_SOURCE_MANIFEST_MSG
+                ):
+                    with localization_manifest_lock:
+                        manifest_snapshot = {
+                            key: dict(rank_manifests)
+                            for key, rank_manifests in (
+                                localization_manifests.items()
+                            )
+                        }
+                    manifest_response = resolve_source_manifest_request(
+                        request,
+                        localization_config,
+                        manifest_snapshot,
+                        set(encoded_data),
+                    )
+                    sock.send_multipart(
+                        (identity, b"", msgspec.msgpack.encode(manifest_response))
+                    )
+                    continue
+
+                logger.error("Connection listener got invalid message %s", request)
+                rejected = resolve_source_manifest_request(
+                    [],
+                    localization_config,
+                    localization_manifests,
+                    set(encoded_data),
                 )
-                if msg != GET_META_MSG:
-                    logger.warning("Connection listener got unexpected message %s", msg)
-                sock.send_multipart((identity, b"", encoded_data[target_tp_rank]))
+                sock.send_multipart((identity, b"", msgspec.msgpack.encode(rejected)))
 
     def _mamba_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. Returns N-1 for Mamba models since the decoder
@@ -416,6 +512,7 @@ class NixlBaseConnectorScheduler:
             self._build_save_meta(meta, scheduler_output)
 
         meta.reqs_to_send = self._reqs_need_send
+        meta.source_integrity_rosters = self._source_integrity_rosters
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
         meta.audit_finished = self._audit_finished_reqs
@@ -433,13 +530,38 @@ class NixlBaseConnectorScheduler:
         self._reqs_in_batch = set()
         self._reqs_not_processed = set()
         self._reqs_need_send = {}
+        self._source_integrity_rosters = {}
 
         return meta
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
         """Stop heartbeating for requests whose KV transfer completed."""
+        worker_meta = connector_output.kv_connector_worker_meta
+        if worker_meta is not None:
+            if not isinstance(worker_meta, NixlLocalizationWorkerMetadata):
+                raise LocalizationError(
+                    "NIXL received an unexpected connector worker metadata type"
+                )
+            with self._localization_manifest_lock:
+                for key, rank_manifests in worker_meta.manifests.items():
+                    target = self._localization_manifests.setdefault(key, {})
+                    overlap = set(target) & set(rank_manifests)
+                    if len(overlap) > 0:
+                        raise LocalizationError(
+                            f"duplicate scheduler source manifests for {key}: "
+                            f"{sorted(overlap)}"
+                        )
+                    target.update(rank_manifests)
+
         for req_id in connector_output.finished_recving or ():
             self._stop_heartbeat(req_id)
+        for req_id in connector_output.finished_sending or ():
+            with self._localization_manifest_lock:
+                expired_keys = [
+                    key for key in self._localization_manifests if key[0] == req_id
+                ]
+                for key in expired_keys:
+                    del self._localization_manifests[key]
 
     def has_pending_push_work(self) -> bool:
         return False

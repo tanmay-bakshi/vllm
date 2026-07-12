@@ -18,6 +18,11 @@ import numpy as np
 import torch
 import zmq
 
+from vllm.distributed.kv_transfer.integrity import (
+    IntegrityIdentity,
+    IntegrityPayloadKind,
+    IntegrityStage,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
@@ -57,6 +62,29 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
     MambaConvSplitInfo,
     derive_mamba_conv_split,
+)
+from vllm.distributed.kv_transfer.nixl_localization import (
+    IntegrityLeafKey,
+    LocalizationArtifactWriter,
+    LocalizationError,
+    LocalizationMode,
+    NixlCaptureRecord,
+    NixlEventRecord,
+    NixlIntegrityLeaf,
+    NixlLocalizationConfig,
+    NixlLocalizationWorkerMetadata,
+    NixlRegionDescriptor,
+    NixlSourceManifest,
+    NixlSourceManifestRecord,
+    NixlSourceRoster,
+    build_integrity_identity,
+    build_integrity_leaf,
+    compute_semantic_contract_digest,
+    leaf_source_key,
+    seal_source_manifest,
+    select_source_manifest,
+    validate_capture,
+    validate_source_manifest_structure,
 )
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.distributed.parallel_state import (
@@ -275,6 +303,16 @@ class NixlBaseConnectorWorker:
             )
         )
         self.kv_cache_config = kv_cache_config
+        self._layer_to_group_index = {
+            layer_name: group_index
+            for group_index, group in enumerate(kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+        }
+        layer_count = sum(
+            len(group.layer_names) for group in kv_cache_config.kv_cache_groups
+        )
+        if len(self._layer_to_group_index) != layer_count:
+            raise LocalizationError("KV cache layer belongs to multiple groups")
         self._layer_specs = {
             layer: group.kv_cache_spec
             for group in kv_cache_config.kv_cache_groups
@@ -343,6 +381,7 @@ class NixlBaseConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.world_size = get_tensor_model_parallel_world_size()
+        self._registration_generation = uuid.uuid4().hex
 
         self.num_blocks = kv_cache_config.num_blocks
         self.enable_permute_local_kv = False
@@ -397,8 +436,40 @@ class NixlBaseConnectorWorker:
         # engine_id -> rank -> (block_lens, num_blocks, device_id) from
         # the handshake metadata (needed to build raw range descriptors)
         self._remote_layout: dict[EngineId, dict[int, tuple]] = defaultdict(dict)
+        self._remote_regions: dict[
+            EngineId, dict[int, tuple[NixlRegionDescriptor, ...]]
+        ] = defaultdict(dict)
+        self._remote_registration_generations: dict[
+            EngineId, dict[int, str]
+        ] = defaultdict(dict)
         # region index -> registered cache tensor (scatter destinations)
         self._region_tensors: list[torch.Tensor] = []
+        self._region_descriptors: tuple[NixlRegionDescriptor, ...] = ()
+        self._localization_config = NixlLocalizationConfig.from_environment()
+        self._localization_writer = (
+            LocalizationArtifactWriter(
+                self._localization_config,
+                self.engine_id,
+                self.tp_rank,
+            )
+            if self._localization_config.enabled
+            else None
+        )
+        self._localization_source_rosters: dict[ReqId, NixlSourceRoster] = {}
+        self._localization_source_pre: dict[
+            tuple[ReqId, int], NixlSourceManifest
+        ] = {}
+        self._localization_pending_manifests: dict[
+            tuple[ReqId, int], NixlSourceManifest
+        ] = {}
+        self._localization_expected_by_request: dict[
+            ReqId, dict[int, NixlSourceManifest]
+        ] = {}
+        self._localization_manifest_deadlines: dict[ReqId, float] = {}
+        self._localization_waiting: dict[ReqId, ReqMeta] = {}
+        self._localization_pre_read_plans: dict[ReqId, dict[str, Any]] = {}
+        self._localization_zero_recorded: set[ReqId] = set()
+        self._localization_terminal_recorded: set[ReqId] = set()
 
         # cpu kv buffer for xfer
         # used when device memory can not be registered under nixl
@@ -1002,6 +1073,31 @@ class NixlBaseConnectorWorker:
         caches_data = [(base_addr, total_size, self.device_id, "")]
 
         self.block_len_per_layer = [block_stride]
+        self._region_descriptors = (
+            NixlRegionDescriptor(
+                semantic_name="packed_cross_layer_storage",
+                group_indices=tuple(
+                    range(len(self.kv_cache_config.kv_cache_groups))
+                ),
+                group_semantic_names=tuple(
+                    (
+                        group_index,
+                        f"packed_cross_layer_storage:group_{group_index}",
+                    )
+                    for group_index in range(
+                        len(self.kv_cache_config.kv_cache_groups)
+                    )
+                ),
+                base_address=base_addr,
+                registered_bytes=total_size,
+                row_bytes=block_stride,
+                shape=(self.num_blocks, block_stride),
+                strides=(block_stride, 1),
+                dtype="uint8",
+                element_size_bytes=1,
+                layout="packed",
+            ),
+        )
         self.num_regions = 1
         self.num_descs = self.num_blocks
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = [base_addr]
@@ -1032,6 +1128,8 @@ class NixlBaseConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            registration_generation=self._registration_generation,
+            regions=self._region_descriptors,
         )
         assert self.compat_hash is not None
         encoder = msgspec.msgpack.Encoder()
@@ -1100,6 +1198,10 @@ class NixlBaseConnectorWorker:
         caches_data = []
         # With hybrid allocator, layers can share a kv cache tensor
         seen_base_addresses = []
+        region_semantic_names: dict[int, list[str]] = defaultdict(list)
+        region_group_indices: dict[int, set[int]] = defaultdict(set)
+        region_group_semantic_names: dict[int, dict[int, list[str]]] = {}
+        region_registered_bytes: dict[int, int] = {}
 
         # Note(tms): I modified this from the original region setup code.
         # K and V are now in different regions. Advantage is that we can
@@ -1157,8 +1259,24 @@ class NixlBaseConnectorWorker:
 
             # TODO (NickLucche) we could eventually unify how we handle FA/FI regions,
             # registering a single tensor for both K/V and splitting logically like FI.
-            for cache in cache_list:
+            for cache_index, cache in enumerate(cache_list):
                 base_addr = cache.data_ptr()
+                region_semantic_names[base_addr].append(
+                    f"{layer_name}:transfer_region_{cache_index}"
+                )
+                group_index = self._layer_to_group_index.get(layer_name)
+                if group_index is None:
+                    raise LocalizationError(
+                        f"registered KV layer {layer_name} has no cache-group owner"
+                    )
+                region_group_indices[base_addr].add(group_index)
+                names_by_group = region_group_semantic_names.setdefault(
+                    base_addr,
+                    {},
+                )
+                names_by_group.setdefault(group_index, []).append(
+                    f"{layer_name}:transfer_region_{cache_index}"
+                )
                 if base_addr in seen_base_addresses:
                     # NOTE (NickLucche) HMA employs memory pooling to share tensors
                     # across groups. This results in skipping all tensors but the ones
@@ -1170,6 +1288,7 @@ class NixlBaseConnectorWorker:
                     "Registering layer %s with cache shape: %s", layer_name, cache.shape
                 )
                 seen_base_addresses.append(base_addr)
+                region_registered_bytes[base_addr] = curr_tensor_size_bytes
                 self._region_tensors.append(cache)
                 # Only record non-Mamba page sizes.
                 if isinstance(layer_spec, MambaSpec):
@@ -1220,6 +1339,36 @@ class NixlBaseConnectorWorker:
             len(self.block_len_per_layer)
             == len(seen_base_addresses)
             == len(self._region_is_mla)
+        )
+        registered_layout = (
+            self.kv_cache_layout
+            if not self.use_host_buffer
+            else self.host_buffer_kv_cache_layout
+        )
+        self._region_descriptors = tuple(
+            NixlRegionDescriptor(
+                semantic_name="|".join(sorted(region_semantic_names[base_addr])),
+                group_indices=tuple(sorted(region_group_indices[base_addr])),
+                group_semantic_names=tuple(
+                    (group_index, "|".join(sorted(names)))
+                    for group_index, names in sorted(
+                        region_group_semantic_names[base_addr].items()
+                    )
+                ),
+                base_address=base_addr,
+                registered_bytes=region_registered_bytes[base_addr],
+                row_bytes=self.block_len_per_layer[index],
+                shape=tuple(int(dim) for dim in self._region_tensors[index].shape),
+                strides=tuple(
+                    int(stride) for stride in self._region_tensors[index].stride()
+                ),
+                dtype=str(self._region_tensors[index].dtype),
+                element_size_bytes=int(
+                    self._region_tensors[index].element_size()
+                ),
+                layout=registered_layout,
+            )
+            for index, base_addr in enumerate(seen_base_addresses)
         )
 
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
@@ -1289,6 +1438,8 @@ class NixlBaseConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            registration_generation=self._registration_generation,
+            regions=self._region_descriptors,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1631,6 +1782,10 @@ class NixlBaseConnectorWorker:
             list(nixl_agent_meta.block_lens),
             nixl_agent_meta.num_blocks,
             nixl_agent_meta.device_id,
+        )
+        self._remote_regions[engine_id][remote_tp_rank] = nixl_agent_meta.regions
+        self._remote_registration_generations[engine_id][remote_tp_rank] = (
+            nixl_agent_meta.registration_generation
         )
         self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
 
@@ -1999,6 +2154,877 @@ class NixlBaseConnectorWorker:
             )
 
     # ------------------------------------------------------------------
+    # Diagnostic P-to-D source snapshots
+    # ------------------------------------------------------------------
+
+    def _localization_capture_source_rosters(
+        self,
+        rosters: dict[ReqId, NixlSourceRoster],
+    ) -> None:
+        """Snapshot newly offered P allocations before D may post a read.
+
+        :param rosters: Exact post-clipping logical block rosters from the
+            scheduler.
+        """
+        if self._localization_config.enabled is False:
+            if len(rosters) > 0:
+                raise LocalizationError(
+                    "source rosters arrived while localization is disabled"
+                )
+            return
+        for req_id, logical_roster in rosters.items():
+            key = (req_id, logical_roster.offer_generation)
+            if key in self._localization_source_pre:
+                raise LocalizationError(f"duplicate source roster {key}")
+            physical_groups = self._logical_to_kernel_block_ids(
+                [list(group) for group in logical_roster.block_ids]
+            )
+            if len(logical_roster.group_token_capacities) != len(physical_groups):
+                raise LocalizationError(
+                    f"source roster token-capacity mismatch for {req_id}"
+                )
+            physical_capacities: list[int] = []
+            for group_index, capacity in enumerate(
+                logical_roster.group_token_capacities
+            ):
+                spec = self.kv_cache_config.kv_cache_groups[
+                    group_index
+                ].kv_cache_spec
+                factor = (
+                    1
+                    if isinstance(spec, MambaSpec)
+                    else self._physical_blocks_per_logical_kv_block
+                )
+                if capacity <= 0 or capacity % factor != 0:
+                    raise LocalizationError(
+                        f"source roster group {group_index} token capacity cannot "
+                        "be represented by physical kernel blocks"
+                    )
+                physical_capacities.append(capacity // factor)
+            physical_roster = NixlSourceRoster(
+                offer_generation=logical_roster.offer_generation,
+                iteration=logical_roster.iteration,
+                valid_token_extent=logical_roster.valid_token_extent,
+                group_token_capacities=tuple(physical_capacities),
+                block_ids=tuple(
+                    tuple(int(block_id) for block_id in group)
+                    for group in physical_groups
+                ),
+            )
+            manifest = self._localization_capture_source_manifest(
+                req_id,
+                physical_roster,
+                IntegrityStage.SOURCE_PRE,
+            )
+            self._localization_source_rosters[req_id] = physical_roster
+            self._localization_source_pre[key] = manifest
+            self._localization_pending_manifests[key] = manifest
+
+    def _localization_capture_source_manifest(
+        self,
+        req_id: ReqId,
+        roster: NixlSourceRoster,
+        stage: IntegrityStage,
+    ) -> NixlSourceManifest:
+        """Hash one P-rank allocation with bounded host-copy memory.
+
+        :param req_id: Producer request identifier.
+        :param roster: Exact physical block roster.
+        :param stage: Pre-offer or pre-release source checkpoint.
+        :returns: Compact per-region manifest.
+        """
+        if not self._coalesce_region_rows():
+            raise LocalizationError("source KV regions are not canonicalizable")
+        assert self._region_rows is not None
+        if len(self._region_rows) == 0:
+            raise LocalizationError("source snapshot has no registered KV regions")
+        if len(self._region_descriptors) != len(self._region_rows):
+            raise LocalizationError("source region descriptor cardinality mismatch")
+
+        start_ns = time.perf_counter_ns()
+        first_device = self._region_rows[0].device.type
+        if first_device != "cpu":
+            torch.accelerator.synchronize()
+
+        source_group_planes = tuple(
+            1 if flag else 2 for flag in self._sp_group_flags()
+        )
+        positions = [
+            (
+                group_index,
+                source_position,
+                int(block_id),
+                roster.group_token_capacities[group_index],
+            )
+            for group_index, group in enumerate(roster.block_ids)
+            for source_position, block_id in enumerate(group)
+        ]
+        leaves: list[NixlIntegrityLeaf] = []
+        copied_bytes = 0
+        hashed_bytes = 0
+        for region_index, rows in enumerate(self._region_rows):
+            row_bytes = int(rows.shape[1])
+            descriptor = self._region_descriptors[region_index]
+            region_positions = [
+                position
+                for position in positions
+                if position[0] in descriptor.group_indices
+            ]
+            if row_bytes <= 0:
+                raise LocalizationError("source region row length must be positive")
+            if descriptor.row_bytes != row_bytes:
+                raise LocalizationError("source semantic row length mismatch")
+            rows_per_chunk = max(
+                1,
+                self._localization_config.copy_chunk_bytes // row_bytes,
+            )
+            for chunk_start in range(0, len(region_positions), rows_per_chunk):
+                chunk_positions = region_positions[
+                    chunk_start : chunk_start + rows_per_chunk
+                ]
+                for _, _, block_id, _ in chunk_positions:
+                    expected_address = (
+                        descriptor.base_address + block_id * descriptor.row_bytes
+                    )
+                    actual_address = int(rows[block_id].data_ptr())
+                    if actual_address != expected_address:
+                        raise LocalizationError(
+                            "source semantic row does not match registered interval"
+                        )
+                    if (
+                        expected_address + descriptor.row_bytes
+                        > descriptor.base_address + descriptor.registered_bytes
+                    ):
+                        raise LocalizationError(
+                            "source row extends beyond registered memory"
+                        )
+                indices = torch.tensor(
+                    [position[2] for position in chunk_positions],
+                    device=rows.device,
+                    dtype=torch.long,
+                )
+                host_rows = rows.index_select(0, indices).cpu().contiguous()
+                copied_bytes += len(chunk_positions) * row_bytes
+                for row_index, (
+                    group_index,
+                    source_position,
+                    block_id,
+                    group_token_capacity,
+                ) in enumerate(chunk_positions):
+                    payload = memoryview(host_rows[row_index].numpy()).cast("B")
+                    semantic_contract_digest = compute_semantic_contract_digest(
+                        region=descriptor,
+                        group_index=group_index,
+                        group_token_capacity=group_token_capacity,
+                        source_plane_contract=source_group_planes[group_index],
+                    )
+                    wire_identity = build_integrity_identity(
+                        config=self._localization_config,
+                        producer_engine_id=self.engine_id,
+                        producer_request_id=req_id,
+                        registration_generation=self._registration_generation,
+                        semantic_contract_digest=semantic_contract_digest,
+                        offer_generation=roster.offer_generation,
+                        iteration=roster.iteration,
+                        source_rank=self.tp_rank,
+                        region_index=region_index,
+                        group_index=group_index,
+                        plane_index=-1,
+                        source_position=source_position,
+                        remote_block_id=block_id,
+                        valid_token_extent=roster.valid_token_extent,
+                        group_token_capacity=group_token_capacity,
+                        payload_kind=IntegrityPayloadKind.WIRE,
+                        byte_length=row_bytes,
+                    )
+                    leaves.append(
+                        build_integrity_leaf(
+                            identity=wire_identity,
+                            payload=payload,
+                            local_block_id=None,
+                            destination_half=None,
+                            rank_slot=None,
+                        )
+                    )
+                    hashed_bytes += row_bytes
+                    commit_bytes = row_bytes // 2
+                    for source_plane in (0, 1):
+                        commit_identity = build_integrity_identity(
+                            config=self._localization_config,
+                            producer_engine_id=self.engine_id,
+                            producer_request_id=req_id,
+                            registration_generation=self._registration_generation,
+                            semantic_contract_digest=semantic_contract_digest,
+                            offer_generation=roster.offer_generation,
+                            iteration=roster.iteration,
+                            source_rank=self.tp_rank,
+                            region_index=region_index,
+                            group_index=group_index,
+                            plane_index=source_plane,
+                            source_position=source_position,
+                            remote_block_id=block_id,
+                            valid_token_extent=roster.valid_token_extent,
+                            group_token_capacity=group_token_capacity,
+                            payload_kind=IntegrityPayloadKind.COMMIT,
+                            byte_length=commit_bytes,
+                        )
+                        plane_start = source_plane * commit_bytes
+                        leaves.append(
+                            build_integrity_leaf(
+                                identity=commit_identity,
+                                payload=payload[
+                                    plane_start : plane_start + commit_bytes
+                                ],
+                                local_block_id=None,
+                                destination_half=None,
+                                rank_slot=None,
+                            )
+                        )
+                        hashed_bytes += commit_bytes
+
+        duration_ns = time.perf_counter_ns() - start_ns
+        manifest = seal_source_manifest(NixlSourceManifest(
+            schema_version=IntegrityIdentity.SCHEMA_VERSION,
+            run_id=self._localization_config.run_id,
+            transport_arm=self._localization_config.transport_arm,
+            producer_engine_id=self.engine_id,
+            producer_request_id=req_id,
+            registration_generation=self._registration_generation,
+            offer_generation=roster.offer_generation,
+            iteration=roster.iteration,
+            source_rank=self.tp_rank,
+            region_lengths=tuple(int(rows.shape[1]) for rows in self._region_rows),
+            regions=self._region_descriptors,
+            source_group_planes=source_group_planes,
+            valid_token_extent=roster.valid_token_extent,
+            group_token_capacities=roster.group_token_capacities,
+            block_ids=roster.block_ids,
+            observer=True,
+            copied_bytes=copied_bytes,
+            hashed_bytes=hashed_bytes,
+            duration_ns=duration_ns,
+            manifest_digest=b"",
+            leaves=tuple(leaves),
+        ))
+        manifest_errors = validate_source_manifest_structure(manifest)
+        if len(manifest_errors) > 0:
+            raise LocalizationError(
+                f"invalid source manifest for {(req_id, self.tp_rank)}: "
+                f"{manifest_errors[:8]}"
+            )
+        self._localization_write_source_capture(manifest, stage)
+        logger.warning(
+            "[p2d-localize] stage=%s rid=%s rank=%d copied_mib=%.1f "
+            "hashed_mib=%.1f duration_s=%.3f manifest=%s observer=true",
+            stage.value,
+            req_id,
+            self.tp_rank,
+            copied_bytes / (1024 * 1024),
+            hashed_bytes / (1024 * 1024),
+            duration_ns / 1_000_000_000,
+            manifest.manifest_digest.hex(),
+        )
+        return manifest
+
+    def _localization_write_source_capture(
+        self,
+        manifest: NixlSourceManifest,
+        stage: IntegrityStage,
+    ) -> None:
+        """Write one complete source manifest as a first-class artifact.
+
+        :param manifest: Source manifest to preserve.
+        :param stage: Pre-offer or pre-release source checkpoint.
+        """
+        if self._localization_writer is None:
+            raise LocalizationError("enabled localization has no artifact writer")
+        self._localization_writer.write(
+            NixlSourceManifestRecord(
+                record_type=NixlSourceManifestRecord.RECORD_TYPE,
+                stage=stage,
+                manifest=manifest,
+            )
+        )
+
+    def _localization_capture_source_post(self, req_id: ReqId) -> None:
+        """Bookend a source allocation before its final release.
+
+        :param req_id: Producer request whose pages are still pinned.
+        """
+        if self._localization_config.enabled is False:
+            return
+        roster = self._localization_source_rosters.get(req_id)
+        if roster is None:
+            return
+        key = (req_id, roster.offer_generation)
+        pre_manifest = self._localization_source_pre.get(key)
+        if pre_manifest is None:
+            raise LocalizationError(f"source release has no PRE manifest for {key}")
+        post_manifest = self._localization_capture_source_manifest(
+            req_id,
+            roster,
+            IntegrityStage.SOURCE_POST,
+        )
+        errors = validate_capture(pre_manifest, post_manifest.leaves, None)
+        if len(errors) > 0:
+            raise LocalizationError(
+                f"source mutated while pinned for {key}: {errors[:8]}"
+            )
+        del self._localization_source_rosters[req_id]
+        del self._localization_source_pre[key]
+
+    def build_localization_worker_meta(
+        self,
+    ) -> NixlLocalizationWorkerMetadata | None:
+        """Drain newly prepared source manifests for scheduler publication.
+
+        :returns: Per-rank manifests, or ``None`` when nothing became ready.
+        """
+        if len(self._localization_pending_manifests) == 0:
+            return None
+        manifests = {
+            key: {manifest.source_rank: manifest}
+            for key, manifest in self._localization_pending_manifests.items()
+        }
+        self._localization_pending_manifests = {}
+        return NixlLocalizationWorkerMetadata(manifests=manifests)
+
+    def _localization_capture_staging(
+        self,
+        req_id: ReqId,
+        plan: dict[str, Any],
+        stage: IntegrityStage,
+        barrier: str,
+    ) -> None:
+        """Capture staged source rows before scatter with bounded host copies.
+
+        :param req_id: Decoder child request identifier.
+        :param plan: Sealed coalesced transfer and placement plan.
+        :param stage: Raw or fenced staging checkpoint.
+        :param barrier: Exact observer ordering applied before the capture.
+        """
+        if self._localization_config.enabled is False:
+            return
+        if self._staging_buf is None:
+            raise LocalizationError("staging capture has no staging allocation")
+        manifests = self._localization_expected_by_request.get(req_id)
+        if manifests is None:
+            raise LocalizationError(f"staging capture lacks manifests for {req_id}")
+        positions = plan["transfer_order"]
+        n_pos = int(plan["n_pos"])
+        n_ranks = int(plan["n_ranks"])
+        for rank_index, source_rank in enumerate(plan["source_ranks"]):
+            start_ns = time.perf_counter_ns()
+            manifest = manifests[int(source_rank)]
+            rank_slot = int(plan["slots"][rank_index])
+            leaves: list[NixlIntegrityLeaf] = []
+            mapping: dict[IntegrityLeafKey, tuple[int, int, int]] = {}
+            copied_bytes = 0
+            hashed_bytes = 0
+            for region_index, row_bytes_raw in enumerate(plan["blens"]):
+                row_bytes = int(row_bytes_raw)
+                region_start = int(plan["off"]) + int(
+                    plan["region_off"][region_index]
+                )
+                region_size = n_ranks * n_pos * row_bytes
+                region = self._staging_buf[
+                    region_start : region_start + region_size
+                ].view(n_ranks, n_pos, row_bytes)[rank_index]
+                rows_per_chunk = max(
+                    1,
+                    self._localization_config.copy_chunk_bytes // row_bytes,
+                )
+                descriptor = manifest.regions[region_index]
+                owned_indices = [
+                    index
+                    for index, position in enumerate(positions)
+                    if int(position.group_index) in descriptor.group_indices
+                ]
+                for chunk_start in range(0, len(owned_indices), rows_per_chunk):
+                    selected = owned_indices[
+                        chunk_start : chunk_start + rows_per_chunk
+                    ]
+                    selected_tensor = torch.tensor(
+                        selected,
+                        device=region.device,
+                        dtype=torch.long,
+                    )
+                    host_rows = region.index_select(
+                        0,
+                        selected_tensor,
+                    ).cpu().contiguous()
+                    copied_bytes += len(selected) * row_bytes
+                    for row_index, position_index in enumerate(selected):
+                        position = positions[position_index]
+                        payload = memoryview(host_rows[row_index].numpy()).cast("B")
+                        semantic_contract_digest = (
+                            compute_semantic_contract_digest(
+                                region=manifest.regions[region_index],
+                                group_index=int(position.group_index),
+                                group_token_capacity=int(
+                                    position.group_token_capacity
+                                ),
+                                source_plane_contract=(
+                                    manifest.source_group_planes[
+                                        int(position.group_index)
+                                    ]
+                                ),
+                            )
+                        )
+                        wire_identity = build_integrity_identity(
+                            config=self._localization_config,
+                            producer_engine_id=manifest.producer_engine_id,
+                            producer_request_id=manifest.producer_request_id,
+                            registration_generation=(
+                                manifest.registration_generation
+                            ),
+                            semantic_contract_digest=semantic_contract_digest,
+                            offer_generation=manifest.offer_generation,
+                            iteration=manifest.iteration,
+                            source_rank=int(source_rank),
+                            region_index=region_index,
+                            group_index=int(position.group_index),
+                            plane_index=-1,
+                            source_position=int(position.source_position),
+                            remote_block_id=int(position.remote_block_id),
+                            valid_token_extent=int(position.valid_token_extent),
+                            group_token_capacity=int(
+                                position.group_token_capacity
+                            ),
+                            payload_kind=IntegrityPayloadKind.WIRE,
+                            byte_length=row_bytes,
+                        )
+                        wire_leaf = build_integrity_leaf(
+                            identity=wire_identity,
+                            payload=payload,
+                            local_block_id=int(position.local_block_id),
+                            destination_half=int(position.plane_index),
+                            rank_slot=rank_slot,
+                        )
+                        leaves.append(wire_leaf)
+                        mapping[leaf_source_key(wire_leaf)] = (
+                            int(position.local_block_id),
+                            rank_slot,
+                            int(position.plane_index),
+                        )
+                        hashed_bytes += row_bytes
+                        if int(position.plane_index) < 0:
+                            continue
+                        commit_bytes = row_bytes // 2
+                        commit_identity = build_integrity_identity(
+                            config=self._localization_config,
+                            producer_engine_id=manifest.producer_engine_id,
+                            producer_request_id=manifest.producer_request_id,
+                            registration_generation=(
+                                manifest.registration_generation
+                            ),
+                            semantic_contract_digest=semantic_contract_digest,
+                            offer_generation=manifest.offer_generation,
+                            iteration=manifest.iteration,
+                            source_rank=int(source_rank),
+                            region_index=region_index,
+                            group_index=int(position.group_index),
+                            plane_index=0,
+                            source_position=int(position.source_position),
+                            remote_block_id=int(position.remote_block_id),
+                            valid_token_extent=int(position.valid_token_extent),
+                            group_token_capacity=int(
+                                position.group_token_capacity
+                            ),
+                            payload_kind=IntegrityPayloadKind.COMMIT,
+                            byte_length=commit_bytes,
+                        )
+                        commit_leaf = build_integrity_leaf(
+                            identity=commit_identity,
+                            payload=payload[:commit_bytes],
+                            local_block_id=int(position.local_block_id),
+                            destination_half=int(position.plane_index),
+                            rank_slot=rank_slot,
+                        )
+                        leaves.append(commit_leaf)
+                        mapping[leaf_source_key(commit_leaf)] = (
+                            int(position.local_block_id),
+                            rank_slot,
+                            int(position.plane_index),
+                        )
+                        hashed_bytes += commit_bytes
+            self._localization_finish_capture(
+                req_id=req_id,
+                manifest=manifest,
+                stage=stage,
+                barrier=barrier,
+                leaves=tuple(leaves),
+                mapping=mapping,
+                copied_bytes=copied_bytes,
+                hashed_bytes=hashed_bytes,
+                duration_ns=time.perf_counter_ns() - start_ns,
+            )
+
+    def _localization_capture_destination(
+        self,
+        req_id: ReqId,
+        plan: dict[str, Any],
+        stage: IntegrityStage,
+        barrier: str,
+    ) -> None:
+        """Capture reconstructed source shards in destination cache rows.
+
+        :param req_id: Decoder child request identifier.
+        :param plan: Sealed coalesced transfer and placement plan.
+        :param stage: Post-scatter or pre-first-read checkpoint.
+        :param barrier: Exact observer ordering applied before the capture.
+        """
+        if self._localization_config.enabled is False:
+            return
+        if self._region_rows is None:
+            raise LocalizationError("destination capture has no canonical rows")
+        manifests = self._localization_expected_by_request.get(req_id)
+        if manifests is None:
+            raise LocalizationError(f"destination capture lacks manifests for {req_id}")
+        positions = plan["transfer_order"]
+        n_ranks = int(plan["n_ranks"])
+        for rank_index, source_rank in enumerate(plan["source_ranks"]):
+            start_ns = time.perf_counter_ns()
+            manifest = manifests[int(source_rank)]
+            rank_slot = int(plan["slots"][rank_index])
+            leaves: list[NixlIntegrityLeaf] = []
+            mapping: dict[IntegrityLeafKey, tuple[int, int, int]] = {}
+            copied_bytes = 0
+            hashed_bytes = 0
+            for region_index, flat in enumerate(self._region_rows):
+                row_bytes = int(plan["blens"][region_index])
+                chunk_bytes = row_bytes // 2
+                descriptor = self._region_descriptors[region_index]
+                dual_indices = [
+                    index
+                    for index, position in enumerate(positions)
+                    if int(position.group_index) in descriptor.group_indices
+                    and int(position.plane_index) < 0
+                ]
+                single_indices = [
+                    index
+                    for index, position in enumerate(positions)
+                    if int(position.group_index) in descriptor.group_indices
+                    and int(position.plane_index) >= 0
+                ]
+                destination = flat.view(flat.shape[0], 2, n_ranks, chunk_bytes)
+                rows_per_chunk = max(
+                    1,
+                    self._localization_config.copy_chunk_bytes // row_bytes,
+                )
+                for chunk_start in range(0, len(dual_indices), rows_per_chunk):
+                    selected = dual_indices[
+                        chunk_start : chunk_start + rows_per_chunk
+                    ]
+                    local_indices = torch.tensor(
+                        [int(positions[index].local_block_id) for index in selected],
+                        device=flat.device,
+                        dtype=torch.long,
+                    )
+                    host_rows = (
+                        destination[local_indices, :, rank_slot, :]
+                        .contiguous()
+                        .view(len(selected), row_bytes)
+                        .cpu()
+                    )
+                    copied_bytes += len(selected) * row_bytes
+                    for row_index, position_index in enumerate(selected):
+                        position = positions[position_index]
+                        payload = memoryview(host_rows[row_index].numpy()).cast("B")
+                        semantic_contract_digest = (
+                            compute_semantic_contract_digest(
+                                region=manifest.regions[region_index],
+                                group_index=int(position.group_index),
+                                group_token_capacity=int(
+                                    position.group_token_capacity
+                                ),
+                                source_plane_contract=(
+                                    manifest.source_group_planes[
+                                        int(position.group_index)
+                                    ]
+                                ),
+                            )
+                        )
+                        identity = build_integrity_identity(
+                            config=self._localization_config,
+                            producer_engine_id=manifest.producer_engine_id,
+                            producer_request_id=manifest.producer_request_id,
+                            registration_generation=(
+                                manifest.registration_generation
+                            ),
+                            semantic_contract_digest=semantic_contract_digest,
+                            offer_generation=manifest.offer_generation,
+                            iteration=manifest.iteration,
+                            source_rank=int(source_rank),
+                            region_index=region_index,
+                            group_index=int(position.group_index),
+                            plane_index=-1,
+                            source_position=int(position.source_position),
+                            remote_block_id=int(position.remote_block_id),
+                            valid_token_extent=int(position.valid_token_extent),
+                            group_token_capacity=int(
+                                position.group_token_capacity
+                            ),
+                            payload_kind=IntegrityPayloadKind.WIRE,
+                            byte_length=row_bytes,
+                        )
+                        leaf = build_integrity_leaf(
+                            identity=identity,
+                            payload=payload,
+                            local_block_id=int(position.local_block_id),
+                            destination_half=-1,
+                            rank_slot=rank_slot,
+                        )
+                        leaves.append(leaf)
+                        mapping[leaf_source_key(leaf)] = (
+                            int(position.local_block_id),
+                            rank_slot,
+                            -1,
+                        )
+                        hashed_bytes += row_bytes
+
+                single_rows_per_chunk = max(
+                    1,
+                    self._localization_config.copy_chunk_bytes // chunk_bytes,
+                )
+                destination_single = flat.view(
+                    flat.shape[0], n_ranks, 2, chunk_bytes
+                )
+                for chunk_start in range(
+                    0,
+                    len(single_indices),
+                    single_rows_per_chunk,
+                ):
+                    selected = single_indices[
+                        chunk_start : chunk_start + single_rows_per_chunk
+                    ]
+                    local_indices = torch.tensor(
+                        [int(positions[index].local_block_id) for index in selected],
+                        device=flat.device,
+                        dtype=torch.long,
+                    )
+                    destination_halves = torch.tensor(
+                        [int(positions[index].plane_index) for index in selected],
+                        device=flat.device,
+                        dtype=torch.long,
+                    )
+                    host_rows = destination_single[
+                        local_indices,
+                        rank_slot,
+                        destination_halves,
+                        :,
+                    ].contiguous().cpu()
+                    copied_bytes += len(selected) * chunk_bytes
+                    for row_index, position_index in enumerate(selected):
+                        position = positions[position_index]
+                        payload = memoryview(host_rows[row_index].numpy()).cast("B")
+                        semantic_contract_digest = (
+                            compute_semantic_contract_digest(
+                                region=manifest.regions[region_index],
+                                group_index=int(position.group_index),
+                                group_token_capacity=int(
+                                    position.group_token_capacity
+                                ),
+                                source_plane_contract=(
+                                    manifest.source_group_planes[
+                                        int(position.group_index)
+                                    ]
+                                ),
+                            )
+                        )
+                        identity = build_integrity_identity(
+                            config=self._localization_config,
+                            producer_engine_id=manifest.producer_engine_id,
+                            producer_request_id=manifest.producer_request_id,
+                            registration_generation=(
+                                manifest.registration_generation
+                            ),
+                            semantic_contract_digest=semantic_contract_digest,
+                            offer_generation=manifest.offer_generation,
+                            iteration=manifest.iteration,
+                            source_rank=int(source_rank),
+                            region_index=region_index,
+                            group_index=int(position.group_index),
+                            plane_index=0,
+                            source_position=int(position.source_position),
+                            remote_block_id=int(position.remote_block_id),
+                            valid_token_extent=int(position.valid_token_extent),
+                            group_token_capacity=int(
+                                position.group_token_capacity
+                            ),
+                            payload_kind=IntegrityPayloadKind.COMMIT,
+                            byte_length=chunk_bytes,
+                        )
+                        leaf = build_integrity_leaf(
+                            identity=identity,
+                            payload=payload,
+                            local_block_id=int(position.local_block_id),
+                            destination_half=int(position.plane_index),
+                            rank_slot=rank_slot,
+                        )
+                        leaves.append(leaf)
+                        mapping[leaf_source_key(leaf)] = (
+                            int(position.local_block_id),
+                            rank_slot,
+                            int(position.plane_index),
+                        )
+                        hashed_bytes += chunk_bytes
+            self._localization_finish_capture(
+                req_id=req_id,
+                manifest=manifest,
+                stage=stage,
+                barrier=barrier,
+                leaves=tuple(leaves),
+                mapping=mapping,
+                copied_bytes=copied_bytes,
+                hashed_bytes=hashed_bytes,
+                duration_ns=time.perf_counter_ns() - start_ns,
+            )
+
+    def _localization_finish_capture(
+        self,
+        *,
+        req_id: ReqId,
+        manifest: NixlSourceManifest,
+        stage: IntegrityStage,
+        barrier: str,
+        leaves: tuple[NixlIntegrityLeaf, ...],
+        mapping: dict[IntegrityLeafKey, tuple[int, int, int]],
+        copied_bytes: int,
+        hashed_bytes: int,
+        duration_ns: int,
+    ) -> None:
+        """Persist and validate one complete rank/stage observation.
+
+        :raises LocalizationError: If content, cardinality, or placement differs.
+        """
+        if self._localization_writer is None:
+            raise LocalizationError("enabled localization has no artifact writer")
+        selected_manifest = select_source_manifest(manifest, set(mapping))
+        errors = validate_capture(selected_manifest, leaves, mapping)
+        self._localization_writer.write(
+            NixlCaptureRecord(
+                record_type=NixlCaptureRecord.RECORD_TYPE,
+                schema_version=manifest.schema_version,
+                stage=stage,
+                run_id=manifest.run_id,
+                transport_arm=manifest.transport_arm,
+                producer_engine_id=manifest.producer_engine_id,
+                producer_request_id=manifest.producer_request_id,
+                registration_generation=manifest.registration_generation,
+                source_manifest_digest=manifest.manifest_digest,
+                offer_generation=manifest.offer_generation,
+                iteration=manifest.iteration,
+                child_request_id=req_id,
+                source_rank=manifest.source_rank,
+                observer_engine_id=self.engine_id,
+                observer_rank=self.tp_rank,
+                observer=True,
+                copied_bytes=copied_bytes,
+                hashed_bytes=hashed_bytes,
+                duration_ns=duration_ns,
+                barrier=barrier,
+                leaves=leaves,
+            )
+        )
+        logger.warning(
+            "[p2d-localize] stage=%s child=%s producer=%s source_rank=%d "
+            "copied_mib=%.1f hashed_mib=%.1f duration_s=%.3f "
+            "manifest=%s observer=true",
+            stage.value,
+            req_id,
+            manifest.producer_request_id,
+            manifest.source_rank,
+            copied_bytes / (1024 * 1024),
+            hashed_bytes / (1024 * 1024),
+            duration_ns / 1_000_000_000,
+            manifest.manifest_digest.hex(),
+        )
+        if len(errors) > 0:
+            raise LocalizationError(
+                f"{stage.value} localization mismatch for {req_id}: {errors[:8]}"
+            )
+
+    def _localization_capture_pre_read(self, req_ids: set[ReqId]) -> None:
+        """Capture destination rows before any new transfer or model forward.
+
+        :param req_ids: Requests admitted to the current model batch.
+        """
+        if self._localization_config.enabled is False:
+            return
+        for req_id in sorted(req_ids):
+            plan = self._localization_pre_read_plans.pop(req_id, None)
+            if plan is None:
+                continue
+            self._localization_capture_destination(
+                req_id,
+                plan,
+                IntegrityStage.PRE_READ,
+                "first_operation_in_start_load_kv_before_new_dma_or_forward",
+            )
+            plan_remote_request = str(plan["producer_request_id"])
+            is_trace = (
+                self._localization_config.mode is LocalizationMode.TRACE
+            )
+            self._localization_record_event(
+                code=("VERIFIED_PRE_READ" if is_trace else "SHAM_PRE_READ_COMPLETE"),
+                evidentiary=is_trace,
+                child_request_id=req_id,
+                producer_engine_id=str(plan["producer_engine_id"]),
+                producer_request_id=plan_remote_request,
+                detail="all required ranks and stages matched before first read",
+            )
+            self._localization_expected_by_request.pop(req_id, None)
+
+    def _localization_record_event(
+        self,
+        *,
+        code: str,
+        evidentiary: bool,
+        child_request_id: ReqId | None,
+        producer_engine_id: str | None,
+        producer_request_id: str | None,
+        detail: str,
+    ) -> None:
+        """Write one explicit child terminal or exclusion outcome.
+
+        :param code: Stable outcome code.
+        :param evidentiary: Whether the child supports byte-integrity claims.
+        :param child_request_id: Decoder child, if the event is child-scoped.
+        :param producer_engine_id: Source engine lineage.
+        :param producer_request_id: Source request lineage.
+        :param detail: Human-readable outcome detail.
+        """
+        if self._localization_config.enabled is False:
+            return
+        if (
+            child_request_id is not None
+            and child_request_id in self._localization_terminal_recorded
+        ):
+            return
+        if self._localization_writer is None:
+            raise LocalizationError("enabled localization has no artifact writer")
+        self._localization_writer.write(
+            NixlEventRecord(
+                record_type=NixlEventRecord.RECORD_TYPE,
+                schema_version=IntegrityIdentity.SCHEMA_VERSION,
+                run_id=self._localization_config.run_id,
+                transport_arm=self._localization_config.transport_arm,
+                code=code,
+                evidentiary=evidentiary,
+                producer_engine_id=producer_engine_id,
+                producer_request_id=producer_request_id,
+                child_request_id=child_request_id,
+                observer_engine_id=self.engine_id,
+                observer_rank=self.tp_rank,
+                detail=detail,
+                created_ns=time.time_ns(),
+            )
+        )
+        if child_request_id is not None:
+            self._localization_terminal_recorded.add(child_request_id)
+
+    # ------------------------------------------------------------------
     # Coalesced pull: staging buffer + completion scatter
     # ------------------------------------------------------------------
 
@@ -2105,9 +3131,25 @@ class NixlBaseConnectorWorker:
         plan = self._coalesce_plans.pop(req_id, None)
         if plan is None:
             return
+        scattered = False
         try:
             assert self._staging_buf is not None
             assert self._region_rows is not None
+            if self._localization_config.enabled:
+                self._localization_capture_staging(
+                    req_id,
+                    plan,
+                    IntegrityStage.STAGING_RAW,
+                    "nixl_done_without_added_device_wide_sync",
+                )
+                if self._staging_buf.device.type != "cpu":
+                    torch.accelerator.synchronize()
+                self._localization_capture_staging(
+                    req_id,
+                    plan,
+                    IntegrityStage.STAGING_FENCED_CONTROL,
+                    "device_synchronize_observer_control_not_gdr_flush",
+                )
             idx = torch.tensor(plan["lpos"], device=self._staging_buf.device,
                                dtype=torch.long)
             n_pos, n_ranks = plan["n_pos"], plan["n_ranks"]
@@ -2148,13 +3190,24 @@ class NixlBaseConnectorWorker:
                 self._audit_pending.append(
                     (req_id, plan["audit_rows"], plan["lpos"])
                 )
+            scattered = True
         finally:
             # The scatter kernels read staging asynchronously while UCX
             # writes for the NEXT user of this range are not
             # stream-ordered: the range must not be reused until the
             # copies have executed. (Future: event-deferred free list.)
-            torch.cuda.synchronize()
-            self._staging_release(plan["off"], plan["size"])
+            try:
+                torch.cuda.synchronize()
+                if scattered and self._localization_config.enabled:
+                    self._localization_capture_destination(
+                        req_id,
+                        plan,
+                        IntegrityStage.DESTINATION,
+                        "post_scatter_device_synchronize_before_publication",
+                    )
+                    self._localization_pre_read_plans[req_id] = plan
+            finally:
+                self._staging_release(plan["off"], plan["size"])
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         """
@@ -2300,16 +3353,19 @@ class NixlBaseConnectorWorker:
                             agent, notif_msg=expired_msg
                         )
                     except Exception:
-                        pass
-            import os as _os
+                        logger.exception(
+                            "Failed to send expiry notification for request %s",
+                            req_id,
+                        )
             grace = float(
-                _os.environ.get("VLLM_GEMMA4_KV_FREE_GRACE_S", "5")
+                os.environ.get("VLLM_GEMMA4_KV_FREE_GRACE_S", "5")
             )
             self._grace_frees[req_id] = now + grace
         # Drain grace-held frees whose window elapsed.
         for req_id in [
             r for r, t in self._grace_frees.items() if now >= t
         ]:
+            self._localization_capture_source_post(req_id)
             del self._grace_frees[req_id]
             done_sending.add(req_id)
 
@@ -2615,9 +3671,23 @@ class NixlBaseConnectorWorker:
             req_id: The request ID.
             handle: The transfer handle.
         """
+        meta = self._recving_metadata.get(req_id)
+        remote = meta.remote if meta is not None else None
+        self._localization_record_event(
+            code="TRANSFER_ABORTED",
+            evidentiary=False,
+            child_request_id=req_id,
+            producer_engine_id=(remote.engine_id if remote is not None else None),
+            producer_request_id=(remote.request_id if remote is not None else None),
+            detail="transfer failed before verified publication",
+        )
+        self._localization_waiting.pop(req_id, None)
+        self._localization_manifest_deadlines.pop(req_id, None)
+        self._localization_expected_by_request.pop(req_id, None)
+        self._localization_pre_read_plans.pop(req_id, None)
         # Use .get() here as the metadata cleanup is handled by get_finished()
         # TODO (NickLucche) handle failed transfer for HMA.
-        if (meta := self._recving_metadata.get(req_id)) and not self._is_hma_required:
+        if meta is not None and not self._is_hma_required:
             self._invalid_block_ids.put(set(meta.local_block_ids[0]))
         self._failed_recv_reqs.put(req_id)
         # coalesced pull: free the staging range, skip the scatter
@@ -2941,6 +4011,9 @@ class NixlBaseConnectorWorker:
         del self.kv_caches_base_addr[engine_id]
         del self.dst_num_blocks[engine_id]
         del self.tp_mappings[engine_id]
+        self._remote_layout.pop(engine_id, None)
+        self._remote_regions.pop(engine_id, None)
+        self._remote_registration_generations.pop(engine_id, None)
         if self.transfer_topo is not None:
             self.transfer_topo.unregister_remote_engine(engine_id)
 
@@ -2960,6 +4033,9 @@ class NixlBaseConnectorWorker:
         if not hasattr(self, "_handshake_initiation_executor"):
             # error happens during init, no need to shutdown
             return
+        if self._localization_writer is not None:
+            self._localization_writer.close()
+            self._localization_writer = None
         self._handshake_initiation_executor.shutdown(wait=False)
         for handles in self._recving_transfers.values():
             for handle in handles:

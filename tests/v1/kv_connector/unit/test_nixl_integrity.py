@@ -23,13 +23,18 @@ def _identity(**overrides: object) -> IntegrityIdentity:
         "transport_arm": "tcp-shm-cuda-copy",
         "producer_engine_id": "prefill",
         "producer_request_id": "producer-rid",
+        "registration_generation": "registration-9",
+        "semantic_contract_digest": bytes(range(32)),
         "offer_generation": 3,
         "iteration": 7,
         "source_rank": 2,
         "region_index": 9,
         "group_index": 11,
+        "plane_index": -1,
         "source_position": 41,
         "remote_block_id": 32768,
+        "valid_token_extent": 1015,
+        "group_token_capacity": 64,
         "payload_kind": IntegrityPayloadKind.WIRE,
         "byte_length": 8,
     }
@@ -81,13 +86,18 @@ def test_identity_domain_changes_digest() -> None:
         ("transport_arm", "cuda-ipc"),
         ("producer_engine_id", "prefill-other"),
         ("producer_request_id", "rid-other"),
+        ("registration_generation", "registration-10"),
+        ("semantic_contract_digest", b"x" * 32),
         ("offer_generation", 4),
         ("iteration", 8),
         ("source_rank", 3),
         ("region_index", 10),
         ("group_index", 12),
+        ("plane_index", 0),
         ("source_position", 42),
         ("remote_block_id", 32769),
+        ("valid_token_extent", 1016),
+        ("group_token_capacity", 32),
         ("payload_kind", IntegrityPayloadKind.COMMIT),
     ):
         changed = compute_integrity_digest(_identity(**{field: value}), payload)
@@ -100,7 +110,7 @@ def test_stage_and_consumer_lineage_do_not_change_comparison_identity() -> None:
     identity = _identity()
     digest = compute_integrity_digest(identity, bytes(range(8)))
     source = IntegrityObservation(
-        stage=IntegrityStage.SOURCE,
+        stage=IntegrityStage.SOURCE_PRE,
         identity=identity,
         digest=digest,
         child_request_id=None,
@@ -109,7 +119,7 @@ def test_stage_and_consumer_lineage_do_not_change_comparison_identity() -> None:
         local_block_id=None,
     )
     staging = IntegrityObservation(
-        stage=IntegrityStage.STAGING,
+        stage=IntegrityStage.STAGING_RAW,
         identity=identity,
         digest=digest,
         child_request_id="decode-child",
@@ -126,9 +136,11 @@ def test_canonical_identity_is_stable() -> None:
     """Canonical serialization has a fixed compatibility fingerprint."""
     assert canonical_identity_bytes(_identity()).hex() == (
         "00010000000772756e2d333762000000117463702d73686d2d637564612d636f7079"
-        "0000000770726566696c6c0000000c70726f64756365722d72696400000000000000"
-        "0300000000000000070000000000000002000000090000000b0000002900000004"
-        "0000000000008000000000000000000877697265"
+        "0000000770726566696c6c0000000c70726f64756365722d7269640000000e726567"
+        "697374726174696f6e2d39000102030405060708090a0b0c0d0e0f10111213141516"
+        "1718191a1b1c1d1e1f00000000000000030000000000000007000000000000000200"
+        "0000090000000bffffffff0000002900000004000000000000800000000000000003"
+        "f70000000000000040000000000000000877697265"
     )
 
 
@@ -140,13 +152,22 @@ def test_payload_length_is_enforced() -> None:
 
 
 @pytest.mark.cpu_test
+def test_boolean_is_not_an_integer_identity_value() -> None:
+    """Boolean subclasses of int cannot alias a canonical numeric identity."""
+    with pytest.raises(TypeError, match="exact int"):
+        _identity(source_rank=True)
+    with pytest.raises(TypeError, match="plane_index"):
+        _identity(plane_index=False)
+
+
+@pytest.mark.cpu_test
 def test_observation_requires_stage_appropriate_lineage() -> None:
     """Source and consumer observations cannot masquerade as each other."""
     identity = _identity()
     digest = compute_integrity_digest(identity, bytes(range(8)))
     with pytest.raises(ValueError, match="cannot carry consumer-local"):
         IntegrityObservation(
-            stage=IntegrityStage.SOURCE,
+            stage=IntegrityStage.SOURCE_PRE,
             identity=identity,
             digest=digest,
             child_request_id="child",

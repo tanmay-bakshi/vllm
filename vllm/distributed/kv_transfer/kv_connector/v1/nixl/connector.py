@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorWorkerMetadata,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -250,6 +251,12 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_worker is None:
             return None
         return self.connector_worker.get_kv_connector_stats()
+
+    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        """Return source manifests prepared by this tensor-parallel worker."""
+        if self.connector_worker is None:
+            return None
+        return self.connector_worker.build_localization_worker_meta()
 
     @classmethod
     def build_kv_connector_stats(

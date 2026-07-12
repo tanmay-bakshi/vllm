@@ -11,6 +11,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.nixl_localization import (
+    NixlRegionDescriptor,
+    NixlSourceRoster,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -39,8 +43,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   2: Add remote_request_id to kv_transfer_params
 #   3: Add physical_blocks_per_logical_kv_block to NixlAgentMetadata
 #   4: Add KV block lease renewal through heartbeats
+#   5: Add gated P-to-D source integrity manifests
 #
-NIXL_CONNECTOR_VERSION: int = 4
+NIXL_CONNECTOR_VERSION: int = 5
 
 
 @dataclass
@@ -56,6 +61,8 @@ class NixlAgentMetadata:
     ssm_sizes: tuple[int, int]
     attn_backend_name: str
     physical_blocks_per_logical_kv_block: int
+    registration_generation: str = ""
+    regions: tuple[NixlRegionDescriptor, ...] = ()
 
 
 @dataclass
@@ -160,6 +167,10 @@ class RemoteMeta:
     # request (n>1 children all pull the same rid). The producer frees
     # its blocks only after this many completion notifications per rank.
     expected_consumers: int = 1
+    p2d_run_id: str | None = None
+    p2d_transport_arm: str | None = None
+    p2d_offer_generation: int | None = None
+    p2d_iteration: int | None = None
 
 
 @dataclass
@@ -178,6 +189,9 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
         self.reqs_to_send: dict[ReqId, float] = {}
+        # P-side physical block rosters that must be snapshotted before a D
+        # localization observer is allowed to post one-sided reads.
+        self.source_integrity_rosters: dict[ReqId, NixlSourceRoster] = {}
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
         # Heartbeat data grouped by remote engine, sent by D worker to P.
@@ -232,5 +246,11 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             expected_consumers=int(
                 kv_transfer_params.get("expected_consumers") or 1
             ),
+            p2d_run_id=kv_transfer_params.get("p2d_run_id"),
+            p2d_transport_arm=kv_transfer_params.get("p2d_transport_arm"),
+            p2d_offer_generation=kv_transfer_params.get(
+                "p2d_offer_generation"
+            ),
+            p2d_iteration=kv_transfer_params.get("p2d_iteration"),
         )
         self.reqs_to_recv[request_id] = req
