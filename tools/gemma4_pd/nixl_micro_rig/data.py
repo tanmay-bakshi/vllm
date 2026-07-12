@@ -1,15 +1,16 @@
 """Deterministic payloads and integrity observations for GPU runtime roles."""
 
-import hashlib
 import json
 from dataclasses import asdict, dataclass
-from functools import cache
 from pathlib import Path
 
 import torch
 
 from tools.gemma4_pd.nixl_micro_rig.config import RigConfig
 from tools.gemma4_pd.nixl_micro_rig.geometry import TransferPlan
+from tools.gemma4_pd.nixl_micro_rig.semantic_contract import (
+    compute_rig_semantic_contract_digest,
+)
 from vllm.distributed.kv_transfer.integrity import (
     IntegrityIdentity,
     IntegrityObservation,
@@ -43,68 +44,6 @@ class ObservationContext:
     iteration: int
     child_request_id: str
     consumer_engine_id: str
-
-
-@cache
-def compute_rig_semantic_contract_digest(
-    config: RigConfig,
-    group_index: int,
-    region_index: int,
-) -> bytes:
-    """Hash one exact synthetic group-to-region interpretation.
-
-    The production localization contract is built from runtime cache specs and
-    tensor descriptors. The model-free rig has no scheduler or model tensors,
-    so its corresponding authority is the checked-in, typed rig geometry. The
-    digest explicitly distinguishes semantically owned rows from transport-only
-    broadcast rows.
-
-    :param config: Complete typed rig configuration.
-    :param group_index: KV-cache group owning the transfer position.
-    :param region_index: Physical registration region carrying the row.
-    :returns: Thirty-two-byte BLAKE2b semantic contract digest.
-    """
-    group = config.groups[group_index]
-    region = config.regions[region_index]
-    source_shape = (config.source_block_count, 2, region.row_bytes // 2)
-    destination_shape = (
-        config.source_block_count,
-        2,
-        len(config.producer_devices),
-        region.row_bytes // 2,
-    )
-    contract = {
-        "schema_version": IntegrityIdentity.SCHEMA_VERSION,
-        "contract": "gemma4-nixl-micro-rig-synthetic-v1",
-        "group_index": group.index,
-        "group_name": group.name,
-        "group_token_capacity": group.token_capacity,
-        "owned_region_indices": group.owned_region_indices,
-        "region_index": region_index,
-        "region_name": region.name,
-        "row_bytes": region.row_bytes,
-        "semantically_owned": region_index in group.owned_region_indices,
-        "source_dtype": "uint8",
-        "source_layout": "block,plane,row-byte",
-        "source_shape": source_shape,
-        "source_strides": (region.row_bytes, region.row_bytes // 2, 1),
-        "source_plane_contract": 2,
-        "destination_dtype": "uint8",
-        "destination_layout": "block,plane,rank-slot,row-byte",
-        "destination_shape": destination_shape,
-        "destination_strides": (
-            region.row_bytes * len(config.producer_devices),
-            region.row_bytes * len(config.producer_devices) // 2,
-            region.row_bytes // 2,
-            1,
-        ),
-    }
-    payload = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.blake2b(
-        payload,
-        digest_size=32,
-        person=b"p2d-rig-sem-v1",
-    ).digest()
 
 
 def _mix32(values: torch.Tensor) -> torch.Tensor:
@@ -533,6 +472,7 @@ def source_observations(
     config: RigConfig,
     plan: TransferPlan,
     context: ObservationContext,
+    stage: IntegrityStage,
     source_rank: int,
     regions: tuple[torch.Tensor, ...],
 ) -> list[IntegrityObservation]:
@@ -541,10 +481,13 @@ def source_observations(
     :param config: Complete rig configuration.
     :param plan: Stable-sorted transfer plan.
     :param context: Iteration lineage.
+    :param stage: Explicit pre-transfer or post-transfer source checkpoint.
     :param source_rank: P rank that owns ``regions``.
     :param regions: Full registered P source tensors.
     :returns: Region-major, position-ordered source observations.
     """
+    if stage not in (IntegrityStage.SOURCE_PRE, IntegrityStage.SOURCE_POST):
+        raise ValueError("source observations require a source integrity stage")
     observations: list[IntegrityObservation] = []
     device = regions[0].device
     block_ids = torch.tensor(plan.block_ids, dtype=torch.long, device=device)
@@ -561,7 +504,7 @@ def source_observations(
                 _observation(
                     config=config,
                     context=context,
-                    stage=IntegrityStage.SOURCE_PRE,
+                    stage=stage,
                     plan=plan,
                     source_rank=source_rank,
                     region_index=region_index,
@@ -700,22 +643,38 @@ def compact_digests(
     ]
 
 
-def write_observations(path: Path, observations: list[IntegrityObservation]) -> None:
+def write_observations(
+    path: Path,
+    observations: list[IntegrityObservation],
+    *,
+    config_fingerprint: str,
+    input_bundle_fingerprint: str,
+    scenario: str,
+) -> None:
     """Persist full schema observations as append-only JSON Lines.
 
     :param path: Output artifact path.
     :param observations: Observations to persist.
+    :param config_fingerprint: SHA-256 identity of the untouched full config.
+    :param input_bundle_fingerprint: SHA-256 identity of every immutable input.
+    :param scenario: Selected scenario identity.
     """
     with path.open("a") as output:
         for observation in observations:
             record = asdict(observation)
             record["stage"] = observation.stage.value
             record["digest"] = observation.digest.hex()
+            record["config_fingerprint"] = config_fingerprint
+            record["input_bundle_fingerprint"] = input_bundle_fingerprint
+            record["scenario"] = scenario
             identity = record["identity"]
             if not isinstance(identity, dict):
                 raise AssertionError(
                     "dataclass identity did not serialize as an object"
                 )
+            identity["semantic_contract_digest"] = (
+                observation.identity.semantic_contract_digest.hex()
+            )
             identity["payload_kind"] = observation.identity.payload_kind.value
             record["evidence_status"] = observation.evidence_status.value
             output.write(json.dumps(record, sort_keys=True) + "\n")

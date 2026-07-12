@@ -18,13 +18,15 @@ class ProtocolError(RuntimeError):
 
 _HEADER = struct.Struct("!Q")
 _MAX_MESSAGE_BYTES = 64 * 1024 * 1024
-_PROTOCOL_VERSION = 1
+_PROTOCOL_VERSION = 2
 _ROLES = frozenset({"producer", "consumer"})
 _ENVELOPE_KEYS = {
     "protocol_version",
     "type",
     "run_id",
     "config_fingerprint",
+    "input_bundle_fingerprint",
+    "scenario",
     "transport_arm",
     "iteration",
     "sender_role",
@@ -32,6 +34,19 @@ _ENVELOPE_KEYS = {
     "sequence",
     "payload",
 }
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ProtocolError(f"control JSON duplicates key {key!r}")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ProtocolError(f"control JSON contains non-finite constant {value}")
 
 
 def _require_object(
@@ -560,14 +575,18 @@ def _validate_identity(
     *,
     run_id: object,
     config_fingerprint: object,
+    input_bundle_fingerprint: object,
+    scenario: object,
     transport_arm: object,
     role: object,
     rank: object,
-) -> tuple[str, str, str, str, int]:
+) -> tuple[str, str, str, str, str, str, int]:
     """Validate immutable endpoint lineage.
 
     :param run_id: Campaign UUID.
     :param config_fingerprint: SHA-256 configuration identity.
+    :param input_bundle_fingerprint: SHA-256 identity of every immutable input.
+    :param scenario: Selected scenario identity.
     :param transport_arm: Fresh-process transport arm.
     :param role: Producer or consumer role.
     :param rank: Role-local rank.
@@ -581,17 +600,32 @@ def _validate_identity(
         raise ProtocolError("run_id must be a UUID") from error
     if str(parsed_run_id) != run_id_text:
         raise ProtocolError("run_id must use canonical lowercase UUID text")
-    fingerprint = _require_string(config_fingerprint, label="config_fingerprint")
-    if len(fingerprint) != 64 or any(
-        character not in "0123456789abcdef" for character in fingerprint
+    fingerprints: list[str] = []
+    for label, raw_value in (
+        ("config_fingerprint", config_fingerprint),
+        ("input_bundle_fingerprint", input_bundle_fingerprint),
     ):
-        raise ProtocolError("config_fingerprint must be lowercase SHA-256")
+        fingerprint = _require_string(raw_value, label=label)
+        if len(fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in fingerprint
+        ):
+            raise ProtocolError(f"{label} must be lowercase SHA-256")
+        fingerprints.append(fingerprint)
+    scenario_name = _require_string(scenario, label="scenario")
     arm = _require_string(transport_arm, label="transport_arm")
     role_name = _require_string(role, label="role")
     if role_name not in _ROLES:
         raise ProtocolError(f"unsupported protocol role: {role_name}")
     role_rank = _require_integer(rank, label="rank", minimum=0)
-    return run_id_text, fingerprint, arm, role_name, role_rank
+    return (
+        run_id_text,
+        fingerprints[0],
+        fingerprints[1],
+        scenario_name,
+        arm,
+        role_name,
+        role_rank,
+    )
 
 
 @dataclass
@@ -601,6 +635,8 @@ class JsonChannel:
     :ivar connection: Connected TCP socket owned by the channel.
     :ivar run_id: Campaign UUID shared by both endpoints.
     :ivar config_fingerprint: SHA-256 configuration identity.
+    :ivar input_bundle_fingerprint: SHA-256 identity of every immutable input.
+    :ivar scenario: Selected scenario identity.
     :ivar transport_arm: Fresh-process UCX arm.
     :ivar local_role: Role emitted by this endpoint.
     :ivar local_rank: Rank emitted by this endpoint.
@@ -612,6 +648,8 @@ class JsonChannel:
     connection: socket.socket
     run_id: str
     config_fingerprint: str
+    input_bundle_fingerprint: str
+    scenario: str
     transport_arm: str
     local_role: str
     local_rank: int
@@ -626,19 +664,25 @@ class JsonChannel:
         (
             self.run_id,
             self.config_fingerprint,
+            self.input_bundle_fingerprint,
+            self.scenario,
             self.transport_arm,
             self.local_role,
             self.local_rank,
         ) = _validate_identity(
             run_id=self.run_id,
             config_fingerprint=self.config_fingerprint,
+            input_bundle_fingerprint=self.input_bundle_fingerprint,
+            scenario=self.scenario,
             transport_arm=self.transport_arm,
             role=self.local_role,
             rank=self.local_rank,
         )
-        _, _, _, self.remote_role, self.remote_rank = _validate_identity(
+        _, _, _, _, _, self.remote_role, self.remote_rank = _validate_identity(
             run_id=self.run_id,
             config_fingerprint=self.config_fingerprint,
+            input_bundle_fingerprint=self.input_bundle_fingerprint,
+            scenario=self.scenario,
             transport_arm=self.transport_arm,
             role=self.remote_role,
             rank=self.remote_rank,
@@ -662,7 +706,8 @@ class JsonChannel:
         return (
             f"direction={direction} local={self.local_role}:{self.local_rank} "
             f"remote={self.remote_role}:{self.remote_rank} run={self.run_id} "
-            f"arm={self.transport_arm} iteration={iteration} "
+            f"scenario={self.scenario} arm={self.transport_arm} "
+            f"inputs={self.input_bundle_fingerprint[:12]} iteration={iteration} "
             f"type={message_type}"
         )
 
@@ -717,6 +762,8 @@ class JsonChannel:
             "type": message_type,
             "run_id": self.run_id,
             "config_fingerprint": self.config_fingerprint,
+            "input_bundle_fingerprint": self.input_bundle_fingerprint,
+            "scenario": self.scenario,
             "transport_arm": self.transport_arm,
             "iteration": validated_iteration,
             "sender_role": self.local_role,
@@ -766,7 +813,11 @@ class JsonChannel:
             size, message_type=message_type, iteration=expected_iteration
         )
         try:
-            decoded: object = json.loads(encoded)
+            decoded: object = json.loads(
+                encoded,
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+            )
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise ProtocolError(f"invalid control JSON: {error}") from error
         message = _require_object(
@@ -781,12 +832,16 @@ class JsonChannel:
         (
             received_run_id,
             received_fingerprint,
+            received_input_fingerprint,
+            received_scenario,
             received_arm,
             received_role,
             received_rank,
         ) = _validate_identity(
             run_id=message["run_id"],
             config_fingerprint=message["config_fingerprint"],
+            input_bundle_fingerprint=message["input_bundle_fingerprint"],
+            scenario=message["scenario"],
             transport_arm=message["transport_arm"],
             role=message["sender_role"],
             rank=message["sender_rank"],
@@ -802,6 +857,12 @@ class JsonChannel:
             ("type", received_type, message_type),
             ("run_id", received_run_id, self.run_id),
             ("config_fingerprint", received_fingerprint, self.config_fingerprint),
+            (
+                "input_bundle_fingerprint",
+                received_input_fingerprint,
+                self.input_bundle_fingerprint,
+            ),
+            ("scenario", received_scenario, self.scenario),
             ("transport_arm", received_arm, self.transport_arm),
             ("iteration", received_iteration, expected_iteration),
             ("sender_role", received_role, self.remote_role),

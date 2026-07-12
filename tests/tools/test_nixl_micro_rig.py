@@ -692,6 +692,8 @@ def test_protocol_round_trip_and_versioning() -> None:
     kwargs = {
         "run_id": "12345678-1234-5678-1234-567812345678",
         "config_fingerprint": "a" * 64,
+        "input_bundle_fingerprint": "b" * 64,
+        "scenario": "boundary",
         "transport_arm": "cuda_copy",
         "timeout_seconds": 1.0,
     }
@@ -731,6 +733,8 @@ def test_protocol_rejects_missing_message_type() -> None:
             first,
             run_id="not-a-uuid",
             config_fingerprint="a" * 64,
+            input_bundle_fingerprint="b" * 64,
+            scenario="boundary",
             transport_arm="cuda_copy",
             local_role="producer",
             local_rank=0,
@@ -746,6 +750,8 @@ def test_protocol_rejects_stale_iteration() -> None:
     kwargs = {
         "run_id": "12345678-1234-5678-1234-567812345678",
         "config_fingerprint": "a" * 64,
+        "input_bundle_fingerprint": "b" * 64,
+        "scenario": "boundary",
         "transport_arm": "cuda_copy",
         "timeout_seconds": 1.0,
     }
@@ -780,6 +786,8 @@ def test_protocol_rejects_duplicate_sequence() -> None:
     kwargs = {
         "run_id": "12345678-1234-5678-1234-567812345678",
         "config_fingerprint": "a" * 64,
+        "input_bundle_fingerprint": "b" * 64,
+        "scenario": "boundary",
         "transport_arm": "cuda_copy",
         "timeout_seconds": 1.0,
     }
@@ -812,10 +820,12 @@ def test_protocol_rejects_duplicate_sequence() -> None:
 
 def _valid_source_post_envelope() -> dict[str, object]:
     return {
-        "protocol_version": 1,
+        "protocol_version": 2,
         "type": "source_post",
         "run_id": "12345678-1234-5678-1234-567812345678",
         "config_fingerprint": "a" * 64,
+        "input_bundle_fingerprint": "b" * 64,
+        "scenario": "boundary",
         "transport_arm": "cuda_copy",
         "iteration": 0,
         "sender_role": "producer",
@@ -835,6 +845,8 @@ def _consumer_channel(connection: socket.socket) -> JsonChannel:
         connection,
         run_id="12345678-1234-5678-1234-567812345678",
         config_fingerprint="a" * 64,
+        input_bundle_fingerprint="b" * 64,
+        scenario="boundary",
         transport_arm="cuda_copy",
         local_role="consumer",
         local_rank=0,

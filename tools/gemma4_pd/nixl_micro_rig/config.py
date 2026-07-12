@@ -2,12 +2,16 @@
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
 class ConfigError(ValueError):
     """Report an invalid or ambiguous micro-rig configuration."""
+
+
+_SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
 
 def _require_keys(
@@ -74,6 +78,20 @@ def _as_str(value: object, context: str) -> str:
     return value
 
 
+def _as_name(value: object, context: str) -> str:
+    """Require an artifact-safe scenario or transport-arm identifier.
+
+    :param value: Parsed JSON value.
+    :param context: Human-readable field name.
+    :returns: Validated identifier.
+    :raises ConfigError: If the value can alter artifact paths.
+    """
+    text = _as_str(value, context)
+    if _SAFE_NAME.fullmatch(text) is None or text in {".", ".."}:
+        raise ConfigError(f"{context} must be an artifact-safe identifier")
+    return text
+
+
 def _as_relative_path(value: object, context: str) -> str:
     """Require a confined, non-empty relative path.
 
@@ -136,7 +154,7 @@ class RegionConfig:
             context=context,
         )
         return cls(
-            name=_as_str(obj["name"], f"{context}.name"),
+            name=_as_name(obj["name"], f"{context}.name"),
             row_bytes=_as_int(obj["row_bytes"], f"{context}.row_bytes"),
         )
 
@@ -209,7 +227,7 @@ class GroupConfig:
         )
         return cls(
             index=_as_int(obj["index"], f"{context}.index"),
-            name=_as_str(obj["name"], f"{context}.name"),
+            name=_as_name(obj["name"], f"{context}.name"),
             token_capacity=_as_int(obj["token_capacity"], f"{context}.token_capacity"),
             remote_position_count=_as_int(
                 obj["remote_position_count"],
@@ -306,7 +324,7 @@ class ScenarioConfig:
                 replay_manifest, f"{context}.replay_manifest"
             )
         return cls(
-            name=_as_str(obj["name"], f"{context}.name"),
+            name=_as_name(obj["name"], f"{context}.name"),
             source_start_block=_as_int(
                 obj["source_start_block"], f"{context}.source_start_block"
             ),
@@ -330,19 +348,25 @@ class TransportArmConfig:
     :ivar name: Stable arm identity.
     :ivar ucx_tls: Exact UCX transport selection.
     :ivar ucx_memtype_cache: Optional UCX memory-type cache setting.
-    :ivar ucx_rndv_scheme: Optional UCX rendezvous scheme setting.
+    :ivar ucx_rndv_scheme: Exact UCX rendezvous scheme setting.
+    :ivar ucx_net_devices: Exact UCX network-device selection.
     """
 
     name: str
     ucx_tls: str
     ucx_memtype_cache: str | None
-    ucx_rndv_scheme: str | None
+    ucx_rndv_scheme: str
+    ucx_net_devices: str
 
     def __post_init__(self) -> None:
         if len(self.name) == 0:
             raise ConfigError("transport arm name must not be empty")
         if len(self.ucx_tls) == 0:
             raise ConfigError("transport arm ucx_tls must not be empty")
+        if self.ucx_rndv_scheme != "get_zcopy":
+            raise ConfigError("transport arm ucx_rndv_scheme must be get_zcopy")
+        if self.ucx_net_devices != "all":
+            raise ConfigError("transport arm ucx_net_devices must be all")
 
     @classmethod
     def from_json(cls, value: object, index: int) -> "TransportArmConfig":
@@ -356,21 +380,23 @@ class TransportArmConfig:
         obj = _as_dict(value, context)
         _require_keys(
             obj,
-            required={"name", "ucx_tls"},
-            optional={"ucx_memtype_cache", "ucx_rndv_scheme"},
+            required={"name", "ucx_tls", "ucx_rndv_scheme", "ucx_net_devices"},
+            optional={"ucx_memtype_cache"},
             context=context,
         )
         memtype = obj.get("ucx_memtype_cache")
-        rndv = obj.get("ucx_rndv_scheme")
         if memtype is not None:
             memtype = _as_str(memtype, f"{context}.ucx_memtype_cache")
-        if rndv is not None:
-            rndv = _as_str(rndv, f"{context}.ucx_rndv_scheme")
         return cls(
-            name=_as_str(obj["name"], f"{context}.name"),
+            name=_as_name(obj["name"], f"{context}.name"),
             ucx_tls=_as_str(obj["ucx_tls"], f"{context}.ucx_tls"),
             ucx_memtype_cache=memtype,
-            ucx_rndv_scheme=rndv,
+            ucx_rndv_scheme=_as_str(
+                obj["ucx_rndv_scheme"], f"{context}.ucx_rndv_scheme"
+            ),
+            ucx_net_devices=_as_str(
+                obj["ucx_net_devices"], f"{context}.ucx_net_devices"
+            ),
         )
 
 
@@ -884,6 +910,38 @@ def _validate_handshake_manifests(config: RigConfig, directory: Path) -> None:
         raise ConfigError("P and D handshake compatibility hashes differ")
 
 
+def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ConfigError(f"configuration duplicates key {key!r}")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ConfigError(f"configuration contains non-finite constant {value}")
+
+
+def parse_config_bytes(payload: bytes, *, source: str) -> RigConfig:
+    """Parse typed configuration bytes without resolving external inputs.
+
+    :param payload: Exact JSON bytes.
+    :param source: Human-readable source identity for diagnostics.
+    :returns: Parsed typed configuration.
+    :raises ConfigError: If JSON or configuration validation fails.
+    """
+    try:
+        value = json.loads(
+            payload,
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ConfigError(f"invalid JSON in {source}: {error}") from error
+    return RigConfig.from_json(value)
+
+
 def load_config(path: Path) -> RigConfig:
     """Load a rig configuration from disk.
 
@@ -891,10 +949,6 @@ def load_config(path: Path) -> RigConfig:
     :returns: Parsed and validated configuration.
     :raises ConfigError: If JSON parsing or validation fails.
     """
-    try:
-        value = json.loads(path.read_text())
-    except json.JSONDecodeError as error:
-        raise ConfigError(f"invalid JSON in {path}: {error}") from error
-    config = RigConfig.from_json(value)
+    config = parse_config_bytes(path.read_bytes(), source=str(path))
     _validate_handshake_manifests(config, path.parent)
     return config

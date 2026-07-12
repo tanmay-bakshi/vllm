@@ -119,11 +119,15 @@
   "transport_arms": [
     {
       "name": "cuda_ipc",
-      "ucx_tls": "tcp,shm,cuda_copy,cuda_ipc"
+      "ucx_tls": "tcp,shm,cuda_copy,cuda_ipc",
+      "ucx_rndv_scheme": "get_zcopy",
+      "ucx_net_devices": "all"
     },
     {
       "name": "cuda_copy",
-      "ucx_tls": "tcp,shm,cuda_copy"
+      "ucx_tls": "tcp,shm,cuda_copy",
+      "ucx_rndv_scheme": "get_zcopy",
+      "ucx_net_devices": "all"
     }
   ],
   "victim": {

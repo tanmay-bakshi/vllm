@@ -20,6 +20,7 @@ from nixl._api import (
 
 from tools.gemma4_pd.nixl_micro_rig.attestation import (
     collect_process_attestation,
+    write_process_limits,
     write_process_maps,
 )
 from tools.gemma4_pd.nixl_micro_rig.config import RigConfig, load_config
@@ -52,6 +53,8 @@ from tools.gemma4_pd.nixl_micro_rig.protocol import (
     StopPayload,
     StoppedPayload,
 )
+from tools.gemma4_pd.nixl_micro_rig.selection import RunSelection
+from vllm.distributed.kv_transfer.integrity import IntegrityStage
 from vllm.distributed.kv_transfer.staging_ownership import (
     HandleState,
     StagingRangeAllocator,
@@ -162,6 +165,9 @@ def _register_regions(agent: nixl_agent, regions: tuple[torch.Tensor, ...]) -> o
 
 def _validate_producer_hello(
     config: RigConfig,
+    selection: RunSelection,
+    run_id: str,
+    input_bundle_fingerprint: str,
     rank: int,
     hello: HelloPayload,
     expected_cuda_visibility: str,
@@ -169,6 +175,9 @@ def _validate_producer_hello(
     """Require a producer advertisement to match its configured role exactly.
 
     :param config: Authenticated production-topology configuration.
+    :param selection: Exact scenario and transport arm.
+    :param run_id: Campaign UUID.
+    :param input_bundle_fingerprint: SHA-256 identity of immutable inputs.
     :param rank: Expected producer TP rank.
     :param hello: Typed producer advertisement.
     :param expected_cuda_visibility: Preflighted producer UUID roster.
@@ -190,9 +199,16 @@ def _validate_producer_hello(
             f"producer rank {rank} advertised logical device {hello.logical_device}"
         )
     expected_attestation = {
+        "run_id": run_id,
+        "config_fingerprint": config.fingerprint,
+        "input_bundle_fingerprint": input_bundle_fingerprint,
+        "selection": selection.to_json(),
+        "selection_fingerprint": selection.fingerprint,
         "role": f"producer:{rank}",
         "physical_device": config.producer_devices[rank],
         "logical_device": rank,
+        "configured_gpu_uuid": expected_cuda_visibility.split(",")[rank],
+        "observed_gpu_uuid": expected_cuda_visibility.split(",")[rank],
     }
     for field, expected in expected_attestation.items():
         actual = hello.attestation.get(field)
@@ -206,6 +222,22 @@ def _validate_producer_hello(
         raise RuntimeError(f"producer rank {rank} attestation lacks environment")
     if environment.get("CUDA_VISIBLE_DEVICES") != expected_cuda_visibility:
         raise RuntimeError(f"producer rank {rank} CUDA visibility differs")
+    arm = config.transport_arm(selection.transport_arm_name)
+    expected_ucx = {
+        "UCX_NET_DEVICES": arm.ucx_net_devices,
+        "UCX_PROTO_INFO": "y",
+        "UCX_RNDV_SCHEME": arm.ucx_rndv_scheme,
+        "UCX_TLS": arm.ucx_tls,
+    }
+    if arm.ucx_memtype_cache is not None:
+        expected_ucx["UCX_MEMTYPE_CACHE"] = arm.ucx_memtype_cache
+    actual_native_environment = {
+        name: value
+        for name, value in environment.items()
+        if name.startswith("UCX_") or name.startswith("NIXL_")
+    }
+    if actual_native_environment != expected_ucx:
+        raise RuntimeError(f"producer rank {rank} native environment differs")
 
 
 def _observation_context(
@@ -265,7 +297,8 @@ def _await_notification(
 def run_producer(
     *,
     config_path: Path,
-    arm_name: str,
+    selection: RunSelection,
+    input_bundle_fingerprint: str,
     run_id: str,
     rank: int,
     artifact_directory: Path,
@@ -274,14 +307,16 @@ def run_producer(
     """Run one independent P-rank NIXL agent and source registration.
 
     :param config_path: Authenticated rig configuration.
-    :param arm_name: Fresh-process transport arm.
+    :param selection: Exact scenario and fresh-process transport arm.
+    :param input_bundle_fingerprint: SHA-256 identity of immutable run inputs.
     :param run_id: Campaign UUID.
     :param rank: P tensor-parallel rank.
     :param artifact_directory: Immutable run artifact directory.
     :param expected_cuda_visibility: Preflighted producer UUID roster.
     """
     config = load_config(config_path)
-    arm = config.transport_arm(arm_name)
+    selection.validate(config)
+    arm = config.transport_arm(selection.transport_arm_name)
     _assert_role_visibility(expected_cuda_visibility)
     if rank < 0 or rank >= len(config.producer_devices):
         raise ValueError(f"producer rank is out of range: {rank}")
@@ -298,17 +333,37 @@ def run_producer(
         for region in config.regions
     )
     registration = _register_regions(agent, region_tensors)
-    attestation = collect_process_attestation(
+    producer_gpu_uuids = expected_cuda_visibility.split(",")
+    if len(producer_gpu_uuids) != len(config.producer_devices):
+        raise RuntimeError("producer CUDA visibility UUID count differs")
+    attestation_snapshot = collect_process_attestation(
         agent,
+        run_id=run_id,
+        config_fingerprint=config.fingerprint,
+        input_bundle_fingerprint=input_bundle_fingerprint,
+        selection=selection,
         role=f"producer:{rank}",
         physical_device=config.producer_devices[rank],
         logical_device=logical_device,
+        configured_gpu_uuid=producer_gpu_uuids[rank],
+        run_directory=config_path.parents[1],
+        native_archive_directory=(
+            artifact_directory / f"producer-{rank}-native-libraries"
+        ),
     )
+    attestation = attestation_snapshot.record
     artifact_directory.mkdir(parents=True, exist_ok=True)
     (artifact_directory / f"producer-{rank}-attestation.json").write_text(
         json.dumps(attestation, indent=2, sort_keys=True)
     )
-    write_process_maps(artifact_directory / f"producer-{rank}-proc-maps.txt")
+    write_process_maps(
+        artifact_directory / f"producer-{rank}-proc-maps.txt",
+        attestation_snapshot.proc_maps,
+    )
+    write_process_limits(
+        artifact_directory / f"producer-{rank}-proc-limits.txt",
+        attestation_snapshot.proc_limits,
+    )
     hello_payload = HelloPayload(
         agent_metadata=base64.b64encode(agent.get_agent_metadata()).decode(),
         base_addresses=tuple(tensor.data_ptr() for tensor in region_tensors),
@@ -324,6 +379,8 @@ def run_producer(
             connection,
             run_id=run_id,
             config_fingerprint=config.fingerprint,
+            input_bundle_fingerprint=input_bundle_fingerprint,
+            scenario=selection.scenario_name,
             transport_arm=arm.name,
             local_role="producer",
             local_rank=rank,
@@ -333,7 +390,7 @@ def run_producer(
         ) as channel:
             channel.send(hello_payload, iteration=-1)
             global_iteration = 0
-            for scenario in config.scenarios:
+            for scenario in (config.scenario(selection.scenario_name),):
                 plan = _plan(config_path, config, scenario.name)
                 for scenario_iteration in range(scenario.iterations):
                     prepare = channel.receive(
@@ -375,13 +432,18 @@ def run_producer(
                             config=config,
                             plan=plan,
                             context=context,
+                            stage=IntegrityStage.SOURCE_PRE,
                             source_rank=rank,
                             regions=region_tensors,
                         )
                     else:
                         before = []
                     write_observations(
-                        artifact_directory / f"producer-{rank}-source.jsonl", before
+                        artifact_directory / f"producer-{rank}-source-pre.jsonl",
+                        before,
+                        config_fingerprint=config.fingerprint,
+                        input_bundle_fingerprint=input_bundle_fingerprint,
+                        scenario=scenario.name,
                     )
                     digest_rows = tuple(
                         DigestRow.from_json(row) for row in compact_digests(before)
@@ -415,11 +477,19 @@ def run_producer(
                             config=config,
                             plan=plan,
                             context=context,
+                            stage=IntegrityStage.SOURCE_POST,
                             source_rank=rank,
                             regions=region_tensors,
                         )
                     else:
                         after = []
+                    write_observations(
+                        artifact_directory / f"producer-{rank}-source-post.jsonl",
+                        after,
+                        config_fingerprint=config.fingerprint,
+                        input_bundle_fingerprint=input_bundle_fingerprint,
+                        scenario=scenario.name,
+                    )
                     matches_before = compact_digests(before) == compact_digests(after)
                     channel.send(
                         SourcePostPayload(
@@ -781,7 +851,8 @@ def _compare_compact(
 def run_consumer(
     *,
     config_path: Path,
-    arm_name: str,
+    selection: RunSelection,
+    input_bundle_fingerprint: str,
     run_id: str,
     artifact_directory: Path,
     expected_cuda_visibility: str,
@@ -790,14 +861,16 @@ def run_consumer(
     """Run the TP1 D agent with exact live registrations and coalesced pulls.
 
     :param config_path: Immutable run-local configuration.
-    :param arm_name: Fresh-process transport arm.
+    :param selection: Exact scenario and fresh-process transport arm.
+    :param input_bundle_fingerprint: SHA-256 identity of immutable run inputs.
     :param run_id: Campaign UUID.
     :param artifact_directory: Fresh arm artifact directory.
     :param expected_cuda_visibility: Preflighted consumer GPU UUID.
     :param producer_cuda_visibility: Preflighted producer UUID roster.
     """
     config = load_config(config_path)
-    arm = config.transport_arm(arm_name)
+    selection.validate(config)
+    arm = config.transport_arm(selection.transport_arm_name)
     _assert_role_visibility(expected_cuda_visibility)
     logical_device = 0
     torch.cuda.set_device(logical_device)
@@ -825,6 +898,8 @@ def run_consumer(
             _connect(config, rank),
             run_id=run_id,
             config_fingerprint=config.fingerprint,
+            input_bundle_fingerprint=input_bundle_fingerprint,
+            scenario=selection.scenario_name,
             transport_arm=arm.name,
             local_role="consumer",
             local_rank=0,
@@ -833,7 +908,15 @@ def run_consumer(
             timeout_seconds=float(config.transfer_timeout_seconds),
         )
         hello = channel.receive(HelloPayload, iteration=-1)
-        _validate_producer_hello(config, rank, hello, producer_cuda_visibility)
+        _validate_producer_hello(
+            config,
+            selection,
+            run_id,
+            input_bundle_fingerprint,
+            rank,
+            hello,
+            producer_cuda_visibility,
+        )
         metadata = base64.b64decode(hello.agent_metadata)
         remote_agents.append(agent.add_remote_agent(metadata))
         remote_bases.append(list(hello.base_addresses))
@@ -858,12 +941,20 @@ def run_consumer(
     staging_registration = _register_regions(agent, (staging,))
     allocator = StagingRangeAllocator(capacity=staging.numel())
     victim = VictimCanary(config, torch.device("cuda:0"))
-    attestation = collect_process_attestation(
+    attestation_snapshot = collect_process_attestation(
         agent,
+        run_id=run_id,
+        config_fingerprint=config.fingerprint,
+        input_bundle_fingerprint=input_bundle_fingerprint,
+        selection=selection,
         role="consumer:0",
         physical_device=config.consumer_device,
         logical_device=logical_device,
+        configured_gpu_uuid=expected_cuda_visibility,
+        run_directory=config_path.parents[1],
+        native_archive_directory=artifact_directory / "consumer-native-libraries",
     )
+    attestation = attestation_snapshot.record
     artifact_directory.mkdir(parents=True, exist_ok=True)
     (artifact_directory / "consumer-attestation.json").write_text(
         json.dumps(
@@ -881,7 +972,10 @@ def run_consumer(
             {
                 "run_id": run_id,
                 "transport_arm": arm.name,
+                "scenario": selection.scenario_name,
+                "selection_fingerprint": selection.fingerprint,
                 "config_fingerprint": config.fingerprint,
+                "input_bundle_fingerprint": input_bundle_fingerprint,
                 "destination": [
                     {
                         "region_index": region_index,
@@ -916,13 +1010,20 @@ def run_consumer(
             sort_keys=True,
         )
     )
-    write_process_maps(artifact_directory / "consumer-proc-maps.txt")
+    write_process_maps(
+        artifact_directory / "consumer-proc-maps.txt",
+        attestation_snapshot.proc_maps,
+    )
+    write_process_limits(
+        artifact_directory / "consumer-proc-limits.txt",
+        attestation_snapshot.proc_limits,
+    )
 
     iteration_records: list[dict[str, object]] = []
     global_iteration = 0
     completed_cleanly = False
     try:
-        for scenario in config.scenarios:
+        for scenario in (config.scenario(selection.scenario_name),):
             plan = _plan(config_path, config, scenario.name)
             if len(set(plan.local_block_ids)) != len(plan.local_block_ids):
                 raise RuntimeError(
@@ -965,6 +1066,11 @@ def run_consumer(
                         )
                     iteration_records.append(
                         {
+                            "run_id": run_id,
+                            "config_fingerprint": config.fingerprint,
+                            "input_bundle_fingerprint": input_bundle_fingerprint,
+                            "selection_fingerprint": selection.fingerprint,
+                            "transport_arm": arm.name,
                             "iteration": global_iteration,
                             "scenario": scenario.name,
                             "scenario_iteration": scenario_iteration,
@@ -1201,10 +1307,18 @@ def run_consumer(
                     _compare_compact(source_rows, staged_compact)
                     _compare_compact(source_rows, committed_compact)
                     write_observations(
-                        artifact_directory / "consumer-staging.jsonl", staged
+                        artifact_directory / "consumer-staging.jsonl",
+                        staged,
+                        config_fingerprint=config.fingerprint,
+                        input_bundle_fingerprint=input_bundle_fingerprint,
+                        scenario=scenario.name,
                     )
                     write_observations(
-                        artifact_directory / "consumer-destination.jsonl", committed
+                        artifact_directory / "consumer-destination.jsonl",
+                        committed,
+                        config_fingerprint=config.fingerprint,
+                        input_bundle_fingerprint=input_bundle_fingerprint,
+                        scenario=scenario.name,
                     )
                     torch.cuda.synchronize()
                     ownership.mark_device_quiescent()
@@ -1220,6 +1334,11 @@ def run_consumer(
                         )
                     iteration_records.append(
                         {
+                            "run_id": run_id,
+                            "config_fingerprint": config.fingerprint,
+                            "input_bundle_fingerprint": input_bundle_fingerprint,
+                            "selection_fingerprint": selection.fingerprint,
+                            "transport_arm": arm.name,
                             "iteration": global_iteration,
                             "scenario": scenario.name,
                             "scenario_iteration": scenario_iteration,
