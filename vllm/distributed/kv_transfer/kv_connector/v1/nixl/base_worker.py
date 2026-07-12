@@ -7,11 +7,12 @@ import os
 import queue
 import threading
 import time
+import traceback
 import uuid
 from collections import defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Never, cast
 
 import msgspec
 import numpy as np
@@ -85,6 +86,12 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     select_source_manifest,
     validate_capture,
     validate_source_manifest_structure,
+)
+from vllm.distributed.kv_transfer.staging_ownership import (
+    CoalescedStagingPlan,
+    HandleState,
+    StagingRangeAllocator,
+    StagingSafetyError,
 )
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.distributed.parallel_state import (
@@ -411,12 +418,30 @@ class NixlBaseConnectorWorker:
         # re-scatters into the real cache with one strided GPU copy per
         # (region, shard) at completion, before the request is released
         # to the scheduler. Byte placement is identical to stock.
-        self.coalesce_pull = os.environ.get(
-            "VLLM_NIXL_COALESCED_PULL", "0") == "1"
-        self.coalesce_staging_mb = int(os.environ.get(
-            "VLLM_NIXL_COALESCED_STAGING_MB", "12288"))
+        self.coalesce_pull = os.environ.get("VLLM_NIXL_COALESCED_PULL", "0") == "1"
+        self.coalesce_staging_mb = int(
+            os.environ.get("VLLM_NIXL_COALESCED_STAGING_MB", "12288")
+        )
+        self._coalesce_warn_after_s = float(
+            self.kv_transfer_config.get_from_extra_config(
+                "coalesce_staging_warn_after_s", 30.0
+            )
+        )
+        self._coalesce_fail_after_s = float(
+            self.kv_transfer_config.get_from_extra_config(
+                "coalesce_staging_fail_after_s", 300.0
+            )
+        )
+        if (
+            self._coalesce_warn_after_s <= 0
+            or self._coalesce_fail_after_s <= self._coalesce_warn_after_s
+        ):
+            raise ValueError(
+                "coalesce_staging_fail_after_s must exceed the positive "
+                "coalesce_staging_warn_after_s"
+            )
         self._staging_buf: torch.Tensor | None = None
-        self._staging_free: list[tuple[int, int]] = []
+        self._staging_allocator: StagingRangeAllocator | None = None
         # requests waiting for a staging range (FIFO; serviced every
         # get_finished as completions free ranges). Parking is safe:
         # to the rest of the engine a parked request is
@@ -425,8 +450,11 @@ class NixlBaseConnectorWorker:
         # alternative -- falling back to the stock path costs ~20x in
         # transfer time, while a range frees in ~100-300ms.
         self._coalesce_pending: deque = deque()
-        # req_id -> scatter plan (staging offsets + block index map)
-        self._coalesce_plans: dict[ReqId, dict] = {}
+        # Coalesced handles, scatter geometry, and staging lifetime have one
+        # generation-scoped owner. Stock transfers remain in
+        # _recving_transfers because they never write the staging registration.
+        self._coalesce_plans: dict[ReqId, CoalescedStagingPlan] = {}
+        self._coalesce_owner_sequence = 0
         self._sp_flags_cache: list[bool] | None = None
         # canonicalized (nb, row_bytes) uint8 views of each region's
         # physical storage (registered tensors are permuted VIEWS of the
@@ -439,9 +467,9 @@ class NixlBaseConnectorWorker:
         self._remote_regions: dict[
             EngineId, dict[int, tuple[NixlRegionDescriptor, ...]]
         ] = defaultdict(dict)
-        self._remote_registration_generations: dict[
-            EngineId, dict[int, str]
-        ] = defaultdict(dict)
+        self._remote_registration_generations: dict[EngineId, dict[int, str]] = (
+            defaultdict(dict)
+        )
         # region index -> registered cache tensor (scatter destinations)
         self._region_tensors: list[torch.Tensor] = []
         self._region_descriptors: tuple[NixlRegionDescriptor, ...] = ()
@@ -456,9 +484,7 @@ class NixlBaseConnectorWorker:
             else None
         )
         self._localization_source_rosters: dict[ReqId, NixlSourceRoster] = {}
-        self._localization_source_pre: dict[
-            tuple[ReqId, int], NixlSourceManifest
-        ] = {}
+        self._localization_source_pre: dict[tuple[ReqId, int], NixlSourceManifest] = {}
         self._localization_pending_manifests: dict[
             tuple[ReqId, int], NixlSourceManifest
         ] = {}
@@ -557,26 +583,17 @@ class NixlBaseConnectorWorker:
         # ---- resident-KV checksum auditor (VLLM_GEMMA4_KV_AUDIT) ----
         # Snapshot content sums of immutable prompt rows at pull commit;
         # re-verify periodically. Debug instrument, off by default.
-        import os as _os_audit
-        self._audit_enabled = (
-            _os_audit.environ.get("VLLM_GEMMA4_KV_AUDIT", "0") == "1"
-        )
+        self._audit_enabled = os.environ.get("VLLM_GEMMA4_KV_AUDIT", "0") == "1"
         self._audit_interval = int(
-            _os_audit.environ.get("VLLM_GEMMA4_KV_AUDIT_INTERVAL", "16")
+            os.environ.get("VLLM_GEMMA4_KV_AUDIT_INTERVAL", "16")
         )
         self._audit_groups = {
             int(x)
-            for x in _os_audit.environ.get(
-                "VLLM_GEMMA4_KV_AUDIT_GROUPS", "10,11"
-            ).split(",")
+            for x in os.environ.get("VLLM_GEMMA4_KV_AUDIT_GROUPS", "10,11").split(",")
             if x.strip()
         }
-        self._audit_tail_exclude = int(
-            _os_audit.environ.get("VLLM_GEMMA4_KV_AUDIT_TAIL", "2")
-        )
-        self._audit_selftest = int(
-            _os_audit.environ.get("VLLM_GEMMA4_KV_AUDIT_SELFTEST", "0")
-        )
+        self._audit_tail_exclude = int(os.environ.get("VLLM_GEMMA4_KV_AUDIT_TAIL", "2"))
+        self._audit_selftest = int(os.environ.get("VLLM_GEMMA4_KV_AUDIT_SELFTEST", "0"))
         # rid -> dict(rows=LongTensor, sums=[n_regions, K] int64, t=float)
         self._audit_state: dict[str, dict] = {}
         # (rid, audit_rows, all_rows) committed this step, snapshot at
@@ -591,8 +608,7 @@ class NixlBaseConnectorWorker:
         self._audit_snap_count = 0
         if self._audit_enabled:
             logger.info(
-                "[kv-audit] ENABLED interval=%d groups=%s tail=%d "
-                "selftest=%d",
+                "[kv-audit] ENABLED interval=%d groups=%s tail=%d selftest=%d",
                 self._audit_interval,
                 sorted(self._audit_groups),
                 self._audit_tail_exclude,
@@ -662,15 +678,15 @@ class NixlBaseConnectorWorker:
             get_representative_spec_type(g.kv_cache_spec)
             for g in self.kv_cache_config.kv_cache_groups
         )
-        import os as _os_sg
-        _skip = _os_sg.environ.get("VLLM_GEMMA4_SKIP_PULL_GROUPS", "")
+        _skip = os.environ.get("VLLM_GEMMA4_SKIP_PULL_GROUPS", "")
         self._skip_pull_groups: set[int] = {
             int(x) for x in _skip.split(",") if x.strip()
         }
         for _gi, _g in enumerate(self.kv_cache_config.kv_cache_groups):
             logger.info(
                 "[kv-group] i=%d block_size=%s n_layers=%d first=%s skip_pull=%s",
-                _gi, getattr(_g.kv_cache_spec, "block_size", "?"),
+                _gi,
+                getattr(_g.kv_cache_spec, "block_size", "?"),
                 len(_g.layer_names),
                 _g.layer_names[0] if _g.layer_names else "-",
                 _gi in self._skip_pull_groups,
@@ -1076,17 +1092,13 @@ class NixlBaseConnectorWorker:
         self._region_descriptors = (
             NixlRegionDescriptor(
                 semantic_name="packed_cross_layer_storage",
-                group_indices=tuple(
-                    range(len(self.kv_cache_config.kv_cache_groups))
-                ),
+                group_indices=tuple(range(len(self.kv_cache_config.kv_cache_groups))),
                 group_semantic_names=tuple(
                     (
                         group_index,
                         f"packed_cross_layer_storage:group_{group_index}",
                     )
-                    for group_index in range(
-                        len(self.kv_cache_config.kv_cache_groups)
-                    )
+                    for group_index in range(len(self.kv_cache_config.kv_cache_groups))
                 ),
                 base_address=base_addr,
                 registered_bytes=total_size,
@@ -1363,9 +1375,7 @@ class NixlBaseConnectorWorker:
                     int(stride) for stride in self._region_tensors[index].stride()
                 ),
                 dtype=str(self._region_tensors[index].dtype),
-                element_size_bytes=int(
-                    self._region_tensors[index].element_size()
-                ),
+                element_size_bytes=int(self._region_tensors[index].element_size()),
                 layout=registered_layout,
             )
             for index, base_addr in enumerate(seen_base_addresses)
@@ -2187,9 +2197,7 @@ class NixlBaseConnectorWorker:
             for group_index, capacity in enumerate(
                 logical_roster.group_token_capacities
             ):
-                spec = self.kv_cache_config.kv_cache_groups[
-                    group_index
-                ].kv_cache_spec
+                spec = self.kv_cache_config.kv_cache_groups[group_index].kv_cache_spec
                 factor = (
                     1
                     if isinstance(spec, MambaSpec)
@@ -2246,9 +2254,7 @@ class NixlBaseConnectorWorker:
         if first_device != "cpu":
             torch.accelerator.synchronize()
 
-        source_group_planes = tuple(
-            1 if flag else 2 for flag in self._sp_group_flags()
-        )
+        source_group_planes = tuple(1 if flag else 2 for flag in self._sp_group_flags())
         positions = [
             (
                 group_index,
@@ -2383,29 +2389,31 @@ class NixlBaseConnectorWorker:
                         hashed_bytes += commit_bytes
 
         duration_ns = time.perf_counter_ns() - start_ns
-        manifest = seal_source_manifest(NixlSourceManifest(
-            schema_version=IntegrityIdentity.SCHEMA_VERSION,
-            run_id=self._localization_config.run_id,
-            transport_arm=self._localization_config.transport_arm,
-            producer_engine_id=self.engine_id,
-            producer_request_id=req_id,
-            registration_generation=self._registration_generation,
-            offer_generation=roster.offer_generation,
-            iteration=roster.iteration,
-            source_rank=self.tp_rank,
-            region_lengths=tuple(int(rows.shape[1]) for rows in self._region_rows),
-            regions=self._region_descriptors,
-            source_group_planes=source_group_planes,
-            valid_token_extent=roster.valid_token_extent,
-            group_token_capacities=roster.group_token_capacities,
-            block_ids=roster.block_ids,
-            observer=True,
-            copied_bytes=copied_bytes,
-            hashed_bytes=hashed_bytes,
-            duration_ns=duration_ns,
-            manifest_digest=b"",
-            leaves=tuple(leaves),
-        ))
+        manifest = seal_source_manifest(
+            NixlSourceManifest(
+                schema_version=IntegrityIdentity.SCHEMA_VERSION,
+                run_id=self._localization_config.run_id,
+                transport_arm=self._localization_config.transport_arm,
+                producer_engine_id=self.engine_id,
+                producer_request_id=req_id,
+                registration_generation=self._registration_generation,
+                offer_generation=roster.offer_generation,
+                iteration=roster.iteration,
+                source_rank=self.tp_rank,
+                region_lengths=tuple(int(rows.shape[1]) for rows in self._region_rows),
+                regions=self._region_descriptors,
+                source_group_planes=source_group_planes,
+                valid_token_extent=roster.valid_token_extent,
+                group_token_capacities=roster.group_token_capacities,
+                block_ids=roster.block_ids,
+                observer=True,
+                copied_bytes=copied_bytes,
+                hashed_bytes=hashed_bytes,
+                duration_ns=duration_ns,
+                manifest_digest=b"",
+                leaves=tuple(leaves),
+            )
+        )
         manifest_errors = validate_source_manifest_structure(manifest)
         if len(manifest_errors) > 0:
             raise LocalizationError(
@@ -2492,14 +2500,14 @@ class NixlBaseConnectorWorker:
     def _localization_capture_staging(
         self,
         req_id: ReqId,
-        plan: dict[str, Any],
+        ownership: CoalescedStagingPlan,
         stage: IntegrityStage,
         barrier: str,
     ) -> None:
         """Capture staged source rows before scatter with bounded host copies.
 
         :param req_id: Decoder child request identifier.
-        :param plan: Sealed coalesced transfer and placement plan.
+        :param ownership: Sealed coalesced transfer and placement owner.
         :param stage: Raw or fenced staging checkpoint.
         :param barrier: Exact observer ordering applied before the capture.
         """
@@ -2510,6 +2518,7 @@ class NixlBaseConnectorWorker:
         manifests = self._localization_expected_by_request.get(req_id)
         if manifests is None:
             raise LocalizationError(f"staging capture lacks manifests for {req_id}")
+        plan = ownership.scatter
         positions = plan["transfer_order"]
         n_pos = int(plan["n_pos"])
         n_ranks = int(plan["n_ranks"])
@@ -2523,7 +2532,7 @@ class NixlBaseConnectorWorker:
             hashed_bytes = 0
             for region_index, row_bytes_raw in enumerate(plan["blens"]):
                 row_bytes = int(row_bytes_raw)
-                region_start = int(plan["off"]) + int(
+                region_start = ownership.lease.offset + int(
                     plan["region_off"][region_index]
                 )
                 region_size = n_ranks * n_pos * row_bytes
@@ -2541,43 +2550,37 @@ class NixlBaseConnectorWorker:
                     if int(position.group_index) in descriptor.group_indices
                 ]
                 for chunk_start in range(0, len(owned_indices), rows_per_chunk):
-                    selected = owned_indices[
-                        chunk_start : chunk_start + rows_per_chunk
-                    ]
+                    selected = owned_indices[chunk_start : chunk_start + rows_per_chunk]
                     selected_tensor = torch.tensor(
                         selected,
                         device=region.device,
                         dtype=torch.long,
                     )
-                    host_rows = region.index_select(
-                        0,
-                        selected_tensor,
-                    ).cpu().contiguous()
+                    host_rows = (
+                        region.index_select(
+                            0,
+                            selected_tensor,
+                        )
+                        .cpu()
+                        .contiguous()
+                    )
                     copied_bytes += len(selected) * row_bytes
                     for row_index, position_index in enumerate(selected):
                         position = positions[position_index]
                         payload = memoryview(host_rows[row_index].numpy()).cast("B")
-                        semantic_contract_digest = (
-                            compute_semantic_contract_digest(
-                                region=manifest.regions[region_index],
-                                group_index=int(position.group_index),
-                                group_token_capacity=int(
-                                    position.group_token_capacity
-                                ),
-                                source_plane_contract=(
-                                    manifest.source_group_planes[
-                                        int(position.group_index)
-                                    ]
-                                ),
-                            )
+                        semantic_contract_digest = compute_semantic_contract_digest(
+                            region=manifest.regions[region_index],
+                            group_index=int(position.group_index),
+                            group_token_capacity=int(position.group_token_capacity),
+                            source_plane_contract=(
+                                manifest.source_group_planes[int(position.group_index)]
+                            ),
                         )
                         wire_identity = build_integrity_identity(
                             config=self._localization_config,
                             producer_engine_id=manifest.producer_engine_id,
                             producer_request_id=manifest.producer_request_id,
-                            registration_generation=(
-                                manifest.registration_generation
-                            ),
+                            registration_generation=(manifest.registration_generation),
                             semantic_contract_digest=semantic_contract_digest,
                             offer_generation=manifest.offer_generation,
                             iteration=manifest.iteration,
@@ -2588,9 +2591,7 @@ class NixlBaseConnectorWorker:
                             source_position=int(position.source_position),
                             remote_block_id=int(position.remote_block_id),
                             valid_token_extent=int(position.valid_token_extent),
-                            group_token_capacity=int(
-                                position.group_token_capacity
-                            ),
+                            group_token_capacity=int(position.group_token_capacity),
                             payload_kind=IntegrityPayloadKind.WIRE,
                             byte_length=row_bytes,
                         )
@@ -2615,9 +2616,7 @@ class NixlBaseConnectorWorker:
                             config=self._localization_config,
                             producer_engine_id=manifest.producer_engine_id,
                             producer_request_id=manifest.producer_request_id,
-                            registration_generation=(
-                                manifest.registration_generation
-                            ),
+                            registration_generation=(manifest.registration_generation),
                             semantic_contract_digest=semantic_contract_digest,
                             offer_generation=manifest.offer_generation,
                             iteration=manifest.iteration,
@@ -2628,9 +2627,7 @@ class NixlBaseConnectorWorker:
                             source_position=int(position.source_position),
                             remote_block_id=int(position.remote_block_id),
                             valid_token_extent=int(position.valid_token_extent),
-                            group_token_capacity=int(
-                                position.group_token_capacity
-                            ),
+                            group_token_capacity=int(position.group_token_capacity),
                             payload_kind=IntegrityPayloadKind.COMMIT,
                             byte_length=commit_bytes,
                         )
@@ -2713,9 +2710,7 @@ class NixlBaseConnectorWorker:
                     self._localization_config.copy_chunk_bytes // row_bytes,
                 )
                 for chunk_start in range(0, len(dual_indices), rows_per_chunk):
-                    selected = dual_indices[
-                        chunk_start : chunk_start + rows_per_chunk
-                    ]
+                    selected = dual_indices[chunk_start : chunk_start + rows_per_chunk]
                     local_indices = torch.tensor(
                         [int(positions[index].local_block_id) for index in selected],
                         device=flat.device,
@@ -2731,27 +2726,19 @@ class NixlBaseConnectorWorker:
                     for row_index, position_index in enumerate(selected):
                         position = positions[position_index]
                         payload = memoryview(host_rows[row_index].numpy()).cast("B")
-                        semantic_contract_digest = (
-                            compute_semantic_contract_digest(
-                                region=manifest.regions[region_index],
-                                group_index=int(position.group_index),
-                                group_token_capacity=int(
-                                    position.group_token_capacity
-                                ),
-                                source_plane_contract=(
-                                    manifest.source_group_planes[
-                                        int(position.group_index)
-                                    ]
-                                ),
-                            )
+                        semantic_contract_digest = compute_semantic_contract_digest(
+                            region=manifest.regions[region_index],
+                            group_index=int(position.group_index),
+                            group_token_capacity=int(position.group_token_capacity),
+                            source_plane_contract=(
+                                manifest.source_group_planes[int(position.group_index)]
+                            ),
                         )
                         identity = build_integrity_identity(
                             config=self._localization_config,
                             producer_engine_id=manifest.producer_engine_id,
                             producer_request_id=manifest.producer_request_id,
-                            registration_generation=(
-                                manifest.registration_generation
-                            ),
+                            registration_generation=(manifest.registration_generation),
                             semantic_contract_digest=semantic_contract_digest,
                             offer_generation=manifest.offer_generation,
                             iteration=manifest.iteration,
@@ -2762,9 +2749,7 @@ class NixlBaseConnectorWorker:
                             source_position=int(position.source_position),
                             remote_block_id=int(position.remote_block_id),
                             valid_token_extent=int(position.valid_token_extent),
-                            group_token_capacity=int(
-                                position.group_token_capacity
-                            ),
+                            group_token_capacity=int(position.group_token_capacity),
                             payload_kind=IntegrityPayloadKind.WIRE,
                             byte_length=row_bytes,
                         )
@@ -2787,9 +2772,7 @@ class NixlBaseConnectorWorker:
                     1,
                     self._localization_config.copy_chunk_bytes // chunk_bytes,
                 )
-                destination_single = flat.view(
-                    flat.shape[0], n_ranks, 2, chunk_bytes
-                )
+                destination_single = flat.view(flat.shape[0], n_ranks, 2, chunk_bytes)
                 for chunk_start in range(
                     0,
                     len(single_indices),
@@ -2808,37 +2791,33 @@ class NixlBaseConnectorWorker:
                         device=flat.device,
                         dtype=torch.long,
                     )
-                    host_rows = destination_single[
-                        local_indices,
-                        rank_slot,
-                        destination_halves,
-                        :,
-                    ].contiguous().cpu()
+                    host_rows = (
+                        destination_single[
+                            local_indices,
+                            rank_slot,
+                            destination_halves,
+                            :,
+                        ]
+                        .contiguous()
+                        .cpu()
+                    )
                     copied_bytes += len(selected) * chunk_bytes
                     for row_index, position_index in enumerate(selected):
                         position = positions[position_index]
                         payload = memoryview(host_rows[row_index].numpy()).cast("B")
-                        semantic_contract_digest = (
-                            compute_semantic_contract_digest(
-                                region=manifest.regions[region_index],
-                                group_index=int(position.group_index),
-                                group_token_capacity=int(
-                                    position.group_token_capacity
-                                ),
-                                source_plane_contract=(
-                                    manifest.source_group_planes[
-                                        int(position.group_index)
-                                    ]
-                                ),
-                            )
+                        semantic_contract_digest = compute_semantic_contract_digest(
+                            region=manifest.regions[region_index],
+                            group_index=int(position.group_index),
+                            group_token_capacity=int(position.group_token_capacity),
+                            source_plane_contract=(
+                                manifest.source_group_planes[int(position.group_index)]
+                            ),
                         )
                         identity = build_integrity_identity(
                             config=self._localization_config,
                             producer_engine_id=manifest.producer_engine_id,
                             producer_request_id=manifest.producer_request_id,
-                            registration_generation=(
-                                manifest.registration_generation
-                            ),
+                            registration_generation=(manifest.registration_generation),
                             semantic_contract_digest=semantic_contract_digest,
                             offer_generation=manifest.offer_generation,
                             iteration=manifest.iteration,
@@ -2849,9 +2828,7 @@ class NixlBaseConnectorWorker:
                             source_position=int(position.source_position),
                             remote_block_id=int(position.remote_block_id),
                             valid_token_extent=int(position.valid_token_extent),
-                            group_token_capacity=int(
-                                position.group_token_capacity
-                            ),
+                            group_token_capacity=int(position.group_token_capacity),
                             payload_kind=IntegrityPayloadKind.COMMIT,
                             byte_length=chunk_bytes,
                         )
@@ -2963,9 +2940,7 @@ class NixlBaseConnectorWorker:
                 "first_operation_in_start_load_kv_before_new_dma_or_forward",
             )
             plan_remote_request = str(plan["producer_request_id"])
-            is_trace = (
-                self._localization_config.mode is LocalizationMode.TRACE
-            )
+            is_trace = self._localization_config.mode is LocalizationMode.TRACE
             self._localization_record_event(
                 code=("VERIFIED_PRE_READ" if is_trace else "SHAM_PRE_READ_COMPLETE"),
                 evidentiary=is_trace,
@@ -3029,7 +3004,10 @@ class NixlBaseConnectorWorker:
     # ------------------------------------------------------------------
 
     def _staging_init(self) -> bool:
-        """Lazily allocate and NIXL-register the staging buffer."""
+        """Lazily allocate and NIXL-register the staging buffer.
+
+        :returns: Whether staging is initialized and available.
+        """
         if self._staging_buf is not None:
             return True
         size = self.coalesce_staging_mb * 1024 * 1024
@@ -3041,37 +3019,246 @@ class NixlBaseConnectorWorker:
                 self.nixl_memory_type,
             )
         except Exception:
-            logger.exception("coalesced pull: staging init failed; disabling")
+            logger.error(
+                "coalesced pull: staging init failed; disabling\n%s",
+                traceback.format_exc(),
+            )
             self.coalesce_pull = False
             self._staging_buf = None
             return False
-        self._staging_free = [(0, size)]
-        logger.info("coalesced pull: %sMB staging registered",
-                    self.coalesce_staging_mb)
+        self._staging_allocator = StagingRangeAllocator(size)
+        logger.info("coalesced pull: %sMB staging registered", self.coalesce_staging_mb)
         return True
 
-    def _staging_alloc(self, need: int) -> int | None:
-        """First-fit allocation from the staging free list."""
-        for i, (off, size) in enumerate(self._staging_free):
-            if size >= need:
-                if size == need:
-                    self._staging_free.pop(i)
-                else:
-                    self._staging_free[i] = (off + need, size - need)
-                return off
-        return None
+    def _create_coalesced_plan(
+        self,
+        req_id: ReqId,
+        size: int,
+        source_ranks: tuple[int, ...],
+        remote_engine_id: EngineId,
+        scatter: dict[str, Any],
+    ) -> CoalescedStagingPlan | None:
+        """Atomically allocate staging and install its native owner.
 
-    def _staging_release(self, off: int, size: int) -> None:
-        """Return a range to the free list, merging neighbors."""
-        self._staging_free.append((off, size))
-        self._staging_free.sort()
-        merged: list[tuple[int, int]] = []
-        for o, s in self._staging_free:
-            if merged and merged[-1][0] + merged[-1][1] == o:
-                merged[-1] = (merged[-1][0], merged[-1][1] + s)
+        :param req_id: Decoder request identifier.
+        :param size: Required staging bytes.
+        :param source_ranks: Complete set of independently posted ranks.
+        :param remote_engine_id: Remote engine owning the source registration.
+        :param scatter: Transfer and placement geometry retained by the plan.
+        :returns: Installed plan, or ``None`` when the pool is busy.
+        """
+        if self._staging_allocator is None:
+            raise StagingSafetyError("coalesced staging allocator is not initialized")
+        if req_id in self._coalesce_plans:
+            raise StagingSafetyError(f"request {req_id} already owns staging")
+        if len(remote_engine_id) == 0:
+            raise StagingSafetyError("coalesced staging requires a remote engine")
+        owner_id = f"{self.engine_id}:{self.tp_rank}:{self._coalesce_owner_sequence}"
+        self._coalesce_owner_sequence += 1
+        plan = self._staging_allocator.create_plan(
+            owner_id=owner_id,
+            request_id=req_id,
+            size=size,
+            source_ranks=source_ranks,
+            remote_engine_id=remote_engine_id,
+            scatter=scatter,
+            warn_after_s=self._coalesce_warn_after_s,
+            fail_after_s=self._coalesce_fail_after_s,
+        )
+        if plan is not None:
+            self._coalesce_plans[req_id] = plan
+        return plan
+
+    def _release_coalesced_plan(self, plan: CoalescedStagingPlan) -> None:
+        """Release one plan only after its complete quiescence proof.
+
+        :param plan: Exact active plan to reclaim.
+        """
+        if self._staging_allocator is None:
+            raise StagingSafetyError("coalesced staging allocator disappeared")
+        if self._coalesce_plans.get(plan.request_id) is not plan:
+            raise StagingSafetyError("coalesced staging request owner mismatch")
+        self._staging_allocator.release(plan)
+        del self._coalesce_plans[plan.request_id]
+
+    def _initialize_and_post_coalesced(
+        self,
+        plan: CoalescedStagingPlan,
+        source_rank: int,
+        local_descs: Any,
+        remote_descs: Any,
+        remote_agent: str,
+        notification_id: bytes,
+    ) -> None:
+        """Prepare, attach, and post one rank without losing native ownership.
+
+        :param plan: Owner installed before native preparation.
+        :param source_rank: Producer rank being posted.
+        :param local_descs: NIXL local descriptor list.
+        :param remote_descs: NIXL remote descriptor list.
+        :param remote_agent: NIXL remote agent identity.
+        :param notification_id: Completion notification payload.
+        """
+        try:
+            handle = self.nixl_wrapper.initialize_xfer(
+                "READ",
+                local_descs,
+                remote_descs,
+                remote_agent,
+                notification_id,
+            )
+            plan.attach_handle(source_rank, handle)
+        except Exception as error:
+            stacktrace = traceback.format_exc()
+            if plan.slots[source_rank].state is HandleState.PREPARING:
+                plan.record_prepare_failure(
+                    source_rank,
+                    f"rank {source_rank} native preparation raised\n{stacktrace}",
+                )
             else:
-                merged.append((o, s))
-        self._staging_free = merged
+                plan.tombstone(
+                    f"rank {source_rank} preparation transition failed\n{stacktrace}"
+                )
+            self._fail_coalesced_plan(
+                plan,
+                f"rank {source_rank} native preparation raised\n{stacktrace}",
+                error,
+            )
+
+        try:
+            plan.begin_post(source_rank)
+            status = self.nixl_wrapper.transfer(handle)
+            plan.record_post_result(source_rank, status)
+        except Exception as error:
+            stacktrace = traceback.format_exc()
+            slot = plan.slots[source_rank]
+            if slot.state is HandleState.POSTING:
+                plan.record_post_exception(
+                    source_rank,
+                    f"rank {source_rank} native post raised\n{stacktrace}",
+                )
+            elif slot.state is HandleState.PREPARED:
+                plan.fail(f"rank {source_rank} failed before native post\n{stacktrace}")
+            else:
+                plan.tombstone(
+                    f"rank {source_rank} post transition failed in "
+                    f"state {slot.state}\n{stacktrace}"
+                )
+            self._fail_coalesced_plan(
+                plan,
+                f"rank {source_rank} native post raised\n{stacktrace}",
+                error,
+            )
+
+        if plan.operation_failed:
+            self._fail_coalesced_plan(
+                plan,
+                plan.failure_reason or "native post failed",
+            )
+
+    def _fail_coalesced_plan(
+        self,
+        plan: CoalescedStagingPlan,
+        reason: str,
+        error: BaseException | None = None,
+    ) -> Never:
+        """Tombstone a plan and fail the decoder before publication.
+
+        :param plan: Plan whose safety proof failed.
+        :param reason: Stable failure detail.
+        :param error: Native exception, if one was raised.
+        :raises StagingSafetyError: Always, after retaining the plan and handles.
+        """
+        plan.fail(reason)
+        if plan.posting_sealed is False:
+            plan.seal_posting()
+        logger.error(
+            "coalesced staging fail-stop: %s reason=%s",
+            plan.describe(),
+            reason,
+            exc_info=error is not None,
+        )
+        failure = StagingSafetyError(
+            f"coalesced staging safety proof failed: {plan.describe()} reason={reason}"
+        )
+        if error is None:
+            raise failure
+        raise failure from error
+
+    def _poll_coalesced_plans(self) -> set[ReqId]:
+        """Poll coalesced owners without releasing any possible writer.
+
+        :returns: Requests whose every native handle authoritatively reached DONE.
+        """
+        done_req_ids: set[ReqId] = set()
+        now = time.monotonic()
+        for plan in tuple(self._coalesce_plans.values()):
+            if plan.warning_due(now):
+                logger.error("coalesced staging still active: %s", plan.describe(now))
+                plan.mark_warning_emitted()
+            if plan.operation_failed:
+                self._fail_coalesced_plan(
+                    plan,
+                    plan.failure_reason or "coalesced operation failed",
+                )
+            for source_rank, slot in plan.slots.items():
+                if slot.state is HandleState.PROC:
+                    if slot.native_handle is None:
+                        plan.tombstone(f"rank {source_rank} lost its native handle")
+                        self._fail_coalesced_plan(
+                            plan,
+                            f"rank {source_rank} lost its native handle",
+                        )
+                    try:
+                        status = self.nixl_wrapper.check_xfer_state(slot.native_handle)
+                    except Exception as error:
+                        stacktrace = traceback.format_exc()
+                        plan.record_query_exception(
+                            source_rank,
+                            f"rank {source_rank} status query raised\n{stacktrace}",
+                        )
+                        self._fail_coalesced_plan(
+                            plan,
+                            f"rank {source_rank} status query raised\n{stacktrace}",
+                            error,
+                        )
+                    plan.record_query_result(source_rank, status)
+                if slot.state in {HandleState.ERR, HandleState.UNKNOWN}:
+                    self._fail_coalesced_plan(
+                        plan,
+                        f"rank {source_rank} status became {slot.state.value}",
+                    )
+                if slot.state is not HandleState.DONE or slot.native_released:
+                    continue
+                if slot.native_handle is None:
+                    self._fail_coalesced_plan(
+                        plan,
+                        f"rank {source_rank} DONE state lost its native handle",
+                    )
+                try:
+                    telemetry = self.nixl_wrapper.get_xfer_telemetry(slot.native_handle)
+                    self.xfer_stats.record_transfer(telemetry)
+                    self.nixl_wrapper.release_xfer_handle(slot.native_handle)
+                except Exception:
+                    logger.error(
+                        "DONE handle cleanup failed for coalesced plan %s rank %s; "
+                        "retaining the terminal handle\n%s",
+                        plan.lease.owner_id,
+                        source_rank,
+                        traceback.format_exc(),
+                    )
+                else:
+                    plan.mark_native_released(source_rank)
+
+            if plan.fail_deadline_expired(now):
+                plan.tombstone("native transfer exceeded the fail-stop deadline")
+                self._fail_coalesced_plan(
+                    plan,
+                    "native transfer exceeded the fail-stop deadline",
+                )
+            if plan.ready_to_scatter:
+                done_req_ids.add(plan.request_id)
+        return done_req_ids
 
     def _sp_group_flags(self) -> list[bool]:
         """Per-KV-cache-group single-plane flags (F2b: kv_planes==1
@@ -3082,12 +3269,6 @@ class NixlBaseConnectorWorker:
                 for g in self.kv_cache_config.kv_cache_groups
             ]
         return self._sp_flags_cache
-
-    def _coalesce_drop_plan(self, req_id: ReqId) -> None:
-        """Free a request's staging without scattering (failure path)."""
-        plan = self._coalesce_plans.pop(req_id, None)
-        if plan is not None:
-            self._staging_release(plan["off"], plan["size"])
 
     def _coalesce_region_rows(self) -> bool:
         """Canonicalize every region tensor to a (num_blocks, row_bytes)
@@ -3106,15 +3287,20 @@ class NixlBaseConnectorWorker:
                 logger.warning(
                     "coalesced pull: region %s not canonicalizable "
                     "(shape %s strides %s); disabling",
-                    i, tuple(cache.shape), tuple(cache.stride()))
+                    i,
+                    tuple(cache.shape),
+                    tuple(cache.stride()),
+                )
                 self.coalesce_pull = False
                 return False
             flat = phys.view(torch.uint8).view(phys.shape[0], -1)
             if flat.shape[1] != self.block_len_per_layer[i]:
                 logger.warning(
-                    "coalesced pull: region %s row bytes %s != block_len "
-                    "%s; disabling", i, flat.shape[1],
-                    self.block_len_per_layer[i])
+                    "coalesced pull: region %s row bytes %s != block_len %s; disabling",
+                    i,
+                    flat.shape[1],
+                    self.block_len_per_layer[i],
+                )
                 self.coalesce_pull = False
                 return False
             rows.append(flat)
@@ -3122,16 +3308,20 @@ class NixlBaseConnectorWorker:
         return True
 
     def _coalesced_scatter(self, req_id: ReqId) -> None:
-        """Distribute a completed request's staged KV into the real
-        cache: per (region, shard) one strided-view copy, staging
-        (n_pos, K/V, chunk) -> cache rows [K: slots 0..R-1 | V: slots
-        0..R-1] at the shard's slot. Runs on the current stream, so it
-        is ordered before any later attention over these blocks --
-        same contract as the existing post-receive processing."""
-        plan = self._coalesce_plans.pop(req_id, None)
+        """Scatter one completed staging generation into the destination cache.
+
+        The device-wide completion fence proves that asynchronous scatter reads
+        no longer touch staging before its lease is returned to the allocator.
+
+        :param req_id: Decoder request whose completed generation should scatter.
+        """
+        plan = self._coalesce_plans.get(req_id)
         if plan is None:
             return
-        scattered = False
+        geometry = plan.scatter
+        plan.begin_device_read()
+        scatter_error: BaseException | None = None
+        scatter_traceback: str | None = None
         try:
             assert self._staging_buf is not None
             assert self._region_rows is not None
@@ -3150,30 +3340,31 @@ class NixlBaseConnectorWorker:
                     IntegrityStage.STAGING_FENCED_CONTROL,
                     "device_synchronize_observer_control_not_gdr_flush",
                 )
-            idx = torch.tensor(plan["lpos"], device=self._staging_buf.device,
-                               dtype=torch.long)
-            n_pos, n_ranks = plan["n_pos"], plan["n_ranks"]
-            halves = plan.get("sp_half")
+            idx = torch.tensor(
+                geometry["lpos"], device=self._staging_buf.device, dtype=torch.long
+            )
+            n_pos, n_ranks = geometry["n_pos"], geometry["n_ranks"]
+            halves = geometry.get("sp_half")
             hv = None
             if halves is not None and any(h >= 0 for h in halves):
-                hv = torch.tensor(halves,
-                                  device=self._staging_buf.device,
-                                  dtype=torch.long)
+                hv = torch.tensor(
+                    halves, device=self._staging_buf.device, dtype=torch.long
+                )
                 dual_m = hv < 0
                 sp_m = ~dual_m
                 idx_d = idx[dual_m]
                 idx_s = idx[sp_m]
                 h_s = hv[sp_m]
             for i, flat in enumerate(self._region_rows):
-                blen = plan["blens"][i]
+                blen = geometry["blens"][i]
                 chunk = blen // 2
-                base = plan["off"] + plan["region_off"][i]
-                reg = self._staging_buf[base:base + n_ranks * n_pos * blen]
+                base = plan.lease.offset + geometry["region_off"][i]
+                reg = self._staging_buf[base : base + n_ranks * n_pos * blen]
                 reg = reg.view(n_ranks, n_pos, 2, chunk)
                 dest = flat.view(flat.shape[0], 2, n_ranks, chunk)
                 if hv is None:
                     for r in range(n_ranks):
-                        dest[:, :, plan["slots"][r], :][idx] = reg[r]
+                        dest[:, :, geometry["slots"][r], :][idx] = reg[r]
                     continue
                 # F2b: single-plane positions carry (local row, half);
                 # the row layout is (rank-shard, halves of 64 tok, K
@@ -3181,33 +3372,70 @@ class NixlBaseConnectorWorker:
                 # keep the standard (K/V, rank-shard, chunk) write.
                 dest_sp = flat.view(flat.shape[0], n_ranks, 2, chunk)
                 for r in range(n_ranks):
-                    sl = plan["slots"][r]
+                    sl = geometry["slots"][r]
                     if idx_d.numel():
                         dest[:, :, sl, :][idx_d] = reg[r][dual_m]
                     if idx_s.numel():
                         dest_sp[idx_s, sl, h_s] = reg[r][sp_m][:, 0]
-            if self._audit_enabled and plan.get("audit_rows"):
+            if self._audit_enabled and geometry.get("audit_rows"):
                 self._audit_pending.append(
-                    (req_id, plan["audit_rows"], plan["lpos"])
+                    (req_id, geometry["audit_rows"], geometry["lpos"])
                 )
-            scattered = True
-        finally:
-            # The scatter kernels read staging asynchronously while UCX
-            # writes for the NEXT user of this range are not
-            # stream-ordered: the range must not be reused until the
-            # copies have executed. (Future: event-deferred free list.)
-            try:
-                torch.cuda.synchronize()
-                if scattered and self._localization_config.enabled:
-                    self._localization_capture_destination(
-                        req_id,
-                        plan,
-                        IntegrityStage.DESTINATION,
-                        "post_scatter_device_synchronize_before_publication",
-                    )
-                    self._localization_pre_read_plans[req_id] = plan
-            finally:
-                self._staging_release(plan["off"], plan["size"])
+        except Exception as error:
+            scatter_error = error
+            scatter_traceback = traceback.format_exc()
+
+        # NIXL writers are quiescent at this point, but the CUDA scatter reads
+        # staging asynchronously. A failed synchronization is not a release
+        # fence and must leave the allocation permanently owned.
+        try:
+            torch.cuda.synchronize()
+        except Exception as error:
+            stacktrace = traceback.format_exc()
+            reason = (
+                "device synchronization failed after staging readers began\n"
+                + stacktrace
+            )
+            plan.tombstone(reason)
+            self._fail_coalesced_plan(
+                plan,
+                reason,
+                error,
+            )
+        plan.mark_device_quiescent()
+
+        if scatter_error is not None:
+            plan.fail("staging scatter failed before publication")
+            self._release_coalesced_plan(plan)
+            logger.error(
+                "coalesced staging scatter failed after safe device quiescence: %s\n%s",
+                plan.describe(),
+                scatter_traceback,
+            )
+            raise StagingSafetyError(
+                "coalesced staging scatter failed before scheduler publication"
+            ) from scatter_error
+
+        try:
+            if self._localization_config.enabled:
+                self._localization_capture_destination(
+                    req_id,
+                    geometry,
+                    IntegrityStage.DESTINATION,
+                    "post_scatter_device_synchronize_before_publication",
+                )
+                self._localization_pre_read_plans[req_id] = geometry
+        except Exception as error:
+            stacktrace = traceback.format_exc()
+            reason = "destination observation failed before publication\n" + stacktrace
+            plan.fail(reason)
+            self._release_coalesced_plan(plan)
+            raise StagingSafetyError(
+                "coalesced destination observation failed before publication\n"
+                + stacktrace
+            ) from error
+
+        self._release_coalesced_plan(plan)
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         """
@@ -3218,6 +3446,7 @@ class NixlBaseConnectorWorker:
         assert self.transfer_topo is not None
         done_sending = self._get_new_notifs()
         done_recving = self._pop_done_transfers(self._recving_transfers)
+        done_recving.update(self._poll_coalesced_plans())
 
         # Drain queue of requests where handshake or transfer setup failed.
         failed_recv_reqs = set[ReqId]()
@@ -3349,22 +3578,16 @@ class NixlBaseConnectorWorker:
             for agents in self._remote_agents.values():
                 for agent in agents.values():
                     try:
-                        self.nixl_wrapper.send_notif(
-                            agent, notif_msg=expired_msg
-                        )
+                        self.nixl_wrapper.send_notif(agent, notif_msg=expired_msg)
                     except Exception:
                         logger.exception(
                             "Failed to send expiry notification for request %s",
                             req_id,
                         )
-            grace = float(
-                os.environ.get("VLLM_GEMMA4_KV_FREE_GRACE_S", "5")
-            )
+            grace = float(os.environ.get("VLLM_GEMMA4_KV_FREE_GRACE_S", "5"))
             self._grace_frees[req_id] = now + grace
         # Drain grace-held frees whose window elapsed.
-        for req_id in [
-            r for r, t in self._grace_frees.items() if now >= t
-        ]:
+        for req_id in [r for r, t in self._grace_frees.items() if now >= t]:
             self._localization_capture_source_post(req_id)
             del self._grace_frees[req_id]
             done_sending.add(req_id)
@@ -3389,9 +3612,7 @@ class NixlBaseConnectorWorker:
         owning group's regions additionally detect decode-side ones."""
         if self._audit_regions is not None:
             return self._audit_regions
-        base_to_region = {
-            t.data_ptr(): i for i, t in enumerate(self._region_tensors)
-        }
+        base_to_region = {t.data_ptr(): i for i, t in enumerate(self._region_tensors)}
         regs: set[int] = {0} if self._region_tensors else set()
         groups = self.kv_cache_config.kv_cache_groups
         for gi in sorted(self._audit_groups):
@@ -3503,9 +3724,7 @@ class NixlBaseConnectorWorker:
                         rows_taken[:8],
                     )
                     self._audit_drop(old_rid, alive=True)
-                rows_t = torch.tensor(
-                    sorted(set(arows)), device=dev, dtype=torch.long
-                )
+                rows_t = torch.tensor(sorted(set(arows)), device=dev, dtype=torch.long)
                 self._audit_state[req_id] = {
                     "rows": rows_t,
                     "sums": self._audit_checksum(rows_t),
@@ -3542,9 +3761,7 @@ class NixlBaseConnectorWorker:
             idx = bad.nonzero().flatten()[:8]
             rows = st["rows"][idx].tolist()
             owners = {p: self._audit_row_owner.get(p) for p in rows}
-            regions_hit = (
-                (cur[:, idx] != st["sums"][:, idx]).sum(dim=1).tolist()
-            )
+            regions_hit = (cur[:, idx] != st["sums"][:, idx]).sum(dim=1).tolist()
             logger.error(
                 "[kv-audit] MISMATCH req=%s rows_bad=%d/%d first=%s "
                 "region_hit_counts=%s owners=%s age=%.1fs step=%d",
@@ -3588,8 +3805,7 @@ class NixlBaseConnectorWorker:
         raise NotImplementedError
 
     def _mark_rid_released(self, rid: str) -> None:
-        import time as _t
-        self._released_rids[rid] = _t.perf_counter()
+        self._released_rids[rid] = time.perf_counter()
         if len(self._released_rids) > 8192:
             for k in list(self._released_rids)[:2048]:
                 del self._released_rids[k]
@@ -3690,8 +3906,6 @@ class NixlBaseConnectorWorker:
         if meta is not None and not self._is_hma_required:
             self._invalid_block_ids.put(set(meta.local_block_ids[0]))
         self._failed_recv_reqs.put(req_id)
-        # coalesced pull: free the staging range, skip the scatter
-        self._coalesce_drop_plan(req_id)
         if handle is not None:
             self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
@@ -3808,7 +4022,9 @@ class NixlBaseConnectorWorker:
                     logger.info(
                         "[prefix-trim] group=%s len_local=%d len_remote=%d "
                         "keep=%d first_local=%s first_remote=%s",
-                        i, num_local_blocks, len(remote_group),
+                        i,
+                        num_local_blocks,
+                        len(remote_group),
                         num_keep,
                         local_block_ids[i][:2] if num_local_blocks else [],
                         remote_group[:2],
@@ -3976,9 +4192,9 @@ class NixlBaseConnectorWorker:
         prevents us from using background threads, though memory usage is not guaranteed
         to be "optimal" until a new handshake is performed.
 
-        Engines with active transfers or pending handshakes cannot be stale:
-        - Active transfers touch _engine_last_active in start_load_kv.
-        - Pending handshakes don't have an _engine_last_active entry yet
+        Pending handshakes do not have an ``_engine_last_active`` entry yet.
+        Coalesced owners are checked explicitly because a long-running native
+        transfer can outlive the last start-time activity update.
         """
         # NOTE (NickLucche): This does NOT currently prevent OOMing if a huge number
         # of remote engines is registered all at once (adding a background cleanup
@@ -3989,6 +4205,18 @@ class NixlBaseConnectorWorker:
 
         now = time.perf_counter()
         for eid, last_active in list(self._engine_last_active.items()):
+            active_plans = [
+                plan
+                for plan in self._coalesce_plans.values()
+                if plan.remote_engine_id == eid
+            ]
+            if len(active_plans) > 0:
+                self._engine_last_active[eid] = now
+                logger.warning(
+                    "Skipping remote-engine eviction while staging is owned: %s",
+                    "; ".join(plan.describe(now) for plan in active_plans),
+                )
+                continue
             if now - last_active > self._engine_ttl:
                 self._cleanup_remote_engine(eid)
 
@@ -4002,6 +4230,16 @@ class NixlBaseConnectorWorker:
         shutdown.
         """
         assert engine_id in self._remote_agents
+        unsafe_plans = [
+            plan
+            for plan in self._coalesce_plans.values()
+            if plan.remote_engine_id == engine_id and plan.reusable is False
+        ]
+        if len(unsafe_plans) > 0:
+            raise StagingSafetyError(
+                "remote-engine cleanup would release resources with live staging "
+                + "; ".join(plan.describe() for plan in unsafe_plans)
+            )
 
         for handle in self.dst_xfer_side_handles.pop(engine_id).values():
             self.nixl_wrapper.release_dlist_handle(handle)
@@ -4025,14 +4263,28 @@ class NixlBaseConnectorWorker:
                 time.perf_counter() - last_active,
             )
 
-    def __del__(self):
-        self.shutdown()
+    def __del__(self) -> None:
+        try:
+            self.shutdown()
+        except StagingSafetyError:
+            logger.critical(
+                "Refusing in-process NIXL teardown with unresolved staging ownership",
+                exc_info=True,
+            )
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """Shutdown the connector worker."""
         if not hasattr(self, "_handshake_initiation_executor"):
             # error happens during init, no need to shutdown
             return
+        unsafe_plans = [
+            plan for plan in self._coalesce_plans.values() if plan.reusable is False
+        ]
+        if len(unsafe_plans) > 0:
+            raise StagingSafetyError(
+                "in-process shutdown cannot quiesce coalesced staging: "
+                + "; ".join(plan.describe() for plan in unsafe_plans)
+            )
         if self._localization_writer is not None:
             self._localization_writer.close()
             self._localization_writer = None

@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pull-specific (READ) worker-side logic for the NIXL connector."""
 
+import os
 import time
+import traceback
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -61,9 +63,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         """
         self._localization_capture_pre_read(metadata.reqs_in_batch)
         self._audit_retire(metadata)
-        self._localization_capture_source_rosters(
-            metadata.source_integrity_rosters
-        )
+        self._localization_capture_source_rosters(metadata.source_integrity_rosters)
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
@@ -109,22 +109,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         for req_id in metadata.reqs_not_processed:
             self._reqs_to_process.discard(req_id)
             waiting_meta = self._localization_waiting.get(req_id)
-            waiting_remote = (
-                waiting_meta.remote if waiting_meta is not None else None
-            )
+            waiting_remote = waiting_meta.remote if waiting_meta is not None else None
             self._localization_record_event(
                 code="REQUEST_ABORTED",
                 evidentiary=False,
                 child_request_id=req_id,
                 producer_engine_id=(
-                    waiting_remote.engine_id
-                    if waiting_remote is not None
-                    else None
+                    waiting_remote.engine_id if waiting_remote is not None else None
                 ),
                 producer_request_id=(
-                    waiting_remote.request_id
-                    if waiting_remote is not None
-                    else None
+                    waiting_remote.request_id if waiting_remote is not None else None
                 ),
                 detail="request aborted before verified pre-read",
             )
@@ -160,28 +154,28 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             and sum(len(group) for group in meta.local_physical_block_ids) == 0
         ):
             if self._localization_writer is None:
-                raise LocalizationError(
-                    "enabled localization has no artifact writer"
-                )
+                raise LocalizationError("enabled localization has no artifact writer")
             if req_id not in self._localization_zero_recorded:
-                self._localization_writer.write(NixlEventRecord(
-                    record_type=NixlEventRecord.RECORD_TYPE,
-                    schema_version=IntegrityIdentity.SCHEMA_VERSION,
-                    run_id=self._localization_config.run_id,
-                    transport_arm=self._localization_config.transport_arm,
-                    code="NON_EVIDENTIARY_ZERO_BYTE",
-                    evidentiary=False,
-                    producer_engine_id=meta.remote.engine_id,
-                    producer_request_id=meta.remote.request_id,
-                    child_request_id=req_id,
-                    observer_engine_id=self.engine_id,
-                    observer_rank=self.tp_rank,
-                    detail=(
-                        "full-prefix hits require prior VERIFIED provenance and "
-                        "are excluded from this localization protocol"
-                    ),
-                    created_ns=time.time_ns(),
-                ))
+                self._localization_writer.write(
+                    NixlEventRecord(
+                        record_type=NixlEventRecord.RECORD_TYPE,
+                        schema_version=IntegrityIdentity.SCHEMA_VERSION,
+                        run_id=self._localization_config.run_id,
+                        transport_arm=self._localization_config.transport_arm,
+                        code="NON_EVIDENTIARY_ZERO_BYTE",
+                        evidentiary=False,
+                        producer_engine_id=meta.remote.engine_id,
+                        producer_request_id=meta.remote.request_id,
+                        child_request_id=req_id,
+                        observer_engine_id=self.engine_id,
+                        observer_rank=self.tp_rank,
+                        detail=(
+                            "full-prefix hits require prior VERIFIED provenance and "
+                            "are excluded from this localization protocol"
+                        ),
+                        created_ns=time.time_ns(),
+                    )
+                )
                 self._localization_zero_recorded.add(req_id)
                 self._localization_terminal_recorded.add(req_id)
             if self._localization_config.strict_zero_byte:
@@ -190,11 +184,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     "strict localization mode"
                 )
 
-        if self._localization_source_gate(
-            req_id,
-            meta,
-            tuple(int(rank) for rank in plan.all_source_ranks),
-        ) is False:
+        if (
+            self._localization_source_gate(
+                req_id,
+                meta,
+                tuple(int(rank) for rank in plan.all_source_ranks),
+            )
+            is False
+        ):
             return
 
         if (
@@ -268,7 +265,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 self._coalesce_pending.append((req_id, meta, read_specs))
                 logger.debug(
                     "coalesced pull: parked %s for staging (%s queued)",
-                    req_id, len(self._coalesce_pending))
+                    req_id,
+                    len(self._coalesce_pending),
+                )
                 return
 
         if (
@@ -288,8 +287,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             logger.error(
                 "coalesced pull unavailable for %s (sp_groups=%s "
                 "no_stock_dma=%s); failing the request instead of the "
-                "stock path.", req_id, any(self._sp_group_flags()),
-                self._no_stock_dma())
+                "stock path.",
+                req_id,
+                any(self._sp_group_flags()),
+                self._no_stock_dma(),
+            )
             self._handle_failed_transfer(req_id, None)
             return
 
@@ -327,9 +329,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         if (
             len(required_ranks) == 0
             or len(set(required_ranks)) != len(required_ranks)
-            or any(
-                type(rank) is not int or rank < 0 for rank in required_ranks
-            )
+            or any(type(rank) is not int or rank < 0 for rank in required_ranks)
         ):
             raise LocalizationError(
                 f"request {req_id} has invalid required source ranks"
@@ -446,10 +446,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             req_id,
             remote.request_id,
             required_ranks,
-            tuple(
-                manifests[rank].manifest_digest.hex()
-                for rank in sorted(manifests)
-            ),
+            tuple(manifests[rank].manifest_digest.hex() for rank in sorted(manifests)),
         )
         return True
 
@@ -502,19 +499,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 )
             if manifest.block_ids != raw_remote_groups:
                 raise LocalizationError(
-                    f"request {req_id} source roster differs on rank "
-                    f"{spec.remote_rank}"
+                    f"request {req_id} source roster differs on rank {spec.remote_rank}"
                 )
             reference_manifest = manifests[read_specs[0].remote_rank]
             if (
-                manifest.valid_token_extent
-                != reference_manifest.valid_token_extent
+                manifest.valid_token_extent != reference_manifest.valid_token_extent
                 or manifest.group_token_capacities
                 != reference_manifest.group_token_capacities
                 or manifest.source_group_planes
                 != reference_manifest.source_group_planes
-                or len(manifest.group_token_capacities)
-                != len(destination_group_planes)
+                or len(manifest.group_token_capacities) != len(destination_group_planes)
             ):
                 raise LocalizationError(
                     f"request {req_id} source semantic extent differs on rank "
@@ -561,8 +555,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     if (
                         len(region.shape) == 0
                         or len(region.shape) != len(region.strides)
-                        or region.registered_bytes
-                        != region.shape[0] * region.row_bytes
+                        or region.registered_bytes != region.shape[0] * region.row_bytes
                         or region.strides[0] * region.element_size_bytes
                         != region.row_bytes
                     ):
@@ -572,17 +565,19 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         )
 
     def _no_stock_dma(self) -> bool:
-        # Default ON: the stock per-descriptor path silently corrupts
-        # local KV offsets past the NIXL/UCX large-offset defect
-        # threshold (block ids >= ~32768). A known-corrupt path must
-        # not be reachable by merely omitting an env var; set =0
-        # explicitly only for small-pool debugging.
-        import os as _os_ns
-        return _os_ns.environ.get(
-            "VLLM_GEMMA4_NIXL_NO_STOCK_DMA", "1") == "1"
+        """Return whether the known-corrupt stock DMA path is disabled.
 
-    def _stock_read_specs(self, req_id: str, meta: ReqMeta,
-                          read_specs: list[ReadSpec]) -> None:
+        Stock DMA is disabled by default because NIXL/UCX corrupts local KV
+        offsets beyond its large-offset threshold. Explicitly setting the
+        variable to ``0`` is reserved for controlled small-pool diagnosis.
+
+        :returns: Whether requests must fail instead of using stock DMA.
+        """
+        return os.environ.get("VLLM_GEMMA4_NIXL_NO_STOCK_DMA", "1") == "1"
+
+    def _stock_read_specs(
+        self, req_id: str, meta: ReqMeta, read_specs: list[ReadSpec]
+    ) -> None:
         """The stock per-descriptor pull for one request's read specs
         (extracted from _read_blocks_for_req so the pending-queue
         servicer can also route a request here)."""
@@ -645,14 +640,19 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     # Coalesced pull
     # ------------------------------------------------------------------
 
-    def _coalesce_gate(self, engine_id: str, tp_ratio: int,
-                       read_specs: list[ReadSpec]) -> bool:
+    def _coalesce_gate(
+        self, engine_id: str, tp_ratio: int, read_specs: list[ReadSpec]
+    ) -> bool:
         """All conditions under which the coalesced path is proven
         equivalent to the stock path. Anything else -> stock."""
         if not self.coalesce_pull:
             return False
-        if not (tp_ratio < 0 and not self.use_mla
-                and not self.use_host_buffer and not self._has_mamba):
+        if not (
+            tp_ratio < 0
+            and not self.use_mla
+            and not self.use_host_buffer
+            and not self._has_mamba
+        ):
             return False
         if self._physical_blocks_per_logical_kv_block != 1:
             return False
@@ -660,8 +660,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             return False
         assert self.transfer_topo is not None
         remote_info = self.transfer_topo.get_engine_info(engine_id)
-        if self.transfer_topo.block_size_ratio(
-                remote_info.remote_block_size) != 1:
+        if self.transfer_topo.block_size_ratio(remote_info.remote_block_size) != 1:
             return False
         layout = self._remote_layout.get(engine_id)
         if not layout or any(s.remote_rank not in layout for s in read_specs):
@@ -670,8 +669,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # (pure SPLIT full-attention groups)
         spec0 = read_specs[0]
         for s in read_specs[1:]:
-            if (s.local_block_ids != spec0.local_block_ids
-                    or s.remote_block_ids != spec0.remote_block_ids):
+            if (
+                s.local_block_ids != spec0.local_block_ids
+                or s.remote_block_ids != spec0.remote_block_ids
+            ):
                 return False
         blens = layout[spec0.remote_rank][0]
         if len(blens) != len(self._region_tensors):
@@ -700,19 +701,27 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 if self._localization_config.enabled or self._no_stock_dma():
                     logger.error(
                         "coalesced drain: %s not expressible; failing "
-                        "instead of the stock path.", req_id)
+                        "instead of the stock path.",
+                        req_id,
+                    )
                     self._handle_failed_transfer(req_id, None)
                     continue
                 self._stock_read_specs(req_id, meta, read_specs)
 
-    def _coalesced_read_request(self, req_id: str, meta: ReqMeta,
-                                read_specs: list[ReadSpec]) -> str:
-        """Whole-request coalesced pull: per remote rank, one READ xfer
-        of contiguous whole-block run descriptors into staging.
-        Returns "posted" (transfers in flight, or nothing to pull, or a
-        mid-post failure already routed through _handle_failed_transfer),
-        "defer" (staging exhausted but the request fits the pool: park
-        and retry), or "stock" (nothing posted; run the stock path)."""
+    def _coalesced_read_request(
+        self, req_id: str, meta: ReqMeta, read_specs: list[ReadSpec]
+    ) -> str:
+        """Post one whole-request READ per remote rank into owned staging.
+
+        Any failure after allocation raises :class:`StagingSafetyError` and
+        leaves uncertain native writers and their range owned until process
+        replacement.
+
+        :param req_id: Decoder request identifier.
+        :param meta: Complete transfer metadata.
+        :param read_specs: Per-source-rank transfer specifications.
+        :returns: ``posted``, ``defer``, or ``stock`` before native failure.
+        """
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
         remote_info = self.transfer_topo.get_engine_info(engine_id)
@@ -737,6 +746,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 try:
                     self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
                 except Exception:
+                    logger.error(
+                        "full-prefix release notification failed for %s rank %s\n%s",
+                        req_id,
+                        s.remote_rank,
+                        traceback.format_exc(),
+                    )
                     self.xfer_stats.record_failed_notification()
             self._localization_expected_by_request.pop(req_id, None)
             self._localization_manifest_deadlines.pop(req_id, None)
@@ -776,14 +791,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             source_position_l.append(
                 np.arange(source_start, source_start + len(rg), dtype=np.int64)
             )
-        lpos = (np.concatenate(lpos_l) if lpos_l
-                else np.zeros(0, dtype=np.int64))
-        rpos = (np.concatenate(rpos_l) if rpos_l
-                else np.zeros(0, dtype=np.int64))
-        halves = (np.concatenate(half_l) if half_l
-                  else np.zeros(0, dtype=np.int8))
-        group_ids = (np.concatenate(group_l) if group_l
-                     else np.zeros(0, dtype=np.int32))
+        lpos = np.concatenate(lpos_l) if lpos_l else np.zeros(0, dtype=np.int64)
+        rpos = np.concatenate(rpos_l) if rpos_l else np.zeros(0, dtype=np.int64)
+        halves = np.concatenate(half_l) if half_l else np.zeros(0, dtype=np.int8)
+        group_ids = np.concatenate(group_l) if group_l else np.zeros(0, dtype=np.int32)
         source_positions = (
             np.concatenate(source_position_l)
             if source_position_l
@@ -821,9 +832,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             raise LocalizationError("coalesced plan contains duplicate source ranks")
         if any(rank not in plan.rank_to_attention_slot for rank in source_ranks):
             raise LocalizationError("coalesced plan is missing a source-rank slot")
-        slots = [
-            int(plan.rank_to_attention_slot[rank]) for rank in source_ranks
-        ]
+        slots = [int(plan.rank_to_attention_slot[rank]) for rank in source_ranks]
         if sorted(slots) != list(range(n_ranks)):
             raise LocalizationError(
                 "coalesced source-rank slots must be a complete bijection"
@@ -839,9 +848,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     else 0
                 ),
                 group_token_capacity=(
-                    semantic_manifest.group_token_capacities[
-                        int(group_ids[index])
-                    ]
+                    semantic_manifest.group_token_capacities[int(group_ids[index])]
                     if semantic_manifest is not None
                     else 0
                 ),
@@ -876,136 +883,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         for i in range(n_regions):
             region_off[i] = acc
             acc += n_pos * n_ranks * blens[i]
-        off = self._staging_alloc(acc)
-        if off is None:
-            if acc > self.coalesce_staging_mb * 1024 * 1024:
-                # can never fit: the stock path is the only option
-                logger.warning(
-                    "coalesced pull: request %s needs %sMB staging "
-                    "(pool %sMB); stock path", req_id, acc >> 20,
-                    self.coalesce_staging_mb)
-                return "stock"
-            return "defer"
-
-        if self._localization_config.enabled:
-            if self._localization_writer is None:
-                raise LocalizationError(
-                    "enabled localization has no artifact writer"
-                )
-            self._localization_writer.write(
-                NixlPlanRecord(
-                    record_type=NixlPlanRecord.RECORD_TYPE,
-                    schema_version=IntegrityIdentity.SCHEMA_VERSION,
-                    run_id=self._localization_config.run_id,
-                    transport_arm=self._localization_config.transport_arm,
-                    producer_engine_id=engine_id,
-                    producer_request_id=meta.remote.request_id,
-                    registration_generations=tuple(
-                        self._remote_registration_generations[engine_id][
-                            int(spec.remote_rank)
-                        ]
-                        for spec in read_specs
-                    ),
-                    source_manifest_digests=tuple(
-                        self._localization_expected_by_request[req_id][
-                            int(spec.remote_rank)
-                        ].manifest_digest
-                        for spec in read_specs
-                    ),
-                    offer_generation=int(meta.remote.p2d_offer_generation),
-                    iteration=int(meta.remote.p2d_iteration),
-                    child_request_id=req_id,
-                    observer_engine_id=self.engine_id,
-                    observer_rank=self.tp_rank,
-                    source_ranks=source_ranks,
-                    rank_slots=tuple(int(slot) for slot in slots),
-                    rank_slot_contract=tuple(
-                        sorted(
-                            (
-                                int(rank),
-                                int(slot),
-                            )
-                            for rank, slot in (
-                                plan.rank_to_attention_slot.items()
-                            )
-                        )
-                    ),
-                    destination_group_planes=tuple(
-                        1 if flag else 2 for flag in sp_flags
-                    ),
-                    region_lengths=tuple(int(length) for length in blens),
-                    regions=tuple(
-                        self._remote_regions[engine_id][int(spec.remote_rank)]
-                        for spec in read_specs
-                    ),
-                    local_regions=self._region_descriptors,
-                    raw_remote_groups=raw_remote_groups,
-                    selected_remote_groups=tuple(
-                        tuple(int(block_id) for block_id in group)
-                        for group in remote_ids
-                    ),
-                    selected_local_groups=tuple(
-                        tuple(int(block_id) for block_id in group)
-                        for group in local_ids
-                    ),
-                    transfer_order=transfer_order,
-                    runs=tuple(runs),
-                    region_offsets=tuple(region_off),
-                    staging_offset=off,
-                    staging_size=acc,
-                )
-            )
-
-        assert self._staging_buf is not None
-        staging_base = self._staging_buf.data_ptr() + off
-        posted = False
-        try:
-            for ridx, s in enumerate(read_specs):
-                blens_r, _, rdev = self._remote_layout[engine_id][
-                    s.remote_rank]
-                assert blens_r == blens, "per-rank region layout mismatch"
-                rbases = self.kv_caches_base_addr[engine_id][s.remote_rank]
-                local_descs, remote_descs = [], []
-                for i in range(n_regions):
-                    base_i = (staging_base + region_off[i]
-                              + ridx * n_pos * blens[i])
-                    for (start, cnt, p0) in runs:
-                        ln = cnt * blens[i]
-                        local_descs.append(
-                            (base_i + p0 * blens[i], ln, self.device_id))
-                        remote_descs.append(
-                            (rbases[i] + start * blens[i], ln, rdev))
-                ld = self.nixl_wrapper.get_xfer_descs(
-                    local_descs, self.nixl_memory_type)
-                rd = self.nixl_wrapper.get_xfer_descs(
-                    remote_descs, self.nixl_memory_type)
-                agent = self._remote_agents[engine_id][s.remote_rank]
-                handle = self.nixl_wrapper.initialize_xfer(
-                    "READ", ld, rd, agent, notif_id)
-                self.nixl_wrapper.transfer(handle)
-                posted = True
-                self._recving_transfers[req_id].append(handle)
-        except Exception as e:
-            if not posted:
-                self._staging_release(off, acc)
-                logger.warning(
-                    "coalesced pull setup failed for %s (%s); stock path",
-                    req_id, e)
-                return "stock"
-            self._log_failure(
-                failure_type="transfer_setup_failed",
-                req_id=req_id,
-                msg="coalesced pull failed mid-post; marking blocks invalid",
-                error=e,
-                dst_engine_id=engine_id,
-            )
-            self._coalesce_plans[req_id] = dict(off=off, size=acc)
-            self._handle_failed_transfer(req_id, None)
-            return "posted"
-
-        self._coalesce_plans[req_id] = dict(
-            off=off, size=acc, n_pos=n_pos, n_ranks=n_ranks, blens=blens,
-            region_off=region_off, lpos=lpos.tolist(),
+        scatter_geometry: dict[str, object] = dict(
+            size=acc,
+            n_pos=n_pos,
+            n_ranks=n_ranks,
+            blens=blens,
+            region_off=region_off,
+            lpos=lpos.tolist(),
             sp_half=halves.tolist(),
             slots=slots,
             source_ranks=list(source_ranks),
@@ -1016,17 +900,153 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             iteration=meta.remote.p2d_iteration,
         )
         if self._audit_enabled:
-            # Immutable prompt rows for the auditor: audited groups
-            # (full-attention globals by default), minus each group's
-            # last rows (decode appends write there).
-            t = self._audit_tail_exclude
-            arows: list[int] = []
-            for gi in sorted(self._audit_groups):
-                if gi < len(local_ids) and not sp_flags[gi]:
-                    g = list(local_ids[gi])
-                    if len(g) > t:
-                        arows.extend(int(b) for b in g[:-t])
-            self._coalesce_plans[req_id]["audit_rows"] = arows
+            tail_exclude = self._audit_tail_exclude
+            audit_rows: list[int] = []
+            for group_index in sorted(self._audit_groups):
+                if group_index >= len(local_ids) or sp_flags[group_index]:
+                    continue
+                group_rows = list(local_ids[group_index])
+                if len(group_rows) > tail_exclude:
+                    audit_rows.extend(int(row) for row in group_rows[:-tail_exclude])
+            scatter_geometry["audit_rows"] = audit_rows
+        if acc > self.coalesce_staging_mb * 1024 * 1024:
+            logger.warning(
+                "coalesced pull: request %s needs %sMB staging (pool %sMB); stock path",
+                req_id,
+                acc >> 20,
+                self.coalesce_staging_mb,
+            )
+            return "stock"
+        ownership = self._create_coalesced_plan(
+            req_id,
+            acc,
+            source_ranks,
+            engine_id,
+            scatter_geometry,
+        )
+        if ownership is None:
+            return "defer"
+        off = ownership.lease.offset
+
+        if self._localization_config.enabled:
+            try:
+                if self._localization_writer is None:
+                    raise LocalizationError(
+                        "enabled localization has no artifact writer"
+                    )
+                self._localization_writer.write(
+                    NixlPlanRecord(
+                        record_type=NixlPlanRecord.RECORD_TYPE,
+                        schema_version=IntegrityIdentity.SCHEMA_VERSION,
+                        run_id=self._localization_config.run_id,
+                        transport_arm=self._localization_config.transport_arm,
+                        producer_engine_id=engine_id,
+                        producer_request_id=meta.remote.request_id,
+                        registration_generations=tuple(
+                            self._remote_registration_generations[engine_id][
+                                int(spec.remote_rank)
+                            ]
+                            for spec in read_specs
+                        ),
+                        source_manifest_digests=tuple(
+                            self._localization_expected_by_request[req_id][
+                                int(spec.remote_rank)
+                            ].manifest_digest
+                            for spec in read_specs
+                        ),
+                        offer_generation=int(meta.remote.p2d_offer_generation),
+                        iteration=int(meta.remote.p2d_iteration),
+                        child_request_id=req_id,
+                        observer_engine_id=self.engine_id,
+                        observer_rank=self.tp_rank,
+                        source_ranks=source_ranks,
+                        rank_slots=tuple(int(slot) for slot in slots),
+                        rank_slot_contract=tuple(
+                            sorted(
+                                (
+                                    int(rank),
+                                    int(slot),
+                                )
+                                for rank, slot in (plan.rank_to_attention_slot.items())
+                            )
+                        ),
+                        destination_group_planes=tuple(
+                            1 if flag else 2 for flag in sp_flags
+                        ),
+                        region_lengths=tuple(int(length) for length in blens),
+                        regions=tuple(
+                            self._remote_regions[engine_id][int(spec.remote_rank)]
+                            for spec in read_specs
+                        ),
+                        local_regions=self._region_descriptors,
+                        raw_remote_groups=raw_remote_groups,
+                        selected_remote_groups=tuple(
+                            tuple(int(block_id) for block_id in group)
+                            for group in remote_ids
+                        ),
+                        selected_local_groups=tuple(
+                            tuple(int(block_id) for block_id in group)
+                            for group in local_ids
+                        ),
+                        transfer_order=transfer_order,
+                        runs=tuple(runs),
+                        region_offsets=tuple(region_off),
+                        staging_offset=off,
+                        staging_size=acc,
+                    )
+                )
+            except Exception as error:
+                stacktrace = traceback.format_exc()
+                self._fail_coalesced_plan(
+                    ownership,
+                    "localization plan recording failed before native posting\n"
+                    + stacktrace,
+                    error,
+                )
+
+        assert self._staging_buf is not None
+        staging_base = self._staging_buf.data_ptr() + off
+        for ridx, s in enumerate(read_specs):
+            source_rank = int(s.remote_rank)
+            ownership.begin_prepare(source_rank)
+            try:
+                blens_r, _, rdev = self._remote_layout[engine_id][s.remote_rank]
+                assert blens_r == blens, "per-rank region layout mismatch"
+                rbases = self.kv_caches_base_addr[engine_id][s.remote_rank]
+                local_descs, remote_descs = [], []
+                for i in range(n_regions):
+                    base_i = staging_base + region_off[i] + ridx * n_pos * blens[i]
+                    for start, cnt, p0 in runs:
+                        ln = cnt * blens[i]
+                        local_descs.append((base_i + p0 * blens[i], ln, self.device_id))
+                        remote_descs.append((rbases[i] + start * blens[i], ln, rdev))
+                ld = self.nixl_wrapper.get_xfer_descs(
+                    local_descs, self.nixl_memory_type
+                )
+                rd = self.nixl_wrapper.get_xfer_descs(
+                    remote_descs, self.nixl_memory_type
+                )
+                agent = self._remote_agents[engine_id][s.remote_rank]
+            except Exception as error:
+                stacktrace = traceback.format_exc()
+                ownership.record_prepare_failure(
+                    source_rank,
+                    f"rank {source_rank} native preparation raised\n{stacktrace}",
+                )
+                self._fail_coalesced_plan(
+                    ownership,
+                    f"rank {source_rank} native preparation raised\n{stacktrace}",
+                    error,
+                )
+            self._initialize_and_post_coalesced(
+                ownership,
+                source_rank,
+                ld,
+                rd,
+                agent,
+                notif_id,
+            )
+        ownership.seal_posting()
         return "posted"
 
     def _read_blocks(
@@ -1197,10 +1217,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 # parked pull for it (in-flight ones are handled at
                 # completion by the release fence in get_finished).
                 if msg.startswith("EXPIRED:"):
-                    rid = msg[len("EXPIRED:"):]
-                    logger.warning(
-                        "Producer expired lease for %s; fencing.", rid
-                    )
+                    rid = msg[len("EXPIRED:") :]
+                    logger.warning("Producer expired lease for %s; fencing.", rid)
                     self._mark_rid_released(rid)
                     still_parked = []
                     for item in self._coalesce_pending:
@@ -1217,11 +1235,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     continue
 
                 parts = msg.rsplit(":", 2)
-                if (
-                    len(parts) == 3
-                    and parts[1].isdigit()
-                    and parts[2].isdigit()
-                ):
+                if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
                     req_id, tp_size, expected_s = parts
                     expected_consumers = int(expected_s)
                 else:

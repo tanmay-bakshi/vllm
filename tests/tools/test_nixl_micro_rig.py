@@ -1,4 +1,3 @@
-import ast
 import json
 import socket
 import struct
@@ -30,11 +29,6 @@ from tools.gemma4_pd.nixl_micro_rig.geometry import (
 from tools.gemma4_pd.nixl_micro_rig.integrity_check import (
     integrity_contract_self_test,
 )
-from tools.gemma4_pd.nixl_micro_rig.ownership import (
-    HandleState,
-    StagingGeneration,
-    StagingRangeAllocator,
-)
 from tools.gemma4_pd.nixl_micro_rig.protocol import (
     JsonChannel,
     PreparePayload,
@@ -44,6 +38,10 @@ from tools.gemma4_pd.nixl_micro_rig.protocol import (
 from tools.gemma4_pd.nixl_micro_rig.roles import (
     _prepared_descriptors,
     _staging_guard_ranges,
+)
+from vllm.distributed.kv_transfer.staging_ownership import (
+    StagingRangeAllocator,
+    StagingSafetyError,
 )
 
 CONFIG_PATH = (
@@ -537,118 +535,156 @@ def test_cuda_visibility_is_bound_to_preflighted_gpu_uuids() -> None:
 
 def test_partial_post_failure_never_reuses_live_staging_generation() -> None:
     allocator = StagingRangeAllocator(capacity=1024)
-    generation = allocator.reserve(generation=7, offset=0, size=512, rank_count=4)
-    assert not generation.reusable
-    with pytest.raises(RuntimeError, match="still has writers"):
-        generation.release()
-
-    generation.record_posted(
-        rank=0, initial_state=HandleState.DONE, native_handle_token="rank-0"
+    ownership = allocator.create_plan(
+        owner_id="plan-7",
+        request_id="request-7",
+        generation=7,
+        offset=0,
+        size=512,
+        source_ranks=(0, 1, 2, 3),
     )
-    generation.record_posted(
-        rank=1, initial_state=HandleState.PROC, native_handle_token="rank-1"
+    assert ownership is not None
+    for rank, status in ((0, "DONE"), (1, "PROC"), (2, "ERR")):
+        ownership.begin_prepare(rank)
+        ownership.attach_handle(rank, object())
+        ownership.begin_post(rank)
+        ownership.record_post_result(rank, status)
+    ownership.seal_posting()
+
+    assert ownership.operation_failed
+    assert ownership.permanently_tombstoned
+    assert not ownership.reusable
+    with pytest.raises(StagingSafetyError, match="not quiescent"):
+        allocator.release(ownership)
+    assert (
+        allocator.create_plan(
+            owner_id="plan-8",
+            request_id="request-8",
+            generation=8,
+            offset=0,
+            size=512,
+            source_ranks=(0, 1, 2, 3),
+        )
+        is None
     )
-    assert not generation.reusable
-    generation.record_posted(
-        rank=2, initial_state=HandleState.ERR, native_handle_token="rank-2"
-    )
-    generation.seal_posting()
 
-    assert generation.operation_failed
-    assert not generation.reusable
-    with pytest.raises(RuntimeError, match="still has writers"):
-        allocator.release(7)
-    with pytest.raises(RuntimeError, match="overlaps"):
-        allocator.reserve(generation=8, offset=0, size=512, rank_count=4)
-
-    generation.update(rank=1, state=HandleState.DONE)
-    assert not generation.reusable
-    generation.update(rank=2, state=HandleState.CANCEL_ACK)
-    assert generation.reusable
-    allocator.release(7)
-    assert generation.released
-
-    allocator.reserve(generation=8, offset=0, size=512, rank_count=4)
-    with pytest.raises(RuntimeError, match="late completion"):
-        allocator.require_active_writer(generation=7, rank=1)
+    ownership.record_query_result(1, "DONE")
+    assert not ownership.native_quiescent
+    assert not ownership.reusable
 
 
 def test_post_after_sealed_failure_boundary_is_rejected() -> None:
-    generation = StagingGeneration.create(generation=9, rank_count=4)
-    generation.record_posted(
-        rank=0, initial_state=HandleState.ERR, native_handle_token="rank-0"
+    allocator = StagingRangeAllocator(capacity=1024)
+    ownership = allocator.create_plan(
+        owner_id="plan-9",
+        request_id="request-9",
+        size=512,
+        source_ranks=(0, 1, 2, 3),
     )
-    generation.seal_posting()
+    assert ownership is not None
+    ownership.begin_prepare(0)
+    ownership.attach_handle(0, object())
+    ownership.begin_post(0)
+    ownership.record_post_result(0, "ERR")
+    ownership.seal_posting()
 
     with pytest.raises(RuntimeError, match="after sealing"):
-        generation.record_posted(
-            rank=1, initial_state=HandleState.PROC, native_handle_token="rank-1"
-        )
+        ownership.begin_prepare(1)
 
 
 def test_out_of_range_rank_cannot_extend_generation() -> None:
-    generation = StagingGeneration.create(generation=10, rank_count=4)
+    allocator = StagingRangeAllocator(capacity=1024)
+    ownership = allocator.create_plan(
+        owner_id="plan-10",
+        request_id="request-10",
+        size=512,
+        source_ranks=(0, 1, 2, 3),
+    )
+    assert ownership is not None
 
-    with pytest.raises(ValueError, match="outside"):
-        generation.record_posted(
-            rank=4,
-            initial_state=HandleState.PROC,
-            native_handle_token="rank-4",
+    with pytest.raises(ValueError, match="not owned"):
+        ownership.begin_prepare(4)
+
+
+def test_unknown_native_submission_remains_tombstoned_after_done() -> None:
+    allocator = StagingRangeAllocator(capacity=1024)
+    ownership = allocator.create_plan(
+        owner_id="plan-unknown",
+        request_id="request-unknown",
+        size=512,
+        source_ranks=(0,),
+    )
+    assert ownership is not None
+    ownership.begin_prepare(0)
+    ownership.attach_handle(0, object())
+    ownership.begin_post(0)
+    ownership.record_post_exception(0, "post raised")
+    ownership.seal_posting()
+
+    ownership.record_query_result(0, "DONE")
+    assert ownership.native_quiescent
+    assert not ownership.reusable
+    with pytest.raises(StagingSafetyError, match="not quiescent"):
+        allocator.release(ownership)
+
+
+def test_successful_generation_requires_device_quiescence_after_scatter() -> None:
+    allocator = StagingRangeAllocator(capacity=1024)
+    ownership = allocator.create_plan(
+        owner_id="plan-success",
+        request_id="request-success",
+        size=512,
+        source_ranks=(0, 1),
+    )
+    assert ownership is not None
+    for rank in ownership.slots:
+        ownership.begin_prepare(rank)
+        ownership.attach_handle(rank, object())
+        ownership.begin_post(rank)
+        ownership.record_post_result(rank, "DONE")
+    ownership.seal_posting()
+
+    assert ownership.ready_to_scatter
+    with pytest.raises(StagingSafetyError, match="no preceding device reader"):
+        ownership.mark_device_quiescent()
+    ownership.begin_device_read()
+    assert not ownership.reusable
+    ownership.mark_device_quiescent()
+    allocator.release(ownership)
+    assert ownership.released
+    with pytest.raises(StagingSafetyError, match="late completion"):
+        allocator.require_active(ownership.lease.generation)
+
+
+def test_invalid_plan_does_not_consume_allocator_capacity() -> None:
+    allocator = StagingRangeAllocator(capacity=1024)
+    with pytest.raises(ValueError, match="source_ranks"):
+        allocator.create_plan(
+            owner_id="invalid",
+            request_id="invalid",
+            size=512,
+            source_ranks=(),
         )
+    assert allocator.free_bytes == 1024
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="production drops coalesced staging on first ERR while a sibling is PROC",
-)
-def test_current_production_partial_post_release_is_safe() -> None:
-    source_path = (
-        Path(__file__).parents[2]
-        / "vllm"
-        / "distributed"
-        / "kv_transfer"
-        / "kv_connector"
-        / "v1"
-        / "nixl"
-        / "base_worker.py"
+def test_prepare_failure_is_quiescent_but_still_logically_failed() -> None:
+    allocator = StagingRangeAllocator(capacity=1024)
+    ownership = allocator.create_plan(
+        owner_id="prepare-failure",
+        request_id="prepare-failure",
+        size=512,
+        source_ranks=(0, 1),
     )
-    syntax = ast.parse(source_path.read_text(), filename=str(source_path))
-    method_node = next(
-        node
-        for node in ast.walk(syntax)
-        if isinstance(node, ast.FunctionDef) and node.name == "_coalesce_drop_plan"
-    )
-    method_node.decorator_list = []
-    module = ast.fix_missing_locations(ast.Module(body=[method_node], type_ignores=[]))
-    namespace: dict[str, object] = {"ReqId": str}
-    exec(compile(module, str(source_path), "exec"), namespace)
-    production_drop_plan = namespace["_coalesce_drop_plan"]
+    assert ownership is not None
+    ownership.begin_prepare(0)
+    ownership.record_prepare_failure(0, "prepare failed")
+    ownership.seal_posting()
 
-    class FakeWorker:
-        def __init__(self) -> None:
-            self._coalesce_plans = {"request": {"off": 128, "size": 256}}
-            self.released: list[tuple[int, int]] = []
-
-        def _staging_release(self, offset: int, size: int) -> None:
-            self.released.append((offset, size))
-
-    worker = FakeWorker()
-    sibling_state = HandleState.PROC
-    production_drop_plan(worker, "request")
-
-    assert not (len(worker.released) > 0 and sibling_state is HandleState.PROC)
-
-
-def test_unknown_native_submission_requires_terminal_or_cancel_ack() -> None:
-    generation = StagingGeneration.create(generation=8, rank_count=4)
-    generation.record_post_exception(rank=0, submission_token="submit-rank-0")
-    generation.seal_posting()
-
-    assert not generation.reusable
-    with pytest.raises(RuntimeError, match="still has writers"):
-        generation.release()
-    generation.update(rank=0, state=HandleState.CANCEL_ACK)
-    assert generation.reusable
+    assert ownership.operation_failed
+    assert ownership.permanently_tombstoned is False
+    assert ownership.native_quiescent
+    allocator.release(ownership)
 
 
 def test_protocol_round_trip_and_versioning() -> None:

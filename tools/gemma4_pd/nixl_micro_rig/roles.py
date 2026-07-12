@@ -41,10 +41,6 @@ from tools.gemma4_pd.nixl_micro_rig.geometry import (
     TransferPlan,
     build_configured_plan,
 )
-from tools.gemma4_pd.nixl_micro_rig.ownership import (
-    HandleState,
-    StagingRangeAllocator,
-)
 from tools.gemma4_pd.nixl_micro_rig.protocol import (
     CompletePayload,
     DigestRow,
@@ -55,6 +51,11 @@ from tools.gemma4_pd.nixl_micro_rig.protocol import (
     SourcePostPayload,
     StopPayload,
     StoppedPayload,
+)
+from vllm.distributed.kv_transfer.staging_ownership import (
+    HandleState,
+    StagingRangeAllocator,
+    StagingSafetyError,
 )
 
 _UCX_BACKEND = "UCX"
@@ -982,12 +983,19 @@ def run_consumer(
                         * 1024
                         * 1024
                     )
-                    ownership = allocator.reserve(
+                    ownership = allocator.create_plan(
+                        owner_id=f"rig:{global_iteration}",
+                        request_id=child_request_id,
                         generation=global_iteration,
                         offset=staging_offset,
                         size=plan.staging_bytes,
-                        rank_count=rank_count,
+                        source_ranks=tuple(range(rank_count)),
+                        remote_engine_id=f"micro-p-{run_id}",
                     )
+                    if ownership is None:
+                        raise StagingSafetyError(
+                            "configured staging generation overlaps a live owner"
+                        )
                     staging[staging_offset : staging_offset + plan.staging_bytes].fill_(
                         (0xA5 + global_iteration) & 0xFF
                     )
@@ -1013,13 +1021,11 @@ def run_consumer(
                     transfer_start.record()
                     transfer_start.synchronize()
                     saw_proc_during_victim = False
-                    failed = False
                     current_rank: int | None = None
-                    current_handle: nixl_xfer_handle | None = None
                     try:
                         for rank in range(rank_count):
                             current_rank = rank
-                            current_handle = None
+                            ownership.begin_prepare(rank)
                             local_raw, remote_raw = _raw_descriptors(
                                 config=config,
                                 plan=plan,
@@ -1039,76 +1045,100 @@ def run_consumer(
                                 notification_id,
                                 backends=[_UCX_BACKEND],
                             )
-                            current_handle = handle
                             handles.append(handle)
+                            ownership.attach_handle(rank, handle)
+                            ownership.begin_post(rank)
                             status = agent.transfer(handle)
-                            state = HandleState(status.lower())
-                            ownership.record_posted(
-                                rank,
-                                state,
-                                native_handle_token=repr(handle),
-                            )
+                            ownership.record_post_result(rank, status)
+                            state = ownership.slots[rank].state
                             if state is HandleState.PROC and victim.incomplete:
                                 saw_proc_during_victim = True
-                            if state is HandleState.ERR:
-                                failed = True
-                                break
+                            if ownership.operation_failed:
+                                ownership.seal_posting()
+                                raise StagingSafetyError(
+                                    "NIXL post failed; staging remains tombstoned: "
+                                    f"{ownership.describe()}"
+                                )
                     except Exception as error:
-                        if (
-                            current_rank is not None
-                            and ownership.states[current_rank] is HandleState.UNPOSTED
-                        ):
-                            submission_token = (
-                                repr(current_handle)
-                                if current_handle is not None
-                                else f"initialize-rank-{current_rank}"
-                            )
-                            ownership.record_post_exception(
-                                current_rank,
-                                submission_token=submission_token,
-                            )
-                        ownership.seal_posting()
-                        raise RuntimeError(
-                            "NIXL submission outcome is unknown; staging remains "
-                            f"tombstoned\n{traceback.format_exc()}"
+                        stacktrace = traceback.format_exc()
+                        if current_rank is not None:
+                            state = ownership.slots[current_rank].state
+                            if state is HandleState.PREPARING:
+                                ownership.record_prepare_failure(
+                                    current_rank,
+                                    f"rank {current_rank} preparation raised",
+                                )
+                            elif state is HandleState.POSTING:
+                                ownership.record_post_exception(
+                                    current_rank,
+                                    f"rank {current_rank} post raised",
+                                )
+                        if ownership.posting_sealed is False:
+                            ownership.seal_posting()
+                        if isinstance(error, StagingSafetyError):
+                            raise
+                        raise StagingSafetyError(
+                            "NIXL submission failed; staging remains owned\n"
+                            f"{stacktrace}"
                         ) from error
                     ownership.seal_posting()
 
                     deadline = time.monotonic() + config.transfer_timeout_seconds
                     while any(
-                        state is HandleState.PROC for state in ownership.states.values()
+                        slot.state is HandleState.PROC
+                        for slot in ownership.slots.values()
                     ):
-                        if time.monotonic() >= deadline:
-                            raise RuntimeError(
+                        for rank, handle in enumerate(handles):
+                            if ownership.slots[rank].state is not HandleState.PROC:
+                                continue
+                            try:
+                                status = agent.check_xfer_state(handle)
+                            except Exception as error:
+                                ownership.record_query_exception(
+                                    rank,
+                                    f"rank {rank} status query raised",
+                                )
+                                raise StagingSafetyError(
+                                    "NIXL status query raised; staging remains "
+                                    f"tombstoned\n{traceback.format_exc()}"
+                                ) from error
+                            ownership.record_query_result(rank, status)
+                            state = ownership.slots[rank].state
+                            if state is HandleState.PROC and victim.incomplete:
+                                saw_proc_during_victim = True
+                            if ownership.operation_failed:
+                                raise StagingSafetyError(
+                                    "NIXL status failed; staging remains tombstoned: "
+                                    f"{ownership.describe()}"
+                                )
+                        if time.monotonic() >= deadline and any(
+                            slot.state is HandleState.PROC
+                            for slot in ownership.slots.values()
+                        ):
+                            ownership.tombstone("NIXL transfer deadline expired")
+                            raise StagingSafetyError(
                                 "NIXL transfer deadline expired; staging remains "
                                 "tombstoned"
                             )
-                        for rank, handle in enumerate(handles):
-                            if ownership.states[rank] is not HandleState.PROC:
-                                continue
-                            status = agent.check_xfer_state(handle)
-                            state = HandleState(status.lower())
-                            ownership.update(rank, state)
-                            if state is HandleState.PROC and victim.incomplete:
-                                saw_proc_during_victim = True
-                            if state is HandleState.ERR:
-                                failed = True
                         time.sleep(0.0001)
 
                     for rank, handle in enumerate(handles):
+                        if ownership.slots[rank].state is not HandleState.DONE:
+                            raise StagingSafetyError(
+                                "non-DONE native handle reached cleanup; staging "
+                                "remains tombstoned"
+                            )
                         handle_records.append(_telemetry(agent, handle))
                         if handle_records[-1]["backend"] != _UCX_BACKEND:
                             raise RuntimeError("NIXL selected a non-UCX backend")
-                        state = ownership.states[rank]
                         try:
                             agent.release_xfer_handle(handle)
                         except Exception as error:
-                            raise RuntimeError(
-                                "native handle release did not acknowledge quiescence; "
-                                f"staging remains tombstoned\n{traceback.format_exc()}"
+                            raise StagingSafetyError(
+                                "DONE handle resource cleanup failed; the rig process "
+                                f"must exit\n{traceback.format_exc()}"
                             ) from error
-                        if state is HandleState.ERR:
-                            ownership.update(rank, HandleState.CANCEL_ACK)
+                        ownership.mark_native_released(rank)
 
                     transfer_done.record()
                     transfer_done.synchronize()
@@ -1124,10 +1154,7 @@ def run_consumer(
                         raise RuntimeError(
                             "INVALID arm: no PROC handle was observed while victim ran"
                         )
-                    if failed:
-                        allocator.release(global_iteration)
-                        raise RuntimeError("NIXL transfer failed without scattering")
-
+                    ownership.begin_device_read()
                     _scatter(
                         config=config,
                         plan=plan,
@@ -1179,7 +1206,10 @@ def run_consumer(
                     write_observations(
                         artifact_directory / "consumer-destination.jsonl", committed
                     )
-                    allocator.release(global_iteration)
+                    torch.cuda.synchronize()
+                    ownership.mark_device_quiescent()
+                    allocator.release(ownership)
+                    ownership_snapshot = ownership.snapshot().to_dict()
                     for channel in channels:
                         channel.send(
                             CompletePayload(
@@ -1210,6 +1240,7 @@ def run_consumer(
                             ),
                             "saw_proc_during_victim": saw_proc_during_victim,
                             "handles": handle_records,
+                            "staging_ownership": ownership_snapshot,
                             "evidence_status": "content_digest",
                         }
                     )
