@@ -74,6 +74,21 @@ def _as_str(value: object, context: str) -> str:
     return value
 
 
+def _as_relative_path(value: object, context: str) -> str:
+    """Require a confined, non-empty relative path.
+
+    :param value: Parsed JSON value.
+    :param context: Human-readable field name for diagnostics.
+    :returns: Validated relative path text.
+    :raises ConfigError: If the path is absolute or can escape its root.
+    """
+    text = _as_str(value, context)
+    path = Path(text)
+    if path.is_absolute() or ".." in path.parts:
+        raise ConfigError(f"{context} must be a confined relative path")
+    return text
+
+
 def _as_list(value: object, context: str) -> list[object]:
     """Require a JSON array.
 
@@ -134,12 +149,15 @@ class GroupConfig:
     :ivar name: Human-readable group identity.
     :ivar remote_position_count: P positions before prefix trimming.
     :ivar local_position_count: D positions remaining after a prefix hit.
+    :ivar owned_region_indices: Semantically live regions for the group. The
+        current coalesced path still broadcasts every group through all regions.
     """
 
     index: int
     name: str
     remote_position_count: int
     local_position_count: int
+    owned_region_indices: tuple[int, ...]
 
     def __post_init__(self) -> None:
         if self.index < 0:
@@ -154,6 +172,12 @@ class GroupConfig:
             raise ConfigError(
                 "group local_position_count must not exceed remote_position_count"
             )
+        if len(self.owned_region_indices) == 0:
+            raise ConfigError("group owned_region_indices must not be empty")
+        if min(self.owned_region_indices) < 0:
+            raise ConfigError("group owned_region_indices must be non-negative")
+        if len(set(self.owned_region_indices)) != len(self.owned_region_indices):
+            raise ConfigError("group owned_region_indices must be unique")
 
     @classmethod
     def from_json(cls, value: object, array_index: int) -> "GroupConfig":
@@ -172,6 +196,7 @@ class GroupConfig:
                 "name",
                 "remote_position_count",
                 "local_position_count",
+                "owned_region_indices",
             },
             optional=set(),
             context=context,
@@ -186,6 +211,15 @@ class GroupConfig:
             local_position_count=_as_int(
                 obj["local_position_count"],
                 f"{context}.local_position_count",
+            ),
+            owned_region_indices=tuple(
+                _as_int(item, f"{context}.owned_region_indices[{region_index}]")
+                for region_index, item in enumerate(
+                    _as_list(
+                        obj["owned_region_indices"],
+                        f"{context}.owned_region_indices",
+                    )
+                )
             ),
         )
 
@@ -227,6 +261,10 @@ class ScenarioConfig:
             raise ConfigError("staging_offsets_mib must not be empty")
         if min(self.staging_offsets_mib) < 0:
             raise ConfigError("staging_offsets_mib must be non-negative")
+        if self.replay_manifest is not None:
+            replay_path = Path(self.replay_manifest)
+            if replay_path.is_absolute() or ".." in replay_path.parts:
+                raise ConfigError("replay_manifest must be a confined relative path")
 
     @classmethod
     def from_json(cls, value: object, index: int) -> "ScenarioConfig":
@@ -257,7 +295,9 @@ class ScenarioConfig:
         )
         replay_manifest = obj.get("replay_manifest")
         if replay_manifest is not None:
-            replay_manifest = _as_str(replay_manifest, f"{context}.replay_manifest")
+            replay_manifest = _as_relative_path(
+                replay_manifest, f"{context}.replay_manifest"
+            )
         return cls(
             name=_as_str(obj["name"], f"{context}.name"),
             source_start_block=_as_int(
@@ -425,10 +465,21 @@ class RigConfig:
             raise ConfigError("source_handshake_manifest must not be empty")
         if len(self.destination_handshake_manifest) == 0:
             raise ConfigError("destination_handshake_manifest must not be empty")
-        if len(self.source_handshake_sha256) != 64:
-            raise ConfigError("source_handshake_sha256 must contain 64 hex digits")
-        if len(self.destination_handshake_sha256) != 64:
-            raise ConfigError("destination_handshake_sha256 must contain 64 hex digits")
+        for context, path_text in (
+            ("source_handshake_manifest", self.source_handshake_manifest),
+            ("destination_handshake_manifest", self.destination_handshake_manifest),
+        ):
+            path = Path(path_text)
+            if path.is_absolute() or ".." in path.parts:
+                raise ConfigError(f"{context} must be a confined relative path")
+        for context, digest in (
+            ("source_handshake_sha256", self.source_handshake_sha256),
+            ("destination_handshake_sha256", self.destination_handshake_sha256),
+        ):
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ConfigError(f"{context} must contain lowercase SHA-256 hex")
         if len(self.producer_devices) == 0:
             raise ConfigError("producer_devices must not be empty")
         if len(set(self.producer_devices)) != len(self.producer_devices):
@@ -463,6 +514,8 @@ class RigConfig:
             raise ConfigError("control_host must not be empty")
         if self.control_port <= 0 or self.control_port > 65535:
             raise ConfigError("control_port must be in [1, 65535]")
+        if self.control_port + len(self.producer_devices) - 1 > 65535:
+            raise ConfigError("producer control ports exceed 65535")
         if len(self.regions) == 0:
             raise ConfigError("regions must not be empty")
         if len({region.name for region in self.regions}) != len(self.regions):
@@ -475,6 +528,9 @@ class RigConfig:
             raise ConfigError("group indices must be contiguous and ordered from zero")
         if len({group.name for group in self.groups}) != len(self.groups):
             raise ConfigError("group names must be unique")
+        for group in self.groups:
+            if max(group.owned_region_indices) >= len(self.regions):
+                raise ConfigError(f"group {group.index} owns an out-of-range region")
         if len(self.scenarios) == 0:
             raise ConfigError("scenarios must not be empty")
         if len({scenario.name for scenario in self.scenarios}) != len(self.scenarios):
@@ -568,10 +624,10 @@ class RigConfig:
 
         return cls(
             schema_version=_as_int(obj["schema_version"], "schema_version"),
-            source_handshake_manifest=_as_str(
+            source_handshake_manifest=_as_relative_path(
                 obj["source_handshake_manifest"], "source_handshake_manifest"
             ),
-            destination_handshake_manifest=_as_str(
+            destination_handshake_manifest=_as_relative_path(
                 obj["destination_handshake_manifest"],
                 "destination_handshake_manifest",
             ),
@@ -717,6 +773,8 @@ def _validate_handshake_manifests(config: RigConfig, directory: Path) -> None:
             f"{len(config.producer_devices)}"
         )
     source_block_lens = tuple(region.row_bytes for region in config.regions)
+    source_engine_ids: set[str] = set()
+    compatibility_hashes: set[str] = set()
     for rank_index, rank in enumerate(source_ranks):
         captured_rank = _as_int(rank.get("rank"), f"source rank[{rank_index}].rank")
         captured_blocks = _as_int(
@@ -725,6 +783,25 @@ def _validate_handshake_manifests(config: RigConfig, directory: Path) -> None:
         captured_lens = _manifest_int_list(
             rank.get("block_lens"), f"source rank[{rank_index}].block_lens"
         )
+        captured_device = _as_int(
+            rank.get("device_id"), f"source rank[{rank_index}].device_id"
+        )
+        captured_block_size = _as_int(
+            rank.get("block_size"), f"source rank[{rank_index}].block_size"
+        )
+        captured_ratio = _as_int(
+            rank.get("physical_blocks_per_logical_kv_block"),
+            f"source rank[{rank_index}].physical_blocks_per_logical_kv_block",
+        )
+        engine_id = _as_str(
+            rank.get("engine_id"), f"source rank[{rank_index}].engine_id"
+        )
+        compatibility_hash = _as_str(
+            rank.get("compatibility_hash"),
+            f"source rank[{rank_index}].compatibility_hash",
+        )
+        source_engine_ids.add(engine_id)
+        compatibility_hashes.add(compatibility_hash)
         if captured_rank != rank_index:
             raise ConfigError("source handshake ranks must be ordered and contiguous")
         if captured_blocks != config.source_block_count:
@@ -737,6 +814,16 @@ def _validate_handshake_manifests(config: RigConfig, directory: Path) -> None:
                 f"source rank {rank_index} block_lens {captured_lens} differ "
                 f"from configured regions {source_block_lens}"
             )
+        if captured_device != rank_index:
+            raise ConfigError("source handshake device IDs must equal TP ranks")
+        if captured_block_size != 16 or captured_ratio != 1:
+            raise ConfigError("source handshake block mapping differs from ship path")
+        if rank.get("kv_cache_layout") != "HND":
+            raise ConfigError("source handshake layout must be HND")
+        if rank.get("attn_backend_name") != "FLASHINFER_GEMMA4_TRTLLM_GEN":
+            raise ConfigError("source handshake attention backend differs")
+    if len(source_engine_ids) != 1 or len(compatibility_hashes) != 1:
+        raise ConfigError("source ranks disagree on engine or compatibility identity")
 
     if len(destination_ranks) != 1:
         raise ConfigError("destination handshake must contain exactly one TP1 rank")
@@ -746,6 +833,13 @@ def _validate_handshake_manifests(config: RigConfig, directory: Path) -> None:
     )
     destination_lens = _manifest_int_list(
         destination.get("block_lens"), "destination rank.block_lens"
+    )
+    destination_block_size = _as_int(
+        destination.get("block_size"), "destination rank.block_size"
+    )
+    destination_ratio = _as_int(
+        destination.get("physical_blocks_per_logical_kv_block"),
+        "destination rank.physical_blocks_per_logical_kv_block",
     )
     expected_destination_lens = tuple(
         row_bytes * len(config.producer_devices) for row_bytes in source_block_lens
@@ -760,6 +854,20 @@ def _validate_handshake_manifests(config: RigConfig, directory: Path) -> None:
             f"destination block_lens {destination_lens} differ from expected "
             f"TP4 scatter rows {expected_destination_lens}"
         )
+    if _as_int(destination.get("rank"), "destination rank.rank") != 0:
+        raise ConfigError("destination handshake must be TP rank zero")
+    if _as_int(destination.get("device_id"), "destination rank.device_id") != 0:
+        raise ConfigError(
+            "destination capture must use isolated logical CUDA device zero"
+        )
+    if destination_block_size != 16 or destination_ratio != 1:
+        raise ConfigError("destination handshake block mapping differs from ship path")
+    if destination.get("kv_cache_layout") != "HND":
+        raise ConfigError("destination handshake layout must be HND")
+    if destination.get("attn_backend_name") != "FLASHINFER_GEMMA4_TRTLLM_GEN":
+        raise ConfigError("destination handshake attention backend differs")
+    if destination.get("compatibility_hash") not in compatibility_hashes:
+        raise ConfigError("P and D handshake compatibility hashes differ")
 
 
 def load_config(path: Path) -> RigConfig:

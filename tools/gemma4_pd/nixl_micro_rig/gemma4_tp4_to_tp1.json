@@ -27,19 +27,19 @@
     {"name": "region_9", "row_bytes": 65536}
   ],
   "groups": [
-    {"index": 0, "name": "local_0", "remote_position_count": 64, "local_position_count": 64},
-    {"index": 1, "name": "local_1", "remote_position_count": 64, "local_position_count": 64},
-    {"index": 2, "name": "local_2", "remote_position_count": 64, "local_position_count": 64},
-    {"index": 3, "name": "local_3", "remote_position_count": 64, "local_position_count": 64},
-    {"index": 4, "name": "local_4", "remote_position_count": 64, "local_position_count": 64},
-    {"index": 5, "name": "local_5", "remote_position_count": 64, "local_position_count": 64},
-    {"index": 6, "name": "local_6", "remote_position_count": 64, "local_position_count": 64},
-    {"index": 7, "name": "local_7", "remote_position_count": 64, "local_position_count": 64},
-    {"index": 8, "name": "local_8", "remote_position_count": 64, "local_position_count": 64},
-    {"index": 9, "name": "local_9", "remote_position_count": 64, "local_position_count": 64},
-    {"index": 10, "name": "global_0", "remote_position_count": 1015, "local_position_count": 1015},
-    {"index": 11, "name": "global_1", "remote_position_count": 1015, "local_position_count": 1015},
-    {"index": 12, "name": "dflash", "remote_position_count": 2, "local_position_count": 2}
+    {"index": 0, "name": "local_0", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 1, "name": "local_1", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 2, "name": "local_2", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 3, "name": "local_3", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 4, "name": "local_4", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 5, "name": "local_5", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 6, "name": "local_6", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 7, "name": "local_7", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 8, "name": "local_8", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 9, "name": "local_9", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 10, "name": "global_0", "remote_position_count": 1015, "local_position_count": 1015, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 11, "name": "global_1", "remote_position_count": 1015, "local_position_count": 1015, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 12, "name": "dflash", "remote_position_count": 2, "local_position_count": 2, "owned_region_indices": [5, 6, 7, 8, 9]}
   ],
   "scenarios": [
     {

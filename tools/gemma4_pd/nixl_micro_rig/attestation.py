@@ -2,6 +2,7 @@
 
 import ctypes
 import hashlib
+import json
 import os
 import platform
 import sys
@@ -42,7 +43,14 @@ def _loaded_native_libraries() -> tuple[Path, ...]:
         name = Path(path_text).name
         if not any(
             marker in name
-            for marker in ("libnixl", "libucp", "libuct", "libucs", "libucm")
+            for marker in (
+                "libnixl",
+                "libplugin_UCX",
+                "libucp",
+                "libuct",
+                "libucs",
+                "libucm",
+            )
         ):
             continue
         path = Path(path_text)
@@ -92,16 +100,21 @@ def collect_process_attestation(
     ]
     api_path = Path(nixl_api.__file__).resolve()
     bindings_path = Path(nixl_bindings.__file__).resolve()
-    environment_names = (
+    environment_names = {name for name in os.environ if name.startswith("NIXL_")} | {
         "CUDA_VISIBLE_DEVICES",
+        "CUDA_DEVICE_ORDER",
+        "LD_LIBRARY_PATH",
+        "PYTHONPATH",
         "UCX_TLS",
         "UCX_MEMTYPE_CACHE",
         "UCX_RNDV_SCHEME",
         "UCX_PROTO_INFO",
-    )
-    return {
+    }
+    maps_payload = Path("/proc/self/maps").read_bytes()
+    record = {
         "role": role,
         "pid": os.getpid(),
+        "argv": list(sys.argv),
         "python": sys.version,
         "platform": platform.platform(),
         "torch_version": torch.__version__,
@@ -114,6 +127,7 @@ def collect_process_attestation(
             "sha256": _sha256(bindings_path),
         },
         "loaded_native_libraries": library_records,
+        "proc_maps_sha256": hashlib.sha256(maps_payload).hexdigest(),
         "ucx_version": _ucx_version(libraries),
         "nixl_plugin_list": agent.get_plugin_list(),
         "nixl_ucx_plugin_params": agent.get_plugin_params("UCX"),
@@ -122,5 +136,19 @@ def collect_process_attestation(
         "physical_device": physical_device,
         "logical_device": logical_device,
         "cuda_device_name": torch.cuda.get_device_name(logical_device),
-        "environment": {name: os.environ.get(name) for name in environment_names},
+        "environment": {
+            name: os.environ.get(name) for name in sorted(environment_names)
+        },
     }
+    normalized = json.loads(json.dumps(record, allow_nan=False))
+    if not isinstance(normalized, dict):
+        raise AssertionError("attestation did not normalize to a JSON object")
+    return normalized
+
+
+def write_process_maps(path: Path) -> None:
+    """Preserve the full loaded-object map used by attestation.
+
+    :param path: Immutable run artifact path.
+    """
+    path.write_bytes(Path("/proc/self/maps").read_bytes())

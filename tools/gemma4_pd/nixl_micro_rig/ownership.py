@@ -184,20 +184,6 @@ class StagingGeneration:
             raise ValueError(f"rank {rank} is outside the staging generation")
 
 
-def production_drop_plan_would_release(states: dict[int, HandleState]) -> bool:
-    """Model the current coalesced failure path's immediate range drop.
-
-    Current production calls ``_coalesce_drop_plan`` as soon as one rank
-    reports ERR. It does not first prove sibling handles terminal. This adapter
-    exists to keep the expected failure executable until production ownership
-    is corrected.
-
-    :param states: Rank-handle states at the first observed failure.
-    :returns: Whether current production returns the staging range.
-    """
-    return any(state is HandleState.ERR for state in states.values())
-
-
 @dataclass
 class StagingRangeAllocator:
     """Bind ownership generations to non-overlapping staging byte ranges.

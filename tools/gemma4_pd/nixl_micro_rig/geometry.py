@@ -72,6 +72,7 @@ class TransferPlan:
     :ivar descriptors_per_handle: Raw descriptors in each P-rank NIXL handle.
     :ivar rank_count: Independent P agents and TP ranks.
     :ivar destination_block_count: Physical rows in every D region.
+    :ivar replay_manifest: Captured plan source, absent for synthetic geometry.
     """
 
     scenario_name: str
@@ -85,6 +86,7 @@ class TransferPlan:
     descriptors_per_handle: int
     rank_count: int
     destination_block_count: int
+    replay_manifest: str | None
 
     @property
     def position_count(self) -> int:
@@ -420,17 +422,48 @@ def build_plan(
         descriptors_per_handle=len(runs) * len(config.regions),
         rank_count=rank_count,
         destination_block_count=config.source_block_count,
+        replay_manifest=scenario.replay_manifest,
     )
 
 
-def describe_plan(config: RigConfig, scenario: ScenarioConfig) -> dict[str, object]:
+def build_configured_plan(
+    config_path: Path,
+    config: RigConfig,
+    scenario: ScenarioConfig,
+) -> TransferPlan:
+    """Build a scenario from its configured synthetic or captured source.
+
+    :param config_path: Configuration path used to resolve replay manifests.
+    :param config: Complete rig configuration.
+    :param scenario: Selected source geometry scenario.
+    :returns: Exact configured transfer plan.
+    """
+    replay = None
+    if scenario.replay_manifest is not None:
+        replay = load_replay_manifest(config_path.parent / scenario.replay_manifest)
+    return build_plan(config, scenario, replay)
+
+
+def describe_plan(
+    config: RigConfig,
+    scenario: ScenarioConfig,
+    plan: TransferPlan | None = None,
+) -> dict[str, object]:
     """Build a JSON-serializable plan description.
 
     :param config: Complete rig configuration.
     :param scenario: Selected source geometry scenario.
+    :param plan: Exact configured plan, or a synthetic plan when omitted.
     :returns: Geometry, boundary, registration, and scatter facts.
     """
-    plan = build_plan(config, scenario)
+    if plan is None:
+        if scenario.replay_manifest is not None:
+            raise ConfigError(
+                "replay-backed scenarios require their loaded plan for description"
+            )
+        plan = build_plan(config, scenario)
+    if plan.scenario_name != scenario.name:
+        raise ConfigError("described plan does not belong to the scenario")
     two_gib = 2 * 1024**3
     source_region_ends = (
         [(plan.block_ids[-1] + 1) * region.row_bytes for region in config.regions]
@@ -454,6 +487,9 @@ def describe_plan(config: RigConfig, scenario: ScenarioConfig) -> dict[str, obje
             )
     return {
         "scenario": scenario.name,
+        "plan_provenance": (
+            "synthetic" if plan.replay_manifest is None else plan.replay_manifest
+        ),
         "position_count": plan.position_count,
         "run_count": len(plan.runs),
         "descriptors_per_handle": plan.descriptors_per_handle,
@@ -478,6 +514,7 @@ def describe_plan(config: RigConfig, scenario: ScenarioConfig) -> dict[str, obje
                 "group_index": group.index,
                 "remote_before_trim": group.remote_position_count,
                 "local_after_trim": group.local_position_count,
+                "owned_region_indices": list(group.owned_region_indices),
             }
             for group in config.groups
         ],
