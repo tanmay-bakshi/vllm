@@ -206,6 +206,7 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        self._receive_delayed_free_req_ids: set[str] = set()
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -1621,15 +1622,42 @@ class Scheduler(SchedulerInterface):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
-        failed_kv_load_req_ids = None
-        if kv_connector_output and kv_connector_output.invalid_block_ids:
+        failed_recving_req_ids = {
+            req_id
+            for req_id in (
+                kv_connector_output.failed_recving
+                if kv_connector_output is not None
+                else ()
+            )
+            if (request := self.requests.get(req_id)) is not None
+            and not request.is_finished()
+        }
+        failed_kv_load_req_ids = set[str]()
+        structured_failure_block_ids = {
+            block_id
+            for failure in (
+                kv_connector_output.failed_recving.values()
+                if kv_connector_output is not None
+                else ()
+            )
+            for block_id in failure.invalid_block_ids
+        }
+        generic_invalid_block_ids = (
+            kv_connector_output.invalid_block_ids - structured_failure_block_ids
+            if kv_connector_output is not None
+            else set()
+        )
+        if generic_invalid_block_ids:
             # These blocks contain externally computed tokens that failed to
             # load. Identify affected requests and adjust their computed token
             # count to trigger recomputation of the invalid blocks.
-            failed_kv_load_req_ids = self._handle_invalid_blocks(
-                kv_connector_output.invalid_block_ids,
-                num_scheduled_tokens,
+            failed_kv_load_req_ids.update(
+                self._handle_invalid_blocks(
+                    generic_invalid_block_ids,
+                    num_scheduled_tokens,
+                )
             )
+        failed_kv_load_req_ids.update(failed_recving_req_ids)
 
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
@@ -1869,9 +1897,26 @@ class Scheduler(SchedulerInterface):
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
 
-        if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
-            requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
-            self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
+        terminal_failed_req_ids = (
+            failed_recving_req_ids
+            if self.recompute_kv_load_failures
+            else failed_kv_load_req_ids
+        )
+        if terminal_failed_req_ids:
+            # Request-scoped receive failure is emitted only after every
+            # expected worker is terminal. It must escape the current source,
+            # so it is terminal even when generic invalid blocks recompute.
+            self.finished_recving_kv_req_ids.update(failed_recving_req_ids)
+            requests = [self.requests[req_id] for req_id in terminal_failed_req_ids]
+            self.finish_requests(
+                terminal_failed_req_ids, RequestStatus.FINISHED_ERROR
+            )
+            self.finished_recving_kv_req_ids.difference_update(
+                failed_recving_req_ids
+            )
+            self.failed_recving_kv_req_ids.difference_update(
+                failed_recving_req_ids
+            )
             for request in requests:
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -2219,6 +2264,8 @@ class Scheduler(SchedulerInterface):
                 delay_free_blocks = (
                     request.request_id not in self.finished_recving_kv_req_ids
                 )
+                if delay_free_blocks:
+                    self._receive_delayed_free_req_ids.add(request.request_id)
                 self.finished_recving_kv_req_ids.discard(request.request_id)
                 self.failed_recving_kv_req_ids.discard(request.request_id)
 
@@ -2248,6 +2295,7 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        self._receive_delayed_free_req_ids.discard(request.request_id)
         self._free_request_blocks(request)
         del self.requests[request.request_id]
 
@@ -2617,6 +2665,8 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
+            if req_id in kv_connector_output.failed_recving:
+                continue
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
             req = self.requests[req_id]
@@ -2624,7 +2674,30 @@ class Scheduler(SchedulerInterface):
                 self.finished_recving_kv_req_ids.add(req_id)
             else:
                 assert RequestStatus.is_finished(req.status)
-                self._free_blocks(self.requests[req_id])
+                if req_id not in self._receive_delayed_free_req_ids:
+                    logger.warning(
+                        "Ignoring finished receive terminal for request %s "
+                        "because its blocks are not retained by an "
+                        "asynchronous receive.",
+                        req_id,
+                    )
+                    continue
+                self._free_blocks(req)
+        for req_id in kv_connector_output.failed_recving:
+            req = self.requests.get(req_id)
+            if req is None:
+                continue
+            if req_id not in self._receive_delayed_free_req_ids:
+                logger.warning(
+                    "Ignoring failed receive terminal for request %s because "
+                    "its blocks are not retained by an asynchronous receive.",
+                    req_id,
+                )
+                continue
+            assert RequestStatus.is_finished(req.status)
+            self.finished_recving_kv_req_ids.discard(req_id)
+            self.failed_recving_kv_req_ids.discard(req_id)
+            self._free_blocks(req)
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
@@ -2672,13 +2745,33 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            req_block_ids_by_group = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
+
+            if len(req_block_ids_by_group) > 1:
+                # Groups may use different block/token geometry. Without a
+                # proven cross-group prefix mapping, generic invalidation must
+                # conservatively reset the entire request.
+                all_req_block_ids = {
+                    block_id
+                    for group_block_ids in req_block_ids_by_group
+                    for block_id in group_block_ids
+                }
+                if all_req_block_ids.isdisjoint(invalid_block_ids):
+                    continue
+
+                affected_req_ids.add(req_id)
+                total_affected_tokens += req_num_computed_tokens
+                request.num_computed_tokens = 0
+                if evict_blocks:
+                    blocks_to_evict.update(all_req_block_ids)
+                continue
+
+            (req_block_ids,) = req_block_ids_by_group
 
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1

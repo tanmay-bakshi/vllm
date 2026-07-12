@@ -440,6 +440,8 @@ class NixlBaseConnectorScheduler:
         """Stop heartbeating for requests whose KV transfer completed."""
         for req_id in connector_output.finished_recving or ():
             self._stop_heartbeat(req_id)
+        for req_id in connector_output.failed_recving:
+            self._stop_heartbeat(req_id)
 
     def has_pending_push_work(self) -> bool:
         return False

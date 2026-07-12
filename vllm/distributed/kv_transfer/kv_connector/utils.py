@@ -17,7 +17,11 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    KVConnectorOutput,
+    KVTransferFailure,
+    ModelRunnerOutput,
+)
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
@@ -55,6 +59,8 @@ class KVOutputAggregator:
         # Complete transfer tracker. Used to track finished requests
         # [req_id -> n_remaining_workers]
         self._recv_remaining_count = dict[str, int]()
+        self._recv_seen_workers = dict[str, set[int]]()
+        self._recv_failures = dict[str, KVTransferFailure]()
         self._send_remaining_count = dict[str, int]()
         self._expected_finished_count = expected_finished_count
 
@@ -86,11 +92,12 @@ class KVOutputAggregator:
 
         finished_sending = set[str]()
         finished_recving = set[str]()
+        failed_recving = dict[str, KVTransferFailure]()
         aggregated_kv_connector_stats = None
         aggregated_kv_connector_worker_meta = None
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
-        for model_runner_output in outputs:
+        for worker_index, model_runner_output in enumerate(outputs):
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
             if not kv_output:
@@ -111,9 +118,33 @@ class KVOutputAggregator:
             update_finished_set(
                 kv_output.finished_sending, self._send_remaining_count, finished_sending
             )
-            update_finished_set(
-                kv_output.finished_recving, self._recv_remaining_count, finished_recving
-            )
+            failure_block_ids = set[int]()
+            for req_id, failure in kv_output.failed_recving.items():
+                failure_block_ids.update(failure.invalid_block_ids)
+                if existing := self._recv_failures.get(req_id):
+                    self._recv_failures[req_id] = existing.aggregate(failure)
+                else:
+                    self._recv_failures[req_id] = failure
+
+            for req_id in kv_output.finished_recving or ():
+                seen_workers = self._recv_seen_workers.setdefault(req_id, set())
+                if worker_index in seen_workers:
+                    continue
+                seen_workers.add(worker_index)
+                remaining_count = self._recv_remaining_count.get(
+                    req_id, self._expected_finished_count
+                )
+                remaining_count -= 1
+                if remaining_count > 0:
+                    self._recv_remaining_count[req_id] = remaining_count
+                    continue
+
+                self._recv_remaining_count.pop(req_id, None)
+                self._recv_seen_workers.pop(req_id, None)
+                if failure := self._recv_failures.pop(req_id, None):
+                    failed_recving[req_id] = failure
+                else:
+                    finished_recving.add(req_id)
 
             # Aggregate kv_connector_stats from all workers.
             if aggregated_kv_connector_stats is None:
@@ -151,7 +182,9 @@ class KVOutputAggregator:
                 combined_kv_cache_events.add_events(worker_kv_cache_events)
                 combined_kv_cache_events.increment_workers(1)
 
-            invalid_block_ids |= kv_output.invalid_block_ids
+            invalid_block_ids.update(
+                kv_output.invalid_block_ids - failure_block_ids
+            )
 
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
@@ -160,6 +193,7 @@ class KVOutputAggregator:
         output.kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending or None,
             finished_recving=finished_recving or None,
+            failed_recving=failed_recving,
             kv_connector_stats=aggregated_kv_connector_stats or None,
             kv_cache_events=combined_kv_cache_events or None,
             kv_connector_worker_meta=aggregated_kv_connector_worker_meta or None,

@@ -29,7 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.outputs import KVConnectorOutput, KVTransferFailure
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
@@ -340,6 +340,16 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             agg_block_ids |= c.get_block_ids_with_load_errors()
         return agg_block_ids
+
+    def get_failed_recving(self) -> dict[str, KVTransferFailure]:
+        failures: dict[str, KVTransferFailure] = {}
+        for connector in self._connectors:
+            for req_id, failure in connector.get_failed_recving().items():
+                if existing := failures.get(req_id):
+                    failures[req_id] = existing.aggregate(failure)
+                else:
+                    failures[req_id] = failure
+        return failures
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Set xPU-specific copy ops for all sub-connectors."""

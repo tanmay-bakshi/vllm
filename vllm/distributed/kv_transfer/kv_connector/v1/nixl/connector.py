@@ -60,7 +60,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.outputs import KVConnectorOutput, KVTransferFailure
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
@@ -245,6 +245,11 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         """Get block IDs that failed to load via NIXL."""
         assert self.connector_worker is not None
         return self.connector_worker.get_block_ids_with_load_errors()
+
+    def get_failed_recving(self) -> dict[str, KVTransferFailure]:
+        """Get completed NIXL receive failures keyed by request ID."""
+        assert self.connector_worker is not None
+        return self.connector_worker.get_failed_recving()
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         if self.connector_worker is None:

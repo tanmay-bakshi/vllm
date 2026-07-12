@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
 
@@ -73,6 +73,10 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
+)
+from vllm.v1.outputs import (
+    KVTransferFailure,
+    KVTransferFailureReason,
 )
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
@@ -532,11 +536,15 @@ class NixlBaseConnectorWorker:
 
         # Invalid blocks from failed NIXL operations (thread-safe queue of block ids)
         self._invalid_block_ids: queue.Queue[set[int]] = queue.Queue()
-        # requests that skipped transfer (handshake or transfer failures)
-        # Uses Queue for thread-safe cross-thread coordination with the
-        # background handshake thread, matching the _ready_requests pattern.
-        self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
-
+        # Receive failures may originate in the background handshake thread.
+        # The main thread owns all transfer and request-state cleanup.
+        self._failed_recv_outcomes: queue.Queue[
+            tuple[ReqId, KVTransferFailureReason, TransferHandle | None]
+        ] = queue.Queue()
+        self._failed_recv_pending: dict[ReqId, KVTransferFailure] = {}
+        self._completed_failed_recv_outcomes: queue.Queue[
+            tuple[ReqId, KVTransferFailure]
+        ] = queue.Queue()
         # Handshake metadata of this worker for NIXL transfers.
         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
         # Background thread for initializing new NIXL handshakes.
@@ -2166,16 +2174,28 @@ class NixlBaseConnectorWorker:
         done_sending = self._get_new_notifs()
         done_recving = self._pop_done_transfers(self._recving_transfers)
 
-        # Drain queue of requests where handshake or transfer setup failed.
-        failed_recv_reqs = set[ReqId]()
-        while not self._failed_recv_reqs.empty():
+        while not self._failed_recv_outcomes.empty():
             try:
-                failed_recv_reqs.add(self._failed_recv_reqs.get_nowait())
+                req_id, reason, handle = self._failed_recv_outcomes.get_nowait()
             except queue.Empty:
                 break
+            failure = self._make_failed_receive(req_id, reason)
+            if existing := self._failed_recv_pending.get(req_id):
+                self._failed_recv_pending[req_id] = existing.aggregate(failure)
+            else:
+                self._failed_recv_pending[req_id] = failure
+            self._coalesce_drop_plan(req_id)
+            if handle is not None:
+                self.nixl_wrapper.release_xfer_handle(handle)
+            self.xfer_stats.record_failed_transfer()
 
-        # Add failed requests to done_recving for scheduler tracking
-        # (blocks are already marked invalid, scheduler will handle recompute)
+        # A rank is terminal only after every handle it knows about has left
+        # PROC. Unknown native state still requires the F2 drain/tombstone work.
+        failed_recv_reqs = {
+            req_id
+            for req_id in self._failed_recv_pending
+            if req_id not in self._recving_transfers
+        }
         done_recving.update(failed_recv_reqs)
 
         if len(done_sending) > 0 or len(done_recving) > 0:
@@ -2215,6 +2235,15 @@ class NixlBaseConnectorWorker:
                     req_id,
                     meta.remote.request_id,
                 )
+                failure = self._make_failed_receive(
+                    req_id,
+                    KVTransferFailureReason.INTEGRITY,
+                    meta,
+                )
+                if existing := self._failed_recv_pending.get(req_id):
+                    failure = existing.aggregate(failure)
+                self._failed_recv_pending[req_id] = failure
+                self._coalesce_drop_plan(req_id)
                 failed_recv_reqs.add(req_id)
             elif meta.remote is not None and req_id not in failed_recv_reqs:
                 # Count this completion; the producer frees its blocks at
@@ -2268,6 +2297,11 @@ class NixlBaseConnectorWorker:
 
         for block_ids in block_ids_for_heterogeneous_attn_post_process:
             self.post_process_device_kv_on_receive_heterogeneous_attn(block_ids)
+
+        for req_id in failed_recv_reqs:
+            failure = self._failed_recv_pending.pop(req_id)
+            self._completed_failed_recv_outcomes.put((req_id, failure))
+            self._invalid_block_ids.put(set(failure.invalid_block_ids))
 
         self._sync_device_after_mamba_recv(done_recving, failed_recv_reqs)
 
@@ -2559,7 +2593,11 @@ class NixlBaseConnectorWorker:
                     new_expiry,
                 )
 
-    def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
+    def _pop_done_transfers(
+        self,
+        transfers: dict[str, list[int]],
+        failed_transfer_handler: Callable[[str, int | None], None] | None = None,
+    ) -> set[str]:
         """
         Pop completed xfers by checking for DONE state.
         Args:
@@ -2567,6 +2605,9 @@ class NixlBaseConnectorWorker:
         Returns:
             set of req_ids that have all done xfers
         """
+        if failed_transfer_handler is None:
+            failed_transfer_handler = self._handle_failed_transfer
+
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = []
@@ -2584,19 +2625,19 @@ class NixlBaseConnectorWorker:
                     else:
                         self._log_failure(
                             failure_type="transfer_failed",
-                            msg="Marking blocks as invalid",
+                            msg="Handling failed transfer",
                             req_id=req_id,
                             xfer_state=xfer_state,
                         )
-                        self._handle_failed_transfer(req_id, handle)
+                        failed_transfer_handler(req_id, handle)
                 except Exception as e:
                     self._log_failure(
                         failure_type="transfer_exception",
-                        msg="Marking blocks as invalid",
+                        msg="Handling failed transfer",
                         req_id=req_id,
                         error=e,
                     )
-                    self._handle_failed_transfer(req_id, handle)
+                    failed_transfer_handler(req_id, handle)
 
             if not in_progress:
                 # Only report request as completed when all transfers are done.
@@ -2606,22 +2647,46 @@ class NixlBaseConnectorWorker:
                 transfers[req_id] = in_progress
         return done_req_ids
 
-    def _handle_failed_transfer(self, req_id: str, handle: int | None):
-        """
-        Handle a failed transfer by marking all (logical) blocks as invalid and
-        recording the failure.
+    def _make_failed_receive(
+        self,
+        req_id: str,
+        reason: KVTransferFailureReason,
+        meta: ReqMeta | None = None,
+    ) -> KVTransferFailure:
+        if meta is None:
+            meta = self._recving_metadata.get(req_id)
+        invalid_block_ids = (
+            frozenset(
+                block_id
+                for group_block_ids in meta.local_block_ids
+                for block_id in group_block_ids
+            )
+            if meta is not None
+            else frozenset()
+        )
+        return KVTransferFailure(
+            reason=reason,
+            invalid_block_ids=invalid_block_ids,
+        )
+
+    def _handle_failed_transfer(
+        self,
+        req_id: str,
+        handle: int | None,
+        reason: KVTransferFailureReason = KVTransferFailureReason.TRANSFER,
+    ) -> None:
+        """Queue a receive failure for main-thread processing.
 
         Args:
             req_id: The request ID.
-            handle: The transfer handle.
+            handle: The transfer handle, if one was created.
+            reason: The failure classification.
         """
-        # Use .get() here as the metadata cleanup is handled by get_finished()
-        # TODO (NickLucche) handle failed transfer for HMA.
-        if (meta := self._recving_metadata.get(req_id)) and not self._is_hma_required:
-            self._invalid_block_ids.put(set(meta.local_block_ids[0]))
-        self._failed_recv_reqs.put(req_id)
-        # coalesced pull: free the staging range, skip the scatter
-        self._coalesce_drop_plan(req_id)
+        self._failed_recv_outcomes.put((req_id, reason, handle))
+
+    def _handle_failed_sending_transfer(
+        self, _req_id: str, handle: int | None
+    ) -> None:
         if handle is not None:
             self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
@@ -2895,6 +2960,20 @@ class NixlBaseConnectorWorker:
                 result.update(self._invalid_block_ids.get_nowait())
             except queue.Empty:
                 break
+        return result
+
+    def get_failed_recving(self) -> dict[str, KVTransferFailure]:
+        """Return and clear completed request-scoped receive failures."""
+        result: dict[str, KVTransferFailure] = {}
+        while not self._completed_failed_recv_outcomes.empty():
+            try:
+                req_id, failure = self._completed_failed_recv_outcomes.get_nowait()
+            except queue.Empty:
+                break
+            if existing := result.get(req_id):
+                result[req_id] = existing.aggregate(failure)
+            else:
+                result[req_id] = failure
         return result
 
     def _evict_stale_engines(self) -> None:
