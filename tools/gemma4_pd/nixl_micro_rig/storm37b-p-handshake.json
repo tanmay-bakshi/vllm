@@ -1,0 +1,167 @@
+{
+  "captured_at": "2026-07-12T16:49:05.071275+00:00",
+  "host": "127.0.0.1",
+  "port": 5601,
+  "ranks": [
+    {
+      "attn_backend_name": "FLASHINFER_GEMMA4_TRTLLM_GEN",
+      "block_lens": [
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536
+      ],
+      "block_size": 16,
+      "compatibility_hash": "09d74c2623780d1b537f94b3a24853ee1ecc56b6ff11bc6010e206251d7076a1",
+      "device_id": 0,
+      "engine_id": "f30b2c35-7e75-4057-9b42-6d80d201ba06",
+      "kv_cache_layout": "HND",
+      "kv_caches_base_addr": [
+        132906454351872,
+        132902260047872,
+        132898065743872,
+        132893871439872,
+        132889677135872,
+        132885482831872,
+        132881288527872,
+        132877094223872,
+        132872899919872,
+        132868705615872
+      ],
+      "nixl_agent_metadata_sha256": "b46797726f53441cdae9b6f58deef1c888365a04f97c8d07a8da64ef71dfb72a",
+      "num_blocks": 64000,
+      "physical_blocks_per_logical_kv_block": 1,
+      "rank": 0,
+      "ssm_sizes": [
+        0,
+        0
+      ]
+    },
+    {
+      "attn_backend_name": "FLASHINFER_GEMMA4_TRTLLM_GEN",
+      "block_lens": [
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536
+      ],
+      "block_size": 16,
+      "compatibility_hash": "09d74c2623780d1b537f94b3a24853ee1ecc56b6ff11bc6010e206251d7076a1",
+      "device_id": 1,
+      "engine_id": "f30b2c35-7e75-4057-9b42-6d80d201ba06",
+      "kv_cache_layout": "HND",
+      "kv_caches_base_addr": [
+        135062595043328,
+        135058400739328,
+        135054206435328,
+        135050012131328,
+        135045817827328,
+        135041623523328,
+        135037429219328,
+        135033234915328,
+        135029040611328,
+        135024846307328
+      ],
+      "nixl_agent_metadata_sha256": "5156102e314d20e4971ef6daa60fdb2998d2df36738340702100099acf1c7c84",
+      "num_blocks": 64000,
+      "physical_blocks_per_logical_kv_block": 1,
+      "rank": 1,
+      "ssm_sizes": [
+        0,
+        0
+      ]
+    },
+    {
+      "attn_backend_name": "FLASHINFER_GEMMA4_TRTLLM_GEN",
+      "block_lens": [
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536
+      ],
+      "block_size": 16,
+      "compatibility_hash": "09d74c2623780d1b537f94b3a24853ee1ecc56b6ff11bc6010e206251d7076a1",
+      "device_id": 2,
+      "engine_id": "f30b2c35-7e75-4057-9b42-6d80d201ba06",
+      "kv_cache_layout": "HND",
+      "kv_caches_base_addr": [
+        139944899117056,
+        139940704813056,
+        139936510509056,
+        139932316205056,
+        139928121901056,
+        139923927597056,
+        139919733293056,
+        139915538989056,
+        139911344685056,
+        139907150381056
+      ],
+      "nixl_agent_metadata_sha256": "ca371330616bfbf2cbfb15cdfe7f485a419d8d1b4d0363cf0110542226255ad6",
+      "num_blocks": 64000,
+      "physical_blocks_per_logical_kv_block": 1,
+      "rank": 2,
+      "ssm_sizes": [
+        0,
+        0
+      ]
+    },
+    {
+      "attn_backend_name": "FLASHINFER_GEMMA4_TRTLLM_GEN",
+      "block_lens": [
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536,
+        65536
+      ],
+      "block_size": 16,
+      "compatibility_hash": "09d74c2623780d1b537f94b3a24853ee1ecc56b6ff11bc6010e206251d7076a1",
+      "device_id": 3,
+      "engine_id": "f30b2c35-7e75-4057-9b42-6d80d201ba06",
+      "kv_cache_layout": "HND",
+      "kv_caches_base_addr": [
+        138160205987840,
+        138156011683840,
+        138151817379840,
+        138147623075840,
+        138143428771840,
+        138139234467840,
+        138135040163840,
+        138130845859840,
+        138126651555840,
+        138122457251840
+      ],
+      "nixl_agent_metadata_sha256": "93c990edbc4779d5d183a1255901c651565b27c57992f46219219eb50637f8fa",
+      "num_blocks": 64000,
+      "physical_blocks_per_logical_kv_block": 1,
+      "rank": 3,
+      "ssm_sizes": [
+        0,
+        0
+      ]
+    }
+  ]
+}

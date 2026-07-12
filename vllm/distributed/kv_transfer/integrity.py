@@ -27,6 +27,13 @@ class IntegrityPayloadKind(StrEnum):
     COMMIT = "commit"
 
 
+class IntegrityEvidenceStatus(StrEnum):
+    """Whether an observation contains source-to-destination byte evidence."""
+
+    CONTENT_DIGEST = "content_digest"
+    NON_EVIDENTIARY_ZERO_BYTE = "non_evidentiary_zero_byte"
+
+
 @dataclass(frozen=True, slots=True)
 class IntegrityIdentity:
     """Stage-independent identity of one ordered transfer payload.
@@ -110,6 +117,18 @@ class IntegrityIdentity:
         if self.plane_index > 1:
             raise ValueError("plane_index must be -1, 0, or 1")
 
+    @property
+    def has_content_evidence(self) -> bool:
+        """Return whether this identity covers any transferred bytes.
+
+        A zero-byte full-prefix operation still carries protocol and lineage
+        evidence. Its digest cannot establish source-to-destination content
+        equality and must never enter a clean content denominator.
+
+        :returns: ``True`` only when ``byte_length`` is nonzero.
+        """
+        return self.byte_length > 0
+
 
 @dataclass(frozen=True, slots=True)
 class IntegrityObservation:
@@ -153,6 +172,16 @@ class IntegrityObservation:
                 )
         elif self.child_request_id is None or len(self.child_request_id) == 0:
             raise ValueError("consumer observations require child_request_id")
+
+    @property
+    def evidence_status(self) -> IntegrityEvidenceStatus:
+        """Classify content evidence without discarding zero-byte lineage.
+
+        :returns: Explicit content or non-evidentiary zero-byte status.
+        """
+        if self.identity.has_content_evidence:
+            return IntegrityEvidenceStatus.CONTENT_DIGEST
+        return IntegrityEvidenceStatus.NON_EVIDENTIARY_ZERO_BYTE
 
 
 def _frame_text(value: str) -> bytes:

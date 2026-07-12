@@ -7,6 +7,7 @@ import struct
 import pytest
 
 from vllm.distributed.kv_transfer.integrity import (
+    IntegrityEvidenceStatus,
     IntegrityIdentity,
     IntegrityObservation,
     IntegrityPayloadKind,
@@ -50,12 +51,8 @@ def test_digest_catches_order_and_compensating_changes() -> None:
     permuted = struct.pack(">II", 4, 1)
     compensated = struct.pack(">II", 2, 3)
 
-    assert sum(struct.unpack(">II", baseline)) == sum(
-        struct.unpack(">II", permuted)
-    )
-    assert sum(struct.unpack(">II", baseline)) == sum(
-        struct.unpack(">II", compensated)
-    )
+    assert sum(struct.unpack(">II", baseline)) == sum(struct.unpack(">II", permuted))
+    assert sum(struct.unpack(">II", baseline)) == sum(struct.unpack(">II", compensated))
 
     baseline_digest = compute_integrity_digest(identity, baseline)
     assert compute_integrity_digest(identity, permuted) != baseline_digest
@@ -185,3 +182,24 @@ def test_observation_requires_stage_appropriate_lineage() -> None:
             observer_rank=0,
             local_block_id=1,
         )
+
+
+@pytest.mark.cpu_test
+def test_zero_byte_full_prefix_observation_is_explicitly_non_evidentiary() -> None:
+    """A zero-byte digest carries protocol lineage, not content evidence."""
+    identity = _identity(byte_length=0)
+    digest = compute_integrity_digest(identity, b"")
+    observation = IntegrityObservation(
+        stage=IntegrityStage.STAGING,
+        identity=identity,
+        digest=digest,
+        child_request_id="child",
+        observer_engine_id="decoder",
+        observer_rank=0,
+        local_block_id=None,
+    )
+
+    assert identity.has_content_evidence is False
+    assert (
+        observation.evidence_status is IntegrityEvidenceStatus.NON_EVIDENTIARY_ZERO_BYTE
+    )

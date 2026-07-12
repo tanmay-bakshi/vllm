@@ -1,0 +1,47 @@
+{
+  "captured_at": "2026-07-12T16:49:27.353486+00:00",
+  "host": "127.0.0.1",
+  "port": 5612,
+  "ranks": [
+    {
+      "attn_backend_name": "FLASHINFER_GEMMA4_TRTLLM_GEN",
+      "block_lens": [
+        262144,
+        262144,
+        262144,
+        262144,
+        262144,
+        262144,
+        262144,
+        262144,
+        262144,
+        262144
+      ],
+      "block_size": 16,
+      "compatibility_hash": "09d74c2623780d1b537f94b3a24853ee1ecc56b6ff11bc6010e206251d7076a1",
+      "device_id": 0,
+      "engine_id": "76830a85-d0b2-4af7-b607-7e4a63ddb7de",
+      "kv_cache_layout": "HND",
+      "kv_caches_base_addr": [
+        129673853927424,
+        129657076711424,
+        129640299495424,
+        129623522279424,
+        129606745063424,
+        129589967847424,
+        129573190631424,
+        129556413415424,
+        129539636199424,
+        129522858983424
+      ],
+      "nixl_agent_metadata_sha256": "f47d13ac0a9d5e8a8379610dba4b4e9746571a7fa9c46d14be781af1b619f656",
+      "num_blocks": 64000,
+      "physical_blocks_per_logical_kv_block": 1,
+      "rank": 0,
+      "ssm_sizes": [
+        0,
+        0
+      ]
+    }
+  ]
+}

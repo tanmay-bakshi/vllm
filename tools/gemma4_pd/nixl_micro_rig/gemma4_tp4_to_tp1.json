@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "source_handshake_manifest": "storm37b-p-handshake.json",
+  "destination_handshake_manifest": "storm37b-d1-handshake.json",
+  "source_handshake_sha256": "68837b42b3449d16cbd159b93ce19a8b3abebd27cea880c64a22feb5f2ce0e5c",
+  "destination_handshake_sha256": "d4072378af250f27491232b9dd2b2b07c60bbf54fb00a5f28d1a6433cfef09f2",
+  "producer_devices": [0, 1, 2, 3],
+  "consumer_device": 4,
+  "protected_devices": [6, 7],
+  "source_block_count": 64000,
+  "staging_capacity_mib": 12288,
+  "nixl_num_threads": 4,
+  "pattern_chunk_bytes": 1048576,
+  "transfer_timeout_seconds": 900,
+  "control_host": "127.0.0.1",
+  "control_port": 18991,
+  "regions": [
+    {"name": "region_0", "row_bytes": 65536},
+    {"name": "region_1", "row_bytes": 65536},
+    {"name": "region_2", "row_bytes": 65536},
+    {"name": "region_3", "row_bytes": 65536},
+    {"name": "region_4", "row_bytes": 65536},
+    {"name": "region_5", "row_bytes": 65536},
+    {"name": "region_6", "row_bytes": 65536},
+    {"name": "region_7", "row_bytes": 65536},
+    {"name": "region_8", "row_bytes": 65536},
+    {"name": "region_9", "row_bytes": 65536}
+  ],
+  "groups": [
+    {"index": 0, "name": "local_0", "remote_position_count": 64, "local_position_count": 64},
+    {"index": 1, "name": "local_1", "remote_position_count": 64, "local_position_count": 64},
+    {"index": 2, "name": "local_2", "remote_position_count": 64, "local_position_count": 64},
+    {"index": 3, "name": "local_3", "remote_position_count": 64, "local_position_count": 64},
+    {"index": 4, "name": "local_4", "remote_position_count": 64, "local_position_count": 64},
+    {"index": 5, "name": "local_5", "remote_position_count": 64, "local_position_count": 64},
+    {"index": 6, "name": "local_6", "remote_position_count": 64, "local_position_count": 64},
+    {"index": 7, "name": "local_7", "remote_position_count": 64, "local_position_count": 64},
+    {"index": 8, "name": "local_8", "remote_position_count": 64, "local_position_count": 64},
+    {"index": 9, "name": "local_9", "remote_position_count": 64, "local_position_count": 64},
+    {"index": 10, "name": "global_0", "remote_position_count": 1015, "local_position_count": 1015},
+    {"index": 11, "name": "global_1", "remote_position_count": 1015, "local_position_count": 1015},
+    {"index": 12, "name": "dflash", "remote_position_count": 2, "local_position_count": 2}
+  ],
+  "scenarios": [
+    {
+      "name": "ends_before_2gib",
+      "source_start_block": 30096,
+      "source_end_block": 32767,
+      "run_count": 1,
+      "iterations": 4,
+      "staging_offsets_mib": [0, 1024, 4096, 0]
+    },
+    {
+      "name": "starts_at_2gib",
+      "source_start_block": 32768,
+      "source_end_block": 35439,
+      "run_count": 1,
+      "iterations": 4,
+      "staging_offsets_mib": [0, 1024, 4096, 0]
+    },
+    {
+      "name": "starts_after_2gib",
+      "source_start_block": 32769,
+      "source_end_block": 35440,
+      "run_count": 1,
+      "iterations": 4,
+      "staging_offsets_mib": [0, 1024, 4096, 0]
+    },
+    {
+      "name": "straddles_2gib",
+      "source_start_block": 31432,
+      "source_end_block": 34103,
+      "run_count": 1,
+      "iterations": 4,
+      "staging_offsets_mib": [0, 1024, 4096, 0]
+    },
+    {
+      "name": "observed_high_contiguous",
+      "source_start_block": 51970,
+      "source_end_block": 54641,
+      "run_count": 1,
+      "iterations": 4,
+      "staging_offsets_mib": [0, 1024, 4096, 0]
+    },
+    {
+      "name": "observed_ceiling_102_runs",
+      "source_start_block": 32768,
+      "source_end_block": 54641,
+      "run_count": 102,
+      "iterations": 4,
+      "staging_offsets_mib": [0, 1024, 4096, 0]
+    },
+    {
+      "name": "split_boundary_103_runs",
+      "source_start_block": 32768,
+      "source_end_block": 54641,
+      "run_count": 103,
+      "iterations": 4,
+      "staging_offsets_mib": [0, 1024, 4096, 0]
+    },
+    {
+      "name": "observed_104_runs",
+      "source_start_block": 32768,
+      "source_end_block": 54641,
+      "run_count": 104,
+      "iterations": 4,
+      "staging_offsets_mib": [0, 1024, 4096, 0]
+    },
+    {
+      "name": "low_split_boundary",
+      "source_start_block": 1024,
+      "source_end_block": 3797,
+      "run_count": 103,
+      "iterations": 4,
+      "staging_offsets_mib": [0, 1024, 4096, 0]
+    }
+  ],
+  "transport_arms": [
+    {
+      "name": "cuda_ipc",
+      "ucx_tls": "tcp,shm,cuda_copy,cuda_ipc"
+    },
+    {
+      "name": "cuda_copy",
+      "ucx_tls": "tcp,shm,cuda_copy"
+    }
+  ],
+  "victim": {
+    "matrix_order": 2048,
+    "rounds": 128,
+    "redzone_bytes": 4194304
+  }
+}
