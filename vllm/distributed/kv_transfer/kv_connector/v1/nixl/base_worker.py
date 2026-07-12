@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base worker-side logic for the NIXL connector."""
 
+import heapq
 import logging
 import os
 import queue
@@ -9,7 +10,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, MutableMapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
 
@@ -86,6 +87,46 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+
+class RequestExpiryTracker(MutableMapping[ReqId, float]):
+    """Deadline index that invalidates stale heap entries by generation."""
+
+    def __init__(self) -> None:
+        self._entries: dict[ReqId, tuple[float, int]] = {}
+        self._heap: list[tuple[float, int, ReqId]] = []
+        self._next_generation = 0
+
+    def __getitem__(self, req_id: ReqId) -> float:
+        return self._entries[req_id][0]
+
+    def __setitem__(self, req_id: ReqId, deadline: float) -> None:
+        existing = self._entries.get(req_id)
+        if existing is not None and existing[0] == deadline:
+            return
+        self._next_generation += 1
+        generation = self._next_generation
+        self._entries[req_id] = (deadline, generation)
+        heapq.heappush(self._heap, (deadline, generation, req_id))
+
+    def __delitem__(self, req_id: ReqId) -> None:
+        del self._entries[req_id]
+
+    def __iter__(self) -> Iterator[ReqId]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def pop_expired(self, now: float) -> list[tuple[ReqId, float]]:
+        expired: list[tuple[ReqId, float]] = []
+        while self._heap and self._heap[0][0] <= now:
+            deadline, generation, req_id = heapq.heappop(self._heap)
+            if self._entries.get(req_id) != (deadline, generation):
+                continue
+            del self._entries[req_id]
+            expired.append((req_id, deadline))
+        return expired
 
 
 class NixlBaseConnectorWorker:
@@ -473,7 +514,7 @@ class NixlBaseConnectorWorker:
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
         # Track the expiration time of requests that are waiting to be sent.
-        self._reqs_to_send: dict[ReqId, float] = {}
+        self._reqs_to_send: MutableMapping[ReqId, float] = RequestExpiryTracker()
         # Release fence: remote rids whose producer blocks are known to be
         # released (own completion, sibling release, or producer EXPIRED
         # notification). Bounded FIFO. A pull must never be issued for --
@@ -2307,11 +2348,7 @@ class NixlBaseConnectorWorker:
 
         # Handle timeout to avoid stranding blocks on remote.
         now = time.perf_counter()
-        while self._reqs_to_send:
-            req_id, expires = next(iter(self._reqs_to_send.items()))
-            # Sorted dict, oldest requests are put first so we can exit early.
-            if now < expires:
-                break
+        for req_id, _ in self._pop_expired_send_requests(now):
             count = self.consumer_notification_counts_by_req.pop(req_id, 0)
             self.xfer_stats.record_kv_expired_req()
             logger.warning(
@@ -2321,7 +2358,6 @@ class NixlBaseConnectorWorker:
                 count,
             )
             self._reqs_to_process.remove(req_id)
-            del self._reqs_to_send[req_id]
             # Notify consumers so they fail (and retry) any pull still
             # planned or in flight for this rid, then hold the blocks
             # for a grace window before the real free: a read that
@@ -2592,6 +2628,21 @@ class NixlBaseConnectorWorker:
                     old,
                     new_expiry,
                 )
+
+    def _pop_expired_send_requests(
+        self, now: float
+    ) -> list[tuple[ReqId, float]]:
+        if isinstance(self._reqs_to_send, RequestExpiryTracker):
+            return self._reqs_to_send.pop_expired(now)
+
+        expired = [
+            (req_id, deadline)
+            for req_id, deadline in self._reqs_to_send.items()
+            if deadline <= now
+        ]
+        for req_id, _ in expired:
+            del self._reqs_to_send[req_id]
+        return expired
 
     def _pop_done_transfers(
         self,
