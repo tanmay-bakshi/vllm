@@ -27,6 +27,9 @@ class HandleState(StrEnum):
     ERR = "err"
 
 
+# Releasing a loaded NIXL/UCX request may cancel or free its request object
+# without proving that cancellation completed. ERR and UNKNOWN can therefore
+# still write; only DONE and states that never posted prove native quiescence.
 _NATIVE_QUIESCENT_STATES = {
     HandleState.NEVER_POSTED,
     HandleState.PREPARE_FAILED,

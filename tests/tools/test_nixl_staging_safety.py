@@ -224,6 +224,32 @@ def test_production_done_observed_at_deadline_is_not_failed() -> None:
     worker.nixl_wrapper.release_xfer_handle.assert_called_once()
 
 
+def test_production_done_release_failure_retains_handle_and_generation() -> None:
+    worker_type = _production_worker_methods(
+        "_fail_coalesced_plan",
+        "_poll_coalesced_plans",
+    )
+    allocator, plan = _plan(statuses=("DONE",))
+    native_handle = plan.slots[0].native_handle
+    worker = worker_type()
+    worker._coalesce_plans = {plan.request_id: plan}
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.get_xfer_telemetry.return_value = object()
+    worker.nixl_wrapper.release_xfer_handle.side_effect = RuntimeError(
+        "release exploded"
+    )
+    worker.xfer_stats = MagicMock()
+
+    with pytest.raises(StagingSafetyError, match="safety proof failed"):
+        worker._poll_coalesced_plans()
+
+    assert allocator.require_active(plan.lease.generation) is plan
+    assert plan.operation_failed
+    assert plan.slots[0].state is HandleState.DONE
+    assert plan.slots[0].native_handle is native_handle
+    assert plan.slots[0].native_released is False
+
+
 def test_production_sync_failure_keeps_owned_generation() -> None:
     torch_module = MagicMock()
     torch_module.cuda.synchronize.side_effect = RuntimeError("sync exploded")

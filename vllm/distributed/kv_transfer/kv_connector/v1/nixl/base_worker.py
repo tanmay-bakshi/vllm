@@ -3239,13 +3239,12 @@ class NixlBaseConnectorWorker:
                     telemetry = self.nixl_wrapper.get_xfer_telemetry(slot.native_handle)
                     self.xfer_stats.record_transfer(telemetry)
                     self.nixl_wrapper.release_xfer_handle(slot.native_handle)
-                except Exception:
-                    logger.error(
-                        "DONE handle cleanup failed for coalesced plan %s rank %s; "
-                        "retaining the terminal handle\n%s",
-                        plan.lease.owner_id,
-                        source_rank,
-                        traceback.format_exc(),
+                except Exception as error:
+                    stacktrace = traceback.format_exc()
+                    self._fail_coalesced_plan(
+                        plan,
+                        f"rank {source_rank} DONE handle cleanup raised\n{stacktrace}",
+                        error,
                     )
                 else:
                     plan.mark_native_released(source_rank)
