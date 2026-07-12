@@ -190,7 +190,7 @@ def test_zero_byte_full_prefix_observation_is_explicitly_non_evidentiary() -> No
     identity = _identity(byte_length=0)
     digest = compute_integrity_digest(identity, b"")
     observation = IntegrityObservation(
-        stage=IntegrityStage.STAGING,
+        stage=IntegrityStage.STAGING_RAW,
         identity=identity,
         digest=digest,
         child_request_id="child",

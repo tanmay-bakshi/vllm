@@ -1,7 +1,9 @@
 """Deterministic payloads and integrity observations for GPU runtime roles."""
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass
+from functools import cache
 from pathlib import Path
 
 import torch
@@ -41,6 +43,68 @@ class ObservationContext:
     iteration: int
     child_request_id: str
     consumer_engine_id: str
+
+
+@cache
+def compute_rig_semantic_contract_digest(
+    config: RigConfig,
+    group_index: int,
+    region_index: int,
+) -> bytes:
+    """Hash one exact synthetic group-to-region interpretation.
+
+    The production localization contract is built from runtime cache specs and
+    tensor descriptors. The model-free rig has no scheduler or model tensors,
+    so its corresponding authority is the checked-in, typed rig geometry. The
+    digest explicitly distinguishes semantically owned rows from transport-only
+    broadcast rows.
+
+    :param config: Complete typed rig configuration.
+    :param group_index: KV-cache group owning the transfer position.
+    :param region_index: Physical registration region carrying the row.
+    :returns: Thirty-two-byte BLAKE2b semantic contract digest.
+    """
+    group = config.groups[group_index]
+    region = config.regions[region_index]
+    source_shape = (config.source_block_count, 2, region.row_bytes // 2)
+    destination_shape = (
+        config.source_block_count,
+        2,
+        len(config.producer_devices),
+        region.row_bytes // 2,
+    )
+    contract = {
+        "schema_version": IntegrityIdentity.SCHEMA_VERSION,
+        "contract": "gemma4-nixl-micro-rig-synthetic-v1",
+        "group_index": group.index,
+        "group_name": group.name,
+        "group_token_capacity": group.token_capacity,
+        "owned_region_indices": group.owned_region_indices,
+        "region_index": region_index,
+        "region_name": region.name,
+        "row_bytes": region.row_bytes,
+        "semantically_owned": region_index in group.owned_region_indices,
+        "source_dtype": "uint8",
+        "source_layout": "block,plane,row-byte",
+        "source_shape": source_shape,
+        "source_strides": (region.row_bytes, region.row_bytes // 2, 1),
+        "source_plane_contract": 2,
+        "destination_dtype": "uint8",
+        "destination_layout": "block,plane,rank-slot,row-byte",
+        "destination_shape": destination_shape,
+        "destination_strides": (
+            region.row_bytes * len(config.producer_devices),
+            region.row_bytes * len(config.producer_devices) // 2,
+            region.row_bytes // 2,
+            1,
+        ),
+    }
+    payload = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.blake2b(
+        payload,
+        digest_size=32,
+        person=b"p2d-rig-sem-v1",
+    ).digest()
 
 
 def _mix32(values: torch.Tensor) -> torch.Tensor:
@@ -398,6 +462,7 @@ def verify_destination_rows(
 
 def _observation(
     *,
+    config: RigConfig,
     context: ObservationContext,
     stage: IntegrityStage,
     plan: TransferPlan,
@@ -408,6 +473,7 @@ def _observation(
 ) -> IntegrityObservation:
     """Hash one physical source row under its exact logical lineage.
 
+    :param config: Complete typed rig configuration.
     :param context: Shared iteration lineage.
     :param stage: Source, staging, or destination observation point.
     :param plan: Exact stable-sorted transfer plan.
@@ -418,22 +484,35 @@ def _observation(
     :returns: Canonical integrity observation.
     """
     pairing = plan.sorted_pairings[sorted_position]
+    group = config.groups[pairing.group_index]
     identity = IntegrityIdentity(
         run_id=context.run_id,
         transport_arm=context.transport_arm,
         producer_engine_id=context.producer_engine_id,
         producer_request_id=context.producer_request_id,
+        registration_generation=(
+            f"{context.run_id}:{context.transport_arm}:"
+            f"producer-rank-{source_rank}:registration-1"
+        ),
+        semantic_contract_digest=compute_rig_semantic_contract_digest(
+            config,
+            pairing.group_index,
+            region_index,
+        ),
         offer_generation=context.offer_generation,
         iteration=context.iteration,
         source_rank=source_rank,
         region_index=region_index,
         group_index=pairing.group_index,
-        source_position=pairing.source_position,
+        plane_index=-1,
+        source_position=pairing.group_position,
         remote_block_id=pairing.remote_block_id,
+        valid_token_extent=config.valid_token_extent,
+        group_token_capacity=group.token_capacity,
         payload_kind=IntegrityPayloadKind.WIRE,
         byte_length=payload.nbytes,
     )
-    is_source = stage is IntegrityStage.SOURCE
+    is_source = stage in (IntegrityStage.SOURCE_PRE, IntegrityStage.SOURCE_POST)
     return IntegrityObservation(
         stage=stage,
         identity=identity,
@@ -480,8 +559,9 @@ def source_observations(
             payload = selected_bytes[start : start + region_config.row_bytes]
             observations.append(
                 _observation(
+                    config=config,
                     context=context,
-                    stage=IntegrityStage.SOURCE,
+                    stage=IntegrityStage.SOURCE_PRE,
                     plan=plan,
                     source_rank=source_rank,
                     region_index=region_index,
@@ -522,8 +602,9 @@ def staging_observations(
                 payload = host_bytes[start : start + region_config.row_bytes]
                 observations.append(
                     _observation(
+                        config=config,
                         context=context,
-                        stage=IntegrityStage.STAGING,
+                        stage=IntegrityStage.STAGING_RAW,
                         plan=plan,
                         source_rank=rank,
                         region_index=region_index,
@@ -567,6 +648,7 @@ def destination_observations(
                 payload = host_bytes[start : start + region_config.row_bytes]
                 observations.append(
                     _observation(
+                        config=config,
                         context=context,
                         stage=IntegrityStage.DESTINATION,
                         plan=plan,

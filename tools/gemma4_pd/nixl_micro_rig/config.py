@@ -147,6 +147,8 @@ class GroupConfig:
 
     :ivar index: Stable KV-cache group index.
     :ivar name: Human-readable group identity.
+    :ivar token_capacity: Exact number of request tokens represented by one
+        physical source block for this group.
     :ivar remote_position_count: P positions before prefix trimming.
     :ivar local_position_count: D positions remaining after a prefix hit.
     :ivar owned_region_indices: Semantically live regions for the group. The
@@ -155,6 +157,7 @@ class GroupConfig:
 
     index: int
     name: str
+    token_capacity: int
     remote_position_count: int
     local_position_count: int
     owned_region_indices: tuple[int, ...]
@@ -164,6 +167,8 @@ class GroupConfig:
             raise ConfigError("group index must be non-negative")
         if len(self.name) == 0:
             raise ConfigError("group name must not be empty")
+        if self.token_capacity <= 0:
+            raise ConfigError("group token_capacity must be positive")
         if self.remote_position_count <= 0:
             raise ConfigError("group remote_position_count must be positive")
         if self.local_position_count < 0:
@@ -194,6 +199,7 @@ class GroupConfig:
             required={
                 "index",
                 "name",
+                "token_capacity",
                 "remote_position_count",
                 "local_position_count",
                 "owned_region_indices",
@@ -204,6 +210,7 @@ class GroupConfig:
         return cls(
             index=_as_int(obj["index"], f"{context}.index"),
             name=_as_str(obj["name"], f"{context}.name"),
+            token_capacity=_as_int(obj["token_capacity"], f"{context}.token_capacity"),
             remote_position_count=_as_int(
                 obj["remote_position_count"],
                 f"{context}.remote_position_count",
@@ -422,6 +429,8 @@ class RigConfig:
     :ivar consumer_device: Physical GPU used for D staging, scatter, and victim.
     :ivar protected_devices: Physical GPUs the rig must never select.
     :ivar source_block_count: Blocks in every P registration region.
+    :ivar valid_token_extent: Exact synthetic request-token extent represented
+        by every configured transfer plan.
     :ivar staging_capacity_mib: D staging registration capacity.
     :ivar nixl_num_threads: NIXL UCX worker thread count.
     :ivar pattern_chunk_bytes: Maximum verification pattern chunk.
@@ -444,6 +453,7 @@ class RigConfig:
     consumer_device: int
     protected_devices: tuple[int, ...]
     source_block_count: int
+    valid_token_extent: int
     staging_capacity_mib: int
     nixl_num_threads: int
     pattern_chunk_bytes: int
@@ -502,6 +512,8 @@ class RigConfig:
             raise ConfigError("device IDs must be non-negative")
         if self.source_block_count <= 0:
             raise ConfigError("source_block_count must be positive")
+        if self.valid_token_extent <= 0:
+            raise ConfigError("valid_token_extent must be positive")
         if self.staging_capacity_mib <= 0:
             raise ConfigError("staging_capacity_mib must be positive")
         if self.nixl_num_threads < 0:
@@ -601,6 +613,7 @@ class RigConfig:
             "consumer_device",
             "protected_devices",
             "source_block_count",
+            "valid_token_extent",
             "staging_capacity_mib",
             "nixl_num_threads",
             "pattern_chunk_bytes",
@@ -648,6 +661,7 @@ class RigConfig:
                 for index, item in enumerate(protected_values)
             ),
             source_block_count=_as_int(obj["source_block_count"], "source_block_count"),
+            valid_token_extent=_as_int(obj["valid_token_extent"], "valid_token_extent"),
             staging_capacity_mib=_as_int(
                 obj["staging_capacity_mib"], "staging_capacity_mib"
             ),

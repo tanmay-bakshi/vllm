@@ -15,6 +15,7 @@ from tools.gemma4_pd.nixl_micro_rig.config import (
     load_config,
 )
 from tools.gemma4_pd.nixl_micro_rig.data import (
+    compute_rig_semantic_contract_digest,
     expected_plane_bytes,
     fill_destination_canary_rows,
     verify_destination_canary_rows,
@@ -60,6 +61,8 @@ def test_default_geometry_matches_captured_storm37b_handshakes() -> None:
     plan = build_plan(config, scenario)
 
     assert plan.position_count == 2672
+    assert config.valid_token_extent == 16240
+    assert tuple(group.token_capacity for group in config.groups) == (16,) * 13
     assert plan.rank_count == 4
     assert plan.staging_bytes == 7_004_487_680
     assert plan.staging_bytes // (1024 * 1024) == 6680
@@ -69,6 +72,18 @@ def test_default_geometry_matches_captured_storm37b_handshakes() -> None:
         region_index * 700_448_768 for region_index in range(10)
     )
     assert plan.replay_manifest is None
+
+
+def test_semantic_contract_binds_group_region_and_ownership() -> None:
+    config = load_config(CONFIG_PATH)
+
+    owned = compute_rig_semantic_contract_digest(config, 0, 0)
+    other_group = compute_rig_semantic_contract_digest(config, 1, 0)
+    transport_only = compute_rig_semantic_contract_digest(config, 12, 0)
+    other_region = compute_rig_semantic_contract_digest(config, 0, 1)
+
+    assert len(owned) == 32
+    assert len({owned, other_group, transport_only, other_region}) == 4
 
 
 @pytest.mark.parametrize(

@@ -8,6 +8,7 @@
   "consumer_device": 4,
   "protected_devices": [6, 7],
   "source_block_count": 64000,
+  "valid_token_extent": 16240,
   "staging_capacity_mib": 12288,
   "nixl_num_threads": 4,
   "pattern_chunk_bytes": 1048576,
@@ -27,19 +28,19 @@
     {"name": "region_9", "row_bytes": 65536}
   ],
   "groups": [
-    {"index": 0, "name": "local_0", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
-    {"index": 1, "name": "local_1", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
-    {"index": 2, "name": "local_2", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
-    {"index": 3, "name": "local_3", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
-    {"index": 4, "name": "local_4", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
-    {"index": 5, "name": "local_5", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
-    {"index": 6, "name": "local_6", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
-    {"index": 7, "name": "local_7", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
-    {"index": 8, "name": "local_8", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
-    {"index": 9, "name": "local_9", "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
-    {"index": 10, "name": "global_0", "remote_position_count": 1015, "local_position_count": 1015, "owned_region_indices": [0, 1, 2, 3, 4]},
-    {"index": 11, "name": "global_1", "remote_position_count": 1015, "local_position_count": 1015, "owned_region_indices": [0, 1, 2, 3, 4]},
-    {"index": 12, "name": "dflash", "remote_position_count": 2, "local_position_count": 2, "owned_region_indices": [5, 6, 7, 8, 9]}
+    {"index": 0, "name": "local_0", "token_capacity": 16, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 1, "name": "local_1", "token_capacity": 16, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 2, "name": "local_2", "token_capacity": 16, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 3, "name": "local_3", "token_capacity": 16, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 4, "name": "local_4", "token_capacity": 16, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 5, "name": "local_5", "token_capacity": 16, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 6, "name": "local_6", "token_capacity": 16, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 7, "name": "local_7", "token_capacity": 16, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 8, "name": "local_8", "token_capacity": 16, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 9, "name": "local_9", "token_capacity": 16, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 10, "name": "global_0", "token_capacity": 16, "remote_position_count": 1015, "local_position_count": 1015, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 11, "name": "global_1", "token_capacity": 16, "remote_position_count": 1015, "local_position_count": 1015, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 12, "name": "dflash", "token_capacity": 16, "remote_position_count": 2, "local_position_count": 2, "owned_region_indices": [5, 6, 7, 8, 9]}
   ],
   "scenarios": [
     {
