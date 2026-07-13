@@ -74,8 +74,8 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlEventRecord,
     NixlIntegrityLeaf,
     NixlLocalizationConfig,
-    NixlLocalizationWorkerMetadata,
     NixlRegionDescriptor,
+    NixlSourceContract,
     NixlSourceManifest,
     NixlSourceManifestRecord,
     NixlSourceRoster,
@@ -84,8 +84,6 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     compute_semantic_contract_digest,
     leaf_source_key,
     seal_source_manifest,
-    select_source_manifest,
-    validate_capture,
     validate_source_manifest_structure,
 )
 from vllm.distributed.kv_transfer.staging_ownership import (
@@ -523,6 +521,9 @@ class NixlBaseConnectorWorker:
         self._remote_registration_generations: dict[EngineId, dict[int, str]] = (
             defaultdict(dict)
         )
+        self._remote_source_semantics: dict[
+            EngineId, dict[int, tuple[tuple[int, ...], tuple[int, ...]]]
+        ] = defaultdict(dict)
         # region index -> registered cache tensor (scatter destinations)
         self._region_tensors: list[torch.Tensor] = []
         self._region_descriptors: tuple[NixlRegionDescriptor, ...] = ()
@@ -532,20 +533,13 @@ class NixlBaseConnectorWorker:
                 self._localization_config,
                 self.engine_id,
                 self.tp_rank,
+                self.world_size,
+                self.model_config.get_total_num_kv_heads(),
             )
             if self._localization_config.enabled
             else None
         )
         self._localization_source_rosters: dict[ReqId, NixlSourceRoster] = {}
-        self._localization_source_pre: dict[tuple[ReqId, int], NixlSourceManifest] = {}
-        self._localization_pending_manifests: dict[
-            tuple[ReqId, int], NixlSourceManifest
-        ] = {}
-        self._localization_expected_by_request: dict[
-            ReqId, dict[int, NixlSourceManifest]
-        ] = {}
-        self._localization_manifest_deadlines: dict[ReqId, float] = {}
-        self._localization_waiting: dict[ReqId, ReqMeta] = {}
         self._localization_pre_read_plans: dict[ReqId, dict[str, Any]] = {}
         self._localization_zero_recorded: set[ReqId] = set()
         self._localization_terminal_recorded: set[ReqId] = set()
@@ -1195,6 +1189,10 @@ class NixlBaseConnectorWorker:
             ),
             registration_generation=self._registration_generation,
             regions=self._region_descriptors,
+            source_group_planes=tuple(
+                1 if flag else 2 for flag in self._sp_group_flags()
+            ),
+            physical_group_token_capacities=(self._physical_group_token_capacities()),
         )
         assert self.compat_hash is not None
         encoder = msgspec.msgpack.Encoder()
@@ -1503,6 +1501,10 @@ class NixlBaseConnectorWorker:
             ),
             registration_generation=self._registration_generation,
             regions=self._region_descriptors,
+            source_group_planes=tuple(
+                1 if flag else 2 for flag in self._sp_group_flags()
+            ),
+            physical_group_token_capacities=(self._physical_group_token_capacities()),
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1835,6 +1837,8 @@ class NixlBaseConnectorWorker:
         if engine_id not in self.dst_num_blocks:
             self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
 
+        self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
+
         # Keep track of remote agent kv caches base addresses.
         self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
             nixl_agent_meta.kv_caches_base_addr
@@ -1850,7 +1854,10 @@ class NixlBaseConnectorWorker:
         self._remote_registration_generations[engine_id][remote_tp_rank] = (
             nixl_agent_meta.registration_generation
         )
-        self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
+        self._remote_source_semantics[engine_id][remote_tp_rank] = (
+            nixl_agent_meta.source_group_planes,
+            nixl_agent_meta.physical_group_token_capacities,
+        )
 
         # This is 1 when P and D `--tensor-parallel-size` match. Otherwise,
         # this is the ratio between the two sizes.
@@ -2224,7 +2231,7 @@ class NixlBaseConnectorWorker:
         self,
         rosters: dict[ReqId, NixlSourceRoster],
     ) -> None:
-        """Snapshot newly offered P allocations before D may post a read.
+        """Retain newly offered producer allocations until read completion.
 
         :param rosters: Exact post-clipping logical block rosters from the
             scheduler.
@@ -2238,50 +2245,46 @@ class NixlBaseConnectorWorker:
         for req_id, logical_roster in rosters.items():
             if self._localization_config.enabled_for(req_id) is False:
                 continue
-            key = (req_id, logical_roster.offer_generation)
-            if key in self._localization_source_pre:
-                raise LocalizationError(f"duplicate source roster {key}")
+            if req_id in self._localization_source_rosters:
+                raise LocalizationError(f"duplicate source roster for {req_id}")
             physical_groups = self._logical_to_kernel_block_ids(
                 [list(group) for group in logical_roster.block_ids]
             )
-            if len(logical_roster.group_token_capacities) != len(physical_groups):
+            physical_capacities = self._physical_group_token_capacities()
+            if len(logical_roster.group_token_capacities) != len(
+                physical_groups
+            ) or len(physical_capacities) != len(physical_groups):
                 raise LocalizationError(
                     f"source roster token-capacity mismatch for {req_id}"
                 )
-            physical_capacities: list[int] = []
-            for group_index, capacity in enumerate(
-                logical_roster.group_token_capacities
-            ):
-                spec = self.kv_cache_config.kv_cache_groups[group_index].kv_cache_spec
+            for group_index, physical_capacity in enumerate(physical_capacities):
                 factor = (
                     1
-                    if isinstance(spec, MambaSpec)
+                    if isinstance(
+                        self.kv_cache_config.kv_cache_groups[group_index].kv_cache_spec,
+                        MambaSpec,
+                    )
                     else self._physical_blocks_per_logical_kv_block
                 )
-                if capacity <= 0 or capacity % factor != 0:
+                if (
+                    logical_roster.group_token_capacities[group_index]
+                    != physical_capacity * factor
+                ):
                     raise LocalizationError(
-                        f"source roster group {group_index} token capacity cannot "
-                        "be represented by physical kernel blocks"
+                        f"source roster group {group_index} token capacity differs "
+                        "from the registered physical contract"
                     )
-                physical_capacities.append(capacity // factor)
             physical_roster = NixlSourceRoster(
                 offer_generation=logical_roster.offer_generation,
                 iteration=logical_roster.iteration,
                 valid_token_extent=logical_roster.valid_token_extent,
-                group_token_capacities=tuple(physical_capacities),
+                group_token_capacities=physical_capacities,
                 block_ids=tuple(
                     tuple(int(block_id) for block_id in group)
                     for group in physical_groups
                 ),
             )
-            manifest = self._localization_capture_source_manifest(
-                req_id,
-                physical_roster,
-                IntegrityStage.SOURCE_PRE,
-            )
             self._localization_source_rosters[req_id] = physical_roster
-            self._localization_source_pre[key] = manifest
-            self._localization_pending_manifests[key] = manifest
 
     def _localization_capture_source_manifest(
         self,
@@ -2293,9 +2296,11 @@ class NixlBaseConnectorWorker:
 
         :param req_id: Producer request identifier.
         :param roster: Exact physical block roster.
-        :param stage: Pre-offer or pre-release source checkpoint.
+        :param stage: Completed-read source checkpoint.
         :returns: Compact per-region manifest.
         """
+        if stage is not IntegrityStage.SOURCE_POST:
+            raise LocalizationError("producer snapshots are only valid at SOURCE_POST")
         if not self._coalesce_region_rows():
             raise LocalizationError("source KV regions are not canonicalizable")
         assert self._region_rows is not None
@@ -2497,7 +2502,7 @@ class NixlBaseConnectorWorker:
         """Write one complete source manifest as a first-class artifact.
 
         :param manifest: Source manifest to preserve.
-        :param stage: Pre-offer or pre-release source checkpoint.
+        :param stage: Completed-read source checkpoint.
         """
         if self._localization_writer is None:
             raise LocalizationError("enabled localization has no artifact writer")
@@ -2510,7 +2515,7 @@ class NixlBaseConnectorWorker:
         )
 
     def _localization_capture_source_post(self, req_id: ReqId) -> None:
-        """Bookend a source allocation before its final release.
+        """Capture a completed-read source allocation before final release.
 
         :param req_id: Producer request whose pages are still pinned.
         """
@@ -2518,39 +2523,27 @@ class NixlBaseConnectorWorker:
             return
         roster = self._localization_source_rosters.get(req_id)
         if roster is None:
-            return
-        key = (req_id, roster.offer_generation)
-        pre_manifest = self._localization_source_pre.get(key)
-        if pre_manifest is None:
-            raise LocalizationError(f"source release has no PRE manifest for {key}")
-        post_manifest = self._localization_capture_source_manifest(
+            raise LocalizationError(
+                f"completed target read has no retained source roster for {req_id}"
+            )
+        self._localization_capture_source_manifest(
             req_id,
             roster,
             IntegrityStage.SOURCE_POST,
         )
-        errors = validate_capture(pre_manifest, post_manifest.leaves, None)
-        if len(errors) > 0:
-            raise LocalizationError(
-                f"source mutated while pinned for {key}: {errors[:8]}"
-            )
         del self._localization_source_rosters[req_id]
-        del self._localization_source_pre[key]
 
-    def build_localization_worker_meta(
-        self,
-    ) -> NixlLocalizationWorkerMetadata | None:
-        """Drain newly prepared source manifests for scheduler publication.
+    def _localization_discard_source_roster(self, req_id: ReqId) -> None:
+        """Discard a target roster whose transfer did not complete.
 
-        :returns: Per-rank manifests, or ``None`` when nothing became ready.
+        :param req_id: Producer request released without completion proof.
         """
-        if len(self._localization_pending_manifests) == 0:
-            return None
-        manifests = {
-            key: {manifest.source_rank: manifest}
-            for key, manifest in self._localization_pending_manifests.items()
-        }
-        self._localization_pending_manifests = {}
-        return NixlLocalizationWorkerMetadata(manifests=manifests)
+        if self._localization_config.enabled_for(req_id) is False:
+            return
+        if self._localization_source_rosters.pop(req_id, None) is None:
+            raise LocalizationError(
+                f"failed target release has no retained source roster for {req_id}"
+            )
 
     def _localization_capture_staging(
         self,
@@ -2570,16 +2563,18 @@ class NixlBaseConnectorWorker:
             return
         if self._staging_buf is None:
             raise LocalizationError("staging capture has no staging allocation")
-        manifests = self._localization_expected_by_request.get(req_id)
-        if manifests is None:
-            raise LocalizationError(f"staging capture lacks manifests for {req_id}")
         plan = ownership.scatter
+        contracts = tuple(plan["source_contracts"])
         positions = plan["transfer_order"]
         n_pos = int(plan["n_pos"])
         n_ranks = int(plan["n_ranks"])
+        if len(contracts) != n_ranks:
+            raise LocalizationError(f"staging capture lacks contracts for {req_id}")
         for rank_index, source_rank in enumerate(plan["source_ranks"]):
             start_ns = time.perf_counter_ns()
-            manifest = manifests[int(source_rank)]
+            contract = contracts[rank_index]
+            if contract.source_rank != int(source_rank):
+                raise LocalizationError("staging contract rank order differs")
             rank_slot = int(plan["slots"][rank_index])
             leaves: list[NixlIntegrityLeaf] = []
             mapping: dict[IntegrityLeafKey, tuple[int, int, int]] = {}
@@ -2598,7 +2593,7 @@ class NixlBaseConnectorWorker:
                     1,
                     self._localization_config.copy_chunk_bytes // row_bytes,
                 )
-                descriptor = manifest.regions[region_index]
+                descriptor = contract.regions[region_index]
                 owned_indices = [
                     index
                     for index, position in enumerate(positions)
@@ -2624,21 +2619,21 @@ class NixlBaseConnectorWorker:
                         position = positions[position_index]
                         payload = memoryview(host_rows[row_index].numpy()).cast("B")
                         semantic_contract_digest = compute_semantic_contract_digest(
-                            region=manifest.regions[region_index],
+                            region=contract.regions[region_index],
                             group_index=int(position.group_index),
                             group_token_capacity=int(position.group_token_capacity),
                             source_plane_contract=(
-                                manifest.source_group_planes[int(position.group_index)]
+                                contract.source_group_planes[int(position.group_index)]
                             ),
                         )
                         wire_identity = build_integrity_identity(
                             config=self._localization_config,
-                            producer_engine_id=manifest.producer_engine_id,
-                            producer_request_id=manifest.producer_request_id,
-                            registration_generation=(manifest.registration_generation),
+                            producer_engine_id=contract.producer_engine_id,
+                            producer_request_id=contract.producer_request_id,
+                            registration_generation=(contract.registration_generation),
                             semantic_contract_digest=semantic_contract_digest,
-                            offer_generation=manifest.offer_generation,
-                            iteration=manifest.iteration,
+                            offer_generation=contract.offer_generation,
+                            iteration=contract.iteration,
                             source_rank=int(source_rank),
                             region_index=region_index,
                             group_index=int(position.group_index),
@@ -2669,12 +2664,12 @@ class NixlBaseConnectorWorker:
                         commit_bytes = row_bytes // 2
                         commit_identity = build_integrity_identity(
                             config=self._localization_config,
-                            producer_engine_id=manifest.producer_engine_id,
-                            producer_request_id=manifest.producer_request_id,
-                            registration_generation=(manifest.registration_generation),
+                            producer_engine_id=contract.producer_engine_id,
+                            producer_request_id=contract.producer_request_id,
+                            registration_generation=(contract.registration_generation),
                             semantic_contract_digest=semantic_contract_digest,
-                            offer_generation=manifest.offer_generation,
-                            iteration=manifest.iteration,
+                            offer_generation=contract.offer_generation,
+                            iteration=contract.iteration,
                             source_rank=int(source_rank),
                             region_index=region_index,
                             group_index=int(position.group_index),
@@ -2702,7 +2697,7 @@ class NixlBaseConnectorWorker:
                         hashed_bytes += commit_bytes
             self._localization_finish_capture(
                 req_id=req_id,
-                manifest=manifest,
+                contract=contract,
                 stage=stage,
                 barrier=barrier,
                 leaves=tuple(leaves),
@@ -2730,14 +2725,16 @@ class NixlBaseConnectorWorker:
             return
         if self._region_rows is None:
             raise LocalizationError("destination capture has no canonical rows")
-        manifests = self._localization_expected_by_request.get(req_id)
-        if manifests is None:
-            raise LocalizationError(f"destination capture lacks manifests for {req_id}")
+        contracts = tuple(plan["source_contracts"])
         positions = plan["transfer_order"]
         n_ranks = int(plan["n_ranks"])
+        if len(contracts) != n_ranks:
+            raise LocalizationError(f"destination capture lacks contracts for {req_id}")
         for rank_index, source_rank in enumerate(plan["source_ranks"]):
             start_ns = time.perf_counter_ns()
-            manifest = manifests[int(source_rank)]
+            contract = contracts[rank_index]
+            if contract.source_rank != int(source_rank):
+                raise LocalizationError("destination contract rank order differs")
             rank_slot = int(plan["slots"][rank_index])
             leaves: list[NixlIntegrityLeaf] = []
             mapping: dict[IntegrityLeafKey, tuple[int, int, int]] = {}
@@ -2782,21 +2779,21 @@ class NixlBaseConnectorWorker:
                         position = positions[position_index]
                         payload = memoryview(host_rows[row_index].numpy()).cast("B")
                         semantic_contract_digest = compute_semantic_contract_digest(
-                            region=manifest.regions[region_index],
+                            region=contract.regions[region_index],
                             group_index=int(position.group_index),
                             group_token_capacity=int(position.group_token_capacity),
                             source_plane_contract=(
-                                manifest.source_group_planes[int(position.group_index)]
+                                contract.source_group_planes[int(position.group_index)]
                             ),
                         )
                         identity = build_integrity_identity(
                             config=self._localization_config,
-                            producer_engine_id=manifest.producer_engine_id,
-                            producer_request_id=manifest.producer_request_id,
-                            registration_generation=(manifest.registration_generation),
+                            producer_engine_id=contract.producer_engine_id,
+                            producer_request_id=contract.producer_request_id,
+                            registration_generation=(contract.registration_generation),
                             semantic_contract_digest=semantic_contract_digest,
-                            offer_generation=manifest.offer_generation,
-                            iteration=manifest.iteration,
+                            offer_generation=contract.offer_generation,
+                            iteration=contract.iteration,
                             source_rank=int(source_rank),
                             region_index=region_index,
                             group_index=int(position.group_index),
@@ -2861,21 +2858,21 @@ class NixlBaseConnectorWorker:
                         position = positions[position_index]
                         payload = memoryview(host_rows[row_index].numpy()).cast("B")
                         semantic_contract_digest = compute_semantic_contract_digest(
-                            region=manifest.regions[region_index],
+                            region=contract.regions[region_index],
                             group_index=int(position.group_index),
                             group_token_capacity=int(position.group_token_capacity),
                             source_plane_contract=(
-                                manifest.source_group_planes[int(position.group_index)]
+                                contract.source_group_planes[int(position.group_index)]
                             ),
                         )
                         identity = build_integrity_identity(
                             config=self._localization_config,
-                            producer_engine_id=manifest.producer_engine_id,
-                            producer_request_id=manifest.producer_request_id,
-                            registration_generation=(manifest.registration_generation),
+                            producer_engine_id=contract.producer_engine_id,
+                            producer_request_id=contract.producer_request_id,
+                            registration_generation=(contract.registration_generation),
                             semantic_contract_digest=semantic_contract_digest,
-                            offer_generation=manifest.offer_generation,
-                            iteration=manifest.iteration,
+                            offer_generation=contract.offer_generation,
+                            iteration=contract.iteration,
                             source_rank=int(source_rank),
                             region_index=region_index,
                             group_index=int(position.group_index),
@@ -2903,7 +2900,7 @@ class NixlBaseConnectorWorker:
                         hashed_bytes += chunk_bytes
             self._localization_finish_capture(
                 req_id=req_id,
-                manifest=manifest,
+                contract=contract,
                 stage=stage,
                 barrier=barrier,
                 leaves=tuple(leaves),
@@ -2917,7 +2914,7 @@ class NixlBaseConnectorWorker:
         self,
         *,
         req_id: ReqId,
-        manifest: NixlSourceManifest,
+        contract: NixlSourceContract,
         stage: IntegrityStage,
         barrier: str,
         leaves: tuple[NixlIntegrityLeaf, ...],
@@ -2926,29 +2923,29 @@ class NixlBaseConnectorWorker:
         hashed_bytes: int,
         duration_ns: int,
     ) -> None:
-        """Persist and validate one complete rank/stage observation.
-
-        :raises LocalizationError: If content, cardinality, or placement differs.
-        """
+        """Persist one complete rank and stage observation for offline proof."""
         if self._localization_writer is None:
             raise LocalizationError("enabled localization has no artifact writer")
-        selected_manifest = select_source_manifest(manifest, set(mapping))
-        errors = validate_capture(selected_manifest, leaves, mapping)
+        if len(leaves) != len(mapping) or set(map(leaf_source_key, leaves)) != set(
+            mapping
+        ):
+            raise LocalizationError(
+                f"{stage.value} capture mapping differs from its leaf set"
+            )
         self._localization_writer.write(
             NixlCaptureRecord(
                 record_type=NixlCaptureRecord.RECORD_TYPE,
-                schema_version=manifest.schema_version,
+                schema_version=contract.schema_version,
                 stage=stage,
-                run_id=manifest.run_id,
-                transport_arm=manifest.transport_arm,
-                producer_engine_id=manifest.producer_engine_id,
-                producer_request_id=manifest.producer_request_id,
-                registration_generation=manifest.registration_generation,
-                source_manifest_digest=manifest.manifest_digest,
-                offer_generation=manifest.offer_generation,
-                iteration=manifest.iteration,
+                run_id=contract.run_id,
+                transport_arm=contract.transport_arm,
+                producer_engine_id=contract.producer_engine_id,
+                producer_request_id=contract.producer_request_id,
+                registration_generation=contract.registration_generation,
+                offer_generation=contract.offer_generation,
+                iteration=contract.iteration,
                 child_request_id=req_id,
-                source_rank=manifest.source_rank,
+                source_rank=contract.source_rank,
                 observer_engine_id=self.engine_id,
                 observer_rank=self.tp_rank,
                 observer=True,
@@ -2961,21 +2958,15 @@ class NixlBaseConnectorWorker:
         )
         logger.warning(
             "[p2d-localize] stage=%s child=%s producer=%s source_rank=%d "
-            "copied_mib=%.1f hashed_mib=%.1f duration_s=%.3f "
-            "manifest=%s observer=true",
+            "copied_mib=%.1f hashed_mib=%.1f duration_s=%.3f observer=true",
             stage.value,
             req_id,
-            manifest.producer_request_id,
-            manifest.source_rank,
+            contract.producer_request_id,
+            contract.source_rank,
             copied_bytes / (1024 * 1024),
             hashed_bytes / (1024 * 1024),
             duration_ns / 1_000_000_000,
-            manifest.manifest_digest.hex(),
         )
-        if len(errors) > 0:
-            raise LocalizationError(
-                f"{stage.value} localization mismatch for {req_id}: {errors[:8]}"
-            )
 
     def _localization_capture_pre_read(self, req_ids: set[ReqId]) -> None:
         """Capture destination rows after transfer drain and before model forward.
@@ -2988,7 +2979,7 @@ class NixlBaseConnectorWorker:
             return
         if len(self._localization_pre_read_plans) != 1:
             raise LocalizationError(
-                "multiple localization targets are pending first-read verification"
+                "multiple localization targets are pending first-read capture"
             )
         req_id, plan = next(iter(self._localization_pre_read_plans.items()))
         if self._localization_config.enabled_for(req_id) is False:
@@ -3002,17 +2993,19 @@ class NixlBaseConnectorWorker:
             IntegrityStage.PRE_READ,
             "after_transfer_phase_drain_before_model_forward",
         )
-        plan_remote_request = str(plan["producer_request_id"])
-        is_trace = self._localization_config.mode is LocalizationMode.TRACE
+        contracts = tuple(plan["source_contracts"])
+        if len(contracts) == 0:
+            raise LocalizationError("pre-read plan has no source contracts")
+        producer = contracts[0]
+        is_sham = self._localization_config.mode is LocalizationMode.SHAM
         self._localization_record_event(
-            code=("VERIFIED_PRE_READ" if is_trace else "SHAM_PRE_READ_COMPLETE"),
-            evidentiary=is_trace,
+            code=("SHAM_CAPTURE_COMPLETE" if is_sham else "CAPTURE_COMPLETE"),
+            evidentiary=False,
             child_request_id=req_id,
-            producer_engine_id=str(plan["producer_engine_id"]),
-            producer_request_id=plan_remote_request,
-            detail="all required ranks and stages matched before first read",
+            producer_engine_id=producer.producer_engine_id,
+            producer_request_id=producer.producer_request_id,
+            detail="all decoder stages captured; offline source comparison pending",
         )
-        self._localization_expected_by_request.pop(req_id, None)
 
     def _localization_record_event(
         self,
@@ -3341,6 +3334,27 @@ class NixlBaseConnectorWorker:
                 for g in self.kv_cache_config.kv_cache_groups
             ]
         return self._sp_flags_cache
+
+    def _physical_group_token_capacities(self) -> tuple[int, ...]:
+        """Return each cache group's token capacity per registered row.
+
+        :returns: Physical token capacities in cache-group order.
+        """
+        capacities: list[int] = []
+        for group in self.kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            factor = (
+                1
+                if isinstance(spec, MambaSpec)
+                else self._physical_blocks_per_logical_kv_block
+            )
+            if spec.block_size <= 0 or spec.block_size % factor != 0:
+                raise LocalizationError(
+                    "cache-group token capacity cannot be represented by "
+                    "physical kernel blocks"
+                )
+            capacities.append(int(spec.block_size // factor))
+        return tuple(capacities)
 
     def _coalesce_region_rows(self) -> bool:
         """Canonicalize every region tensor to a (num_blocks, row_bytes)
@@ -3915,7 +3929,7 @@ class NixlBaseConnectorWorker:
             self._grace_frees[req_id] = now + grace
         # Drain grace-held frees whose window elapsed.
         for req_id in [r for r, t in self._grace_frees.items() if now >= t]:
-            self._localization_capture_source_post(req_id)
+            self._localization_discard_source_roster(req_id)
             del self._grace_frees[req_id]
             done_sending.add(req_id)
 
@@ -4222,11 +4236,8 @@ class NixlBaseConnectorWorker:
             child_request_id=req_id,
             producer_engine_id=(remote.engine_id if remote is not None else None),
             producer_request_id=(remote.request_id if remote is not None else None),
-            detail="transfer failed before verified publication",
+            detail="transfer failed before complete diagnostic capture",
         )
-        self._localization_waiting.pop(req_id, None)
-        self._localization_manifest_deadlines.pop(req_id, None)
-        self._localization_expected_by_request.pop(req_id, None)
         self._localization_pre_read_plans.pop(req_id, None)
         # Use .get() here as the metadata cleanup is handled by get_finished()
         # TODO (NickLucche) handle failed transfer for HMA.

@@ -44,8 +44,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   3: Add physical_blocks_per_logical_kv_block to NixlAgentMetadata
 #   4: Add KV block lease renewal through heartbeats
 #   5: Add gated P-to-D source integrity manifests
+#   6: Replace source gating with post-transfer source references
 #
-NIXL_CONNECTOR_VERSION: int = 5
+NIXL_CONNECTOR_VERSION: int = 6
 
 
 @dataclass
@@ -63,6 +64,8 @@ class NixlAgentMetadata:
     physical_blocks_per_logical_kv_block: int
     registration_generation: str = ""
     regions: tuple[NixlRegionDescriptor, ...] = ()
+    source_group_planes: tuple[int, ...] = ()
+    physical_group_token_capacities: tuple[int, ...] = ()
 
 
 @dataclass
@@ -163,6 +166,7 @@ class RemoteMeta:
     port: int
     engine_id: str
     request_id: str
+    remote_num_tokens: int = 0
     # How many consumer-side requests will pull/notify for this remote
     # request (n>1 children all pull the same rid). The producer frees
     # its blocks only after this many completion notifications per rank.
@@ -189,9 +193,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
         self.reqs_to_send: dict[ReqId, float] = {}
-        # P-side physical block rosters that must be snapshotted before a D
-        # localization observer is allowed to post one-sided reads.
-        self.source_integrity_rosters: dict[ReqId, NixlSourceRoster] = {}
+        # P-side block rosters retained until completed remote reads are observed.
+        self.source_rosters: dict[ReqId, NixlSourceRoster] = {}
         # Requests that will execute a model forward with this metadata. This
         # is distinct from producer-side lease tracking in reqs_in_batch.
         self.scheduled_request_ids: set[ReqId] = set()
@@ -244,16 +247,13 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             block_ids=kv_transfer_params["remote_block_ids"],
             engine_id=kv_transfer_params["remote_engine_id"],
             request_id=kv_transfer_params["remote_request_id"],
+            remote_num_tokens=int(kv_transfer_params["remote_num_tokens"]),
             host=kv_transfer_params["remote_host"],
             port=kv_transfer_params["remote_port"],
-            expected_consumers=int(
-                kv_transfer_params.get("expected_consumers") or 1
-            ),
+            expected_consumers=int(kv_transfer_params.get("expected_consumers") or 1),
             p2d_run_id=kv_transfer_params.get("p2d_run_id"),
             p2d_transport_arm=kv_transfer_params.get("p2d_transport_arm"),
-            p2d_offer_generation=kv_transfer_params.get(
-                "p2d_offer_generation"
-            ),
+            p2d_offer_generation=kv_transfer_params.get("p2d_offer_generation"),
             p2d_iteration=kv_transfer_params.get("p2d_iteration"),
         )
         self.reqs_to_recv[request_id] = req

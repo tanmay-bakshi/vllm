@@ -5,13 +5,9 @@
 import os
 import time
 import traceback
-from contextlib import ExitStack
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import msgspec
 import numpy as np
-import zmq
 
 from vllm.distributed.kv_transfer.integrity import IntegrityIdentity
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
@@ -24,21 +20,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
 from vllm.distributed.kv_transfer.nixl_localization import (
-    GET_SOURCE_MANIFEST_MSG,
     LocalizationError,
-    ManifestStatus,
     NixlEventRecord,
     NixlPlanPosition,
     NixlPlanRecord,
-    NixlSourceManifestResponse,
-    compute_source_manifest_digest,
+    NixlSourceContract,
     locate_subsequence,
-    validate_source_manifest_structure,
+    validate_source_contract_structure,
 )
 from vllm.logger import init_logger
-from vllm.utils.network_utils import make_zmq_path
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -47,22 +38,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-@dataclass(slots=True)
-class _SourceManifestRequest:
-    """One source-manifest exchange awaiting its producer response.
-
-    :ivar stack: Context stack that owns the request socket.
-    :ivar socket: REQ socket retained until its complete response is readable.
-    """
-
-    stack: ExitStack
-    socket: zmq.Socket
-
-
 class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     """Pull-specific (READ) worker logic."""
-
-    _localization_manifest_requests: dict[str, _SourceManifestRequest]
 
     def __init__(
         self,
@@ -70,8 +47,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         engine_id: str,
         kv_cache_config: "KVCacheConfig",
     ) -> None:
-        # ``__del__`` dispatches to this class's shutdown after partial init.
-        self._localization_manifest_requests = {}
         super().__init__(vllm_config, engine_id, kv_cache_config)
         if self._phase_separate_transfer_decode and not self.coalesce_pull:
             raise ValueError("phase_separate_transfer_decode requires coalesced pull")
@@ -80,21 +55,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 "phase_separate_transfer_decode requires stock DMA to be disabled"
             )
 
-    def shutdown(self) -> None:
-        """Close source-manifest exchanges and shut down the connector worker."""
-        for req_id in tuple(self._localization_manifest_requests):
-            self._drop_localization_manifest_request(req_id)
-        super().shutdown()
-
-    def _handle_failed_transfer(self, req_id: str, handle: int | None) -> None:
-        """Drop a manifest exchange before failing its transfer.
-
-        :param req_id: Request whose transfer failed.
-        :param handle: Optional native transfer handle to release.
-        """
-        self._drop_localization_manifest_request(req_id)
-        super()._handle_failed_transfer(req_id, handle)
-
     def start_load_kv(self, metadata: NixlConnectorMetadata) -> None:
         """Start and account for receive work required by this model step.
 
@@ -102,7 +62,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         """
         self._begin_transfer_phase()
         self._audit_retire(metadata)
-        self._localization_capture_source_rosters(metadata.source_integrity_rosters)
+        self._localization_capture_source_rosters(metadata.source_rosters)
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
@@ -147,34 +107,25 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Remove all requests that are not to be processed (eg aborted).
         for req_id in metadata.reqs_not_processed:
             self._reqs_to_process.discard(req_id)
-            waiting_meta = self._localization_waiting.get(req_id)
-            waiting_remote = waiting_meta.remote if waiting_meta is not None else None
             pre_read_plan = self._localization_pre_read_plans.get(req_id)
             producer_engine_id: str | None = None
             producer_request_id: str | None = None
-            if waiting_remote is not None:
-                producer_engine_id = waiting_remote.engine_id
-                producer_request_id = waiting_remote.request_id
-            elif pre_read_plan is not None:
-                producer_engine_id = str(pre_read_plan["producer_engine_id"])
-                producer_request_id = str(pre_read_plan["producer_request_id"])
+            if pre_read_plan is not None:
+                contracts = tuple(pre_read_plan["source_contracts"])
+                if len(contracts) > 0:
+                    producer_engine_id = contracts[0].producer_engine_id
+                    producer_request_id = contracts[0].producer_request_id
             self._localization_record_event(
                 code="REQUEST_ABORTED",
                 evidentiary=False,
                 child_request_id=req_id,
                 producer_engine_id=producer_engine_id,
                 producer_request_id=producer_request_id,
-                detail="request aborted before verified pre-read",
+                detail="request aborted before complete first-read capture",
             )
-            self._drop_localization_manifest_request(req_id)
-            self._localization_waiting.pop(req_id, None)
-            self._localization_manifest_deadlines.pop(req_id, None)
-            self._localization_expected_by_request.pop(req_id, None)
             self._localization_pre_read_plans.pop(req_id, None)
             # We should never get an abort after setting an expiry timer
             assert req_id not in self._reqs_to_send
-
-        self._service_localization_waiting()
 
         # Add to requests that are waiting to be read and track expiration.
         for req_id, expiration_time in metadata.reqs_to_send.items():
@@ -220,8 +171,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         observer_engine_id=self.engine_id,
                         observer_rank=self.tp_rank,
                         detail=(
-                            "full-prefix hits require prior VERIFIED provenance and "
-                            "are excluded from this localization protocol"
+                            "full-prefix hits have no transferred bytes and are "
+                            "excluded from this localization protocol"
                         ),
                         created_ns=time.time_ns(),
                     )
@@ -233,16 +184,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     f"full-prefix request {req_id} is non-evidentiary in "
                     "strict localization mode"
                 )
-
-        if (
-            self._localization_source_gate(
-                req_id,
-                meta,
-                tuple(int(rank) for rank in plan.all_source_ranks),
-            )
-            is False
-        ):
-            return
 
         if (
             meta.remote.request_id in self._released_rids
@@ -292,10 +233,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         if self.use_mla and tp_ratio < 0:
             assert len(read_specs) == 1
 
-        if (
-            localization_enabled
-            and sum(len(group) for group in local_block_ids) == 0
-        ):
+        if localization_enabled and sum(len(group) for group in local_block_ids) == 0:
             result = self._coalesced_read_request(req_id, meta, read_specs)
             if result != "posted":
                 raise LocalizationError(
@@ -308,11 +246,36 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # completed plans free staging. Localization forbids the stock path
         # because it has no staging or destination observation points.
         if self._coalesce_gate(engine_id, tp_ratio, read_specs):
-            res = self._coalesced_read_request(req_id, meta, read_specs)
+            source_contracts: tuple[NixlSourceContract, ...] = ()
+            if localization_enabled:
+                spec0 = read_specs[0]
+                raw_remote_groups = tuple(
+                    tuple(int(block_id) for block_id in group)
+                    for group in spec0.remote_block_ids
+                )
+                region_lengths = tuple(
+                    int(length)
+                    for length in self._remote_layout[engine_id][spec0.remote_rank][0]
+                )
+                source_contracts = self._localization_build_source_contracts(
+                    req_id,
+                    meta,
+                    read_specs,
+                    raw_remote_groups,
+                    region_lengths,
+                )
+            res = self._coalesced_read_request(
+                req_id,
+                meta,
+                read_specs,
+                source_contracts,
+            )
             if res == "posted":
                 return
             if res == "defer":
-                self._coalesce_pending.append((req_id, meta, read_specs))
+                self._coalesce_pending.append(
+                    (req_id, meta, read_specs, source_contracts)
+                )
                 logger.debug(
                     "coalesced pull: parked %s for staging (%s queued)",
                     req_id,
@@ -320,11 +283,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 )
                 return
 
-        if (
-            localization_enabled
-            or any(self._sp_group_flags())
-            or self._no_stock_dma()
-        ):
+        if localization_enabled or any(self._sp_group_flags()) or self._no_stock_dma():
             # F2b: the stock per-descriptor path cannot express the
             # single-plane K-half/2:1 mapping -- running it would write
             # a dual layout into a single-plane cache. Fail the request
@@ -347,263 +306,51 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
         self._stock_read_specs(req_id, meta, read_specs)
 
-    def _service_localization_waiting(self) -> None:
-        """Retry requests parked before the source-manifest gate."""
-        if len(self._localization_waiting) == 0:
-            return
-        for req_id, meta in list(self._localization_waiting.items()):
-            self._read_blocks_for_req(req_id, meta)
-
-    def _drop_localization_manifest_request(self, req_id: str) -> None:
-        """Close and forget one source-manifest exchange.
-
-        :param req_id: Decoder request that owns the exchange.
-        """
-        request = self._localization_manifest_requests.pop(req_id, None)
-        if request is None:
-            return
-        request.stack.close()
-
-    def _defer_localization_manifest_request(
-        self,
-        req_id: str,
-        meta: ReqMeta,
-        deadline: float,
-    ) -> bool:
-        """Park an incomplete manifest exchange within its absolute deadline.
-
-        :param req_id: Decoder request awaiting its producer manifest.
-        :param meta: Transfer metadata retained for a later engine step.
-        :param deadline: Deadline for the gate to remain incomplete.
-        :returns: Always ``False`` while the request remains parked.
-        :raises LocalizationError: When the gate is still incomplete at its deadline.
-        """
-        if time.perf_counter() < deadline:
-            self._localization_waiting[req_id] = meta
-            return False
-        self._drop_localization_manifest_request(req_id)
-        self._localization_waiting.pop(req_id, None)
-        self._localization_manifest_deadlines.pop(req_id, None)
-        raise LocalizationError(
-            f"source-manifest gate timed out for decoder request {req_id}"
-        )
-
-    def _localization_source_gate(
-        self,
-        req_id: str,
-        meta: ReqMeta,
-        required_ranks: tuple[int, ...],
-    ) -> bool:
-        """Require an all-rank P snapshot before posting any one-sided read.
-
-        :param req_id: Decoder child request identifier.
-        :param meta: Request transfer metadata.
-        :param required_ranks: P ranks whose bytes this D worker will read.
-        :returns: ``True`` only after an authoritative source manifest is ready.
-        :raises LocalizationError: On timeout, rejection, or protocol mismatch.
-        """
-        assert meta.remote is not None
-        remote = meta.remote
-        remote_lineage = (
-            remote.p2d_run_id,
-            remote.p2d_transport_arm,
-            remote.p2d_offer_generation,
-            remote.p2d_iteration,
-        )
-        if self._localization_config.enabled_for(req_id) is False:
-            if self._localization_config.enabled_for(remote.request_id) or any(
-                value is not None for value in remote_lineage
-            ):
-                raise LocalizationError(
-                    f"request {req_id} carries a target producer or localization "
-                    "lineage outside the decoder target"
-                )
-            return True
-        if (
-            len(required_ranks) == 0
-            or len(set(required_ranks)) != len(required_ranks)
-            or any(type(rank) is not int or rank < 0 for rank in required_ranks)
-        ):
-            self._drop_localization_manifest_request(req_id)
-            raise LocalizationError(
-                f"request {req_id} has invalid required source ranks"
-            )
-        if req_id in self._localization_expected_by_request:
-            self._drop_localization_manifest_request(req_id)
-            self._localization_waiting.pop(req_id, None)
-            return True
-        if (
-            self._localization_config.enabled_for(remote.request_id) is False
-            or remote.p2d_run_id != self._localization_config.run_id
-            or remote.p2d_transport_arm != self._localization_config.transport_arm
-            or remote.p2d_offer_generation is None
-            or remote.p2d_iteration is None
-        ):
-            self._drop_localization_manifest_request(req_id)
-            raise LocalizationError(
-                f"request {req_id} has incomplete or mismatched localization lineage"
-            )
-
-        deadline = self._localization_manifest_deadlines.get(req_id)
-        if deadline is None:
-            deadline = (
-                time.perf_counter() + self._localization_config.manifest_timeout_s
-            )
-            self._localization_manifest_deadlines[req_id] = deadline
-        path = make_zmq_path("tcp", remote.host, remote.port)
-        request = (
-            GET_SOURCE_MANIFEST_MSG,
-            self._localization_config.run_id,
-            self._localization_config.transport_arm,
-            remote.engine_id,
-            remote.request_id,
-            remote.p2d_offer_generation,
-            remote.p2d_iteration,
-            required_ranks,
-        )
-        manifest_request = self._localization_manifest_requests.get(req_id)
-        if manifest_request is None:
-            if time.perf_counter() >= deadline:
-                return self._defer_localization_manifest_request(
-                    req_id,
-                    meta,
-                    deadline,
-                )
-            with ExitStack() as opening_stack:
-                try:
-                    socket = opening_stack.enter_context(zmq_ctx(zmq.REQ, path))
-                    socket.send(msgspec.msgpack.encode(request), flags=zmq.NOBLOCK)
-                except zmq.Again:
-                    return self._defer_localization_manifest_request(
-                        req_id,
-                        meta,
-                        deadline,
-                    )
-                except zmq.ZMQError as error:
-                    raise LocalizationError(
-                        f"source-manifest side channel failed for {req_id}"
-                    ) from error
-                stack = opening_stack.pop_all()
-            manifest_request = _SourceManifestRequest(
-                stack=stack,
-                socket=socket,
-            )
-            self._localization_manifest_requests[req_id] = manifest_request
-        # A queued response completed the wait even if this step observes it
-        # after the deadline. Only an exchange that is still unreadable expires.
-        try:
-            response_bytes = manifest_request.socket.recv(flags=zmq.NOBLOCK)
-        except zmq.Again:
-            return self._defer_localization_manifest_request(
-                req_id,
-                meta,
-                deadline,
-            )
-        except zmq.ZMQError as error:
-            self._drop_localization_manifest_request(req_id)
-            raise LocalizationError(
-                f"source-manifest side channel failed for {req_id}"
-            ) from error
-        self._drop_localization_manifest_request(req_id)
-        try:
-            response = msgspec.msgpack.decode(
-                response_bytes,
-                type=NixlSourceManifestResponse,
-            )
-        except (msgspec.DecodeError, msgspec.ValidationError) as error:
-            raise LocalizationError(
-                f"source-manifest response is malformed for {req_id}"
-            ) from error
-        if response.status is ManifestStatus.PENDING:
-            return self._defer_localization_manifest_request(
-                req_id,
-                meta,
-                deadline,
-            )
-        if response.status is not ManifestStatus.READY:
-            raise LocalizationError(
-                f"source-manifest gate rejected {req_id}: {response.detail}"
-            )
-        if len(response.manifests) != len(required_ranks):
-            raise LocalizationError(
-                f"source-manifest gate returned incomplete ranks for {req_id}"
-            )
-        if response.schema_version != IntegrityIdentity.SCHEMA_VERSION:
-            raise LocalizationError(
-                f"source-manifest response schema mismatch for {req_id}"
-            )
-        manifests = {manifest.source_rank: manifest for manifest in response.manifests}
-        if len(manifests) != len(response.manifests):
-            raise LocalizationError(
-                f"source-manifest gate returned duplicate ranks for {req_id}"
-            )
-        if set(manifests) != set(required_ranks):
-            raise LocalizationError(
-                f"source-manifest gate returned wrong ranks for {req_id}"
-            )
-        for manifest in manifests.values():
-            structure_errors = validate_source_manifest_structure(manifest)
-            if len(structure_errors) > 0:
-                raise LocalizationError(
-                    f"invalid source manifest for decoder request {req_id}: "
-                    f"{structure_errors[:8]}"
-                )
-            if (
-                manifest.schema_version != IntegrityIdentity.SCHEMA_VERSION
-                or manifest.run_id != self._localization_config.run_id
-                or manifest.transport_arm != self._localization_config.transport_arm
-                or manifest.producer_engine_id != remote.engine_id
-                or manifest.producer_request_id != remote.request_id
-                or manifest.offer_generation != remote.p2d_offer_generation
-                or manifest.iteration != remote.p2d_iteration
-                or manifest.registration_generation
-                != self._remote_registration_generations[remote.engine_id][
-                    manifest.source_rank
-                ]
-                or manifest.regions
-                != self._remote_regions[remote.engine_id][manifest.source_rank]
-            ):
-                raise LocalizationError(
-                    f"source-manifest lineage mismatch for decoder request {req_id}"
-                )
-            if compute_source_manifest_digest(manifest) != manifest.manifest_digest:
-                raise LocalizationError(
-                    f"source-manifest digest mismatch for decoder request {req_id}"
-                )
-        self._localization_expected_by_request[req_id] = manifests
-        self._localization_manifest_deadlines.pop(req_id, None)
-        self._localization_waiting.pop(req_id, None)
-        logger.warning(
-            "[p2d-localize] source gate READY child=%s producer=%s "
-            "ranks=%s manifests=%s observer=true",
-            req_id,
-            remote.request_id,
-            required_ranks,
-            tuple(manifests[rank].manifest_digest.hex() for rank in sorted(manifests)),
-        )
-        return True
-
-    def _localization_validate_plan_manifests(
+    def _localization_build_source_contracts(
         self,
         req_id: str,
         meta: ReqMeta,
         read_specs: list[ReadSpec],
         raw_remote_groups: tuple[tuple[int, ...], ...],
         region_lengths: tuple[int, ...],
-    ) -> None:
-        """Bind the exact unsorted transfer roster to all P-rank manifests.
+    ) -> tuple[NixlSourceContract, ...]:
+        """Build immutable source contracts from request and handshake metadata.
 
         :param req_id: Decoder child request identifier.
         :param meta: Request transfer metadata.
         :param read_specs: Per-source-rank transfer specifications.
         :param raw_remote_groups: Exact pre-sort physical source groups.
         :param region_lengths: Exact source row lengths in registration order.
-        :raises LocalizationError: If any manifest describes different bytes.
+        :returns: Contracts in the same source-rank order as ``read_specs``.
+        :raises LocalizationError: If lineage, geometry, or semantics are invalid.
         """
         assert meta.remote is not None
-        manifests = self._localization_expected_by_request.get(req_id)
-        if manifests is None:
-            raise LocalizationError(f"request {req_id} has no gated source manifest")
+        remote = meta.remote
+        if (
+            self._localization_config.enabled_for(req_id) is False
+            or self._localization_config.enabled_for(remote.request_id) is False
+            or remote.p2d_run_id != self._localization_config.run_id
+            or remote.p2d_transport_arm != self._localization_config.transport_arm
+            or type(remote.p2d_offer_generation) is not int
+            or remote.p2d_offer_generation < 0
+            or type(remote.p2d_iteration) is not int
+            or remote.p2d_iteration < 0
+            or remote.remote_num_tokens <= 0
+        ):
+            raise LocalizationError(
+                f"request {req_id} has incomplete or mismatched localization lineage"
+            )
+        source_ranks = tuple(int(spec.remote_rank) for spec in read_specs)
+        if (
+            len(source_ranks) == 0
+            or len(set(source_ranks)) != len(source_ranks)
+            or any(rank < 0 for rank in source_ranks)
+        ):
+            raise LocalizationError(
+                f"request {req_id} has invalid required source ranks"
+            )
+        if len(raw_remote_groups) == 0:
+            raise LocalizationError(f"request {req_id} has no source cache groups")
         if len(self._region_descriptors) != len(region_lengths):
             raise LocalizationError(
                 f"request {req_id} local region descriptor cardinality differs"
@@ -611,6 +358,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         destination_group_planes = tuple(
             1 if flag else 2 for flag in self._sp_group_flags()
         )
+        destination_group_token_capacities = self._physical_group_token_capacities()
         if len(destination_group_planes) != len(raw_remote_groups):
             raise LocalizationError(
                 f"request {req_id} destination plane-contract cardinality differs"
@@ -624,41 +372,135 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             raise LocalizationError(
                 f"request {req_id} local semantic regions do not cover all groups"
             )
-        for spec in read_specs:
-            manifest = manifests.get(spec.remote_rank)
-            if manifest is None:
-                raise LocalizationError(
-                    f"request {req_id} lacks P-rank {spec.remote_rank} manifest"
-                )
-            if manifest.block_ids != raw_remote_groups:
-                raise LocalizationError(
-                    f"request {req_id} source roster differs on rank {spec.remote_rank}"
-                )
-            reference_manifest = manifests[read_specs[0].remote_rank]
+
+        layouts = self._remote_layout.get(remote.engine_id)
+        regions_by_rank = self._remote_regions.get(remote.engine_id)
+        generations = self._remote_registration_generations.get(remote.engine_id)
+        semantics_by_rank = self._remote_source_semantics.get(remote.engine_id)
+        base_addresses_by_rank = self.kv_caches_base_addr.get(remote.engine_id)
+        if (
+            layouts is None
+            or regions_by_rank is None
+            or generations is None
+            or semantics_by_rank is None
+            or base_addresses_by_rank is None
+        ):
+            raise LocalizationError(
+                f"request {req_id} has no validated producer handshake"
+            )
+
+        contracts: list[NixlSourceContract] = []
+        reference_planes: tuple[int, ...] | None = None
+        reference_capacities: tuple[int, ...] | None = None
+        for spec, source_rank in zip(read_specs, source_ranks, strict=True):
             if (
-                manifest.valid_token_extent != reference_manifest.valid_token_extent
-                or manifest.group_token_capacities
-                != reference_manifest.group_token_capacities
-                or manifest.source_group_planes
-                != reference_manifest.source_group_planes
-                or len(manifest.group_token_capacities) != len(destination_group_planes)
+                source_rank not in layouts
+                or source_rank not in regions_by_rank
+                or source_rank not in generations
+                or source_rank not in semantics_by_rank
+                or source_rank not in base_addresses_by_rank
             ):
                 raise LocalizationError(
-                    f"request {req_id} source semantic extent differs on rank "
-                    f"{spec.remote_rank}"
+                    f"request {req_id} lacks validated P-rank {source_rank} metadata"
                 )
-            if manifest.region_lengths != region_lengths:
+            spec_remote_groups = tuple(
+                tuple(int(block_id) for block_id in group)
+                for group in spec.remote_block_ids
+            )
+            if spec_remote_groups != raw_remote_groups:
+                raise LocalizationError(
+                    f"request {req_id} source roster differs on rank {source_rank}"
+                )
+            layout = layouts[source_rank]
+            source_region_lengths = tuple(int(length) for length in layout[0])
+            if source_region_lengths != region_lengths:
                 raise LocalizationError(
                     f"request {req_id} source region layout differs on rank "
-                    f"{spec.remote_rank}"
+                    f"{source_rank}"
                 )
-            if len(manifest.regions) != len(self._region_descriptors):
+            num_blocks = int(layout[1])
+            if num_blocks <= 0 or any(
+                block_id < 0 or block_id >= num_blocks
+                for group in raw_remote_groups
+                for block_id in group
+            ):
+                raise LocalizationError(
+                    f"request {req_id} source roster is outside rank "
+                    f"{source_rank} registration"
+                )
+
+            source_group_planes, group_token_capacities = semantics_by_rank[source_rank]
+            source_group_planes = tuple(int(planes) for planes in source_group_planes)
+            group_token_capacities = tuple(
+                int(capacity) for capacity in group_token_capacities
+            )
+            if (
+                source_group_planes != destination_group_planes
+                or group_token_capacities != destination_group_token_capacities
+            ):
+                raise LocalizationError(
+                    f"request {req_id} source semantics differ from destination on "
+                    f"rank {source_rank}"
+                )
+            if reference_planes is None:
+                reference_planes = source_group_planes
+                reference_capacities = group_token_capacities
+            elif (
+                source_group_planes != reference_planes
+                or group_token_capacities != reference_capacities
+            ):
+                raise LocalizationError(
+                    f"request {req_id} source semantics differ on rank {source_rank}"
+                )
+
+            regions = tuple(regions_by_rank[source_rank])
+            base_addresses = tuple(
+                int(address) for address in base_addresses_by_rank[source_rank]
+            )
+            if len(regions) != len(base_addresses) or any(
+                region.base_address != base_address
+                or len(region.shape) == 0
+                or region.shape[0] != num_blocks
+                for region, base_address in zip(
+                    regions,
+                    base_addresses,
+                    strict=True,
+                )
+            ):
+                raise LocalizationError(
+                    f"request {req_id} source contract differs from native "
+                    f"registration on rank {source_rank}"
+                )
+            contract = NixlSourceContract(
+                schema_version=IntegrityIdentity.SCHEMA_VERSION,
+                run_id=self._localization_config.run_id,
+                transport_arm=self._localization_config.transport_arm,
+                producer_engine_id=remote.engine_id,
+                producer_request_id=remote.request_id,
+                registration_generation=generations[source_rank],
+                offer_generation=remote.p2d_offer_generation,
+                iteration=remote.p2d_iteration,
+                source_rank=source_rank,
+                region_lengths=source_region_lengths,
+                regions=regions,
+                source_group_planes=source_group_planes,
+                valid_token_extent=remote.remote_num_tokens,
+                group_token_capacities=group_token_capacities,
+                block_ids=raw_remote_groups,
+            )
+            structure_errors = validate_source_contract_structure(contract)
+            if len(structure_errors) > 0:
+                raise LocalizationError(
+                    f"invalid source contract for decoder request {req_id}: "
+                    f"{structure_errors[:8]}"
+                )
+            if len(regions) != len(self._region_descriptors):
                 raise LocalizationError(
                     f"request {req_id} source/local region count differs on rank "
-                    f"{spec.remote_rank}"
+                    f"{source_rank}"
                 )
             for source_region, local_region in zip(
-                manifest.regions,
+                regions,
                 self._region_descriptors,
                 strict=True,
             ):
@@ -674,12 +516,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 ):
                     raise LocalizationError(
                         f"request {req_id} semantic region identity differs on "
-                        f"rank {spec.remote_rank}"
+                        f"rank {source_rank}"
                     )
                 if local_region.row_bytes != len(read_specs) * source_region.row_bytes:
                     raise LocalizationError(
                         f"request {req_id} local/source row geometry differs on "
-                        f"rank {spec.remote_rank}"
+                        f"rank {source_rank}"
                     )
                 for role, region in (
                     ("source", source_region),
@@ -694,8 +536,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     ):
                         raise LocalizationError(
                             f"request {req_id} {role} region geometry is not "
-                            f"row canonical on rank {spec.remote_rank}"
+                            f"row canonical on rank {source_rank}"
                         )
+            contracts.append(contract)
+        return tuple(contracts)
 
     def _no_stock_dma(self) -> bool:
         """Return whether the known-corrupt stock DMA path is disabled.
@@ -825,8 +669,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         (FIFO -- strict head-of-line, so a large request cannot be
         starved by smaller ones slipping past it)."""
         while self._coalesce_pending:
-            req_id, meta, read_specs = self._coalesce_pending[0]
-            res = self._coalesced_read_request(req_id, meta, read_specs)
+            req_id, meta, read_specs, source_contracts = self._coalesce_pending[0]
+            res = self._coalesced_read_request(
+                req_id,
+                meta,
+                read_specs,
+                source_contracts,
+            )
             if res == "defer":
                 break
             self._coalesce_pending.popleft()
@@ -845,7 +694,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 self._stock_read_specs(req_id, meta, read_specs)
 
     def _coalesced_read_request(
-        self, req_id: str, meta: ReqMeta, read_specs: list[ReadSpec]
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        read_specs: list[ReadSpec],
+        source_contracts: tuple[NixlSourceContract, ...] = (),
     ) -> str:
         """Post one whole-request READ per remote rank into owned staging.
 
@@ -856,6 +709,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         :param req_id: Decoder request identifier.
         :param meta: Complete transfer metadata.
         :param read_specs: Per-source-rank transfer specifications.
+        :param source_contracts: Frozen diagnostic source contracts.
         :returns: ``posted``, ``defer``, or ``stock`` before native failure.
         """
         assert meta.remote is not None and self.transfer_topo is not None
@@ -863,6 +717,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         engine_id = meta.remote.engine_id
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         spec0 = read_specs[0]
+        untrimmed_local_groups = (
+            tuple(
+                tuple(int(block_id) for block_id in group)
+                for group in spec0.local_block_ids
+            )
+            if localization_enabled
+            else ()
+        )
         raw_remote_groups = (
             tuple(
                 tuple(int(block_id) for block_id in group)
@@ -894,9 +756,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         traceback.format_exc(),
                     )
                     self.xfer_stats.record_failed_notification()
-            self._localization_expected_by_request.pop(req_id, None)
-            self._localization_manifest_deadlines.pop(req_id, None)
-            self._localization_waiting.pop(req_id, None)
             return "posted"
 
         # HMA broadcast semantics (see _compute_desc_ids): every group's
@@ -952,22 +811,29 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         n_ranks = len(read_specs)
         blens = self._remote_layout[engine_id][spec0.remote_rank][0]
         n_regions = len(blens)
-        if localization_enabled:
-            self._localization_validate_plan_manifests(
-                req_id,
-                meta,
-                read_specs,
-                raw_remote_groups,
-                tuple(int(length) for length in blens),
-            )
-            manifests = self._localization_expected_by_request[req_id]
-            semantic_manifest = manifests[int(read_specs[0].remote_rank)]
-        else:
-            semantic_manifest = None
         plan = self.tp_mappings[engine_id]
         source_ranks = tuple(int(spec.remote_rank) for spec in read_specs)
         if len(set(source_ranks)) != n_ranks:
             raise LocalizationError("coalesced plan contains duplicate source ranks")
+        semantic_contract: NixlSourceContract | None = None
+        if localization_enabled:
+            if (
+                len(source_contracts) != n_ranks
+                or tuple(contract.source_rank for contract in source_contracts)
+                != source_ranks
+                or any(
+                    contract.block_ids != raw_remote_groups
+                    for contract in source_contracts
+                )
+            ):
+                raise LocalizationError(
+                    f"request {req_id} source contracts differ from its read plan"
+                )
+            semantic_contract = source_contracts[0]
+        elif len(source_contracts) > 0:
+            raise LocalizationError(
+                f"request {req_id} carries contracts outside localization scope"
+            )
         if any(rank not in plan.rank_to_attention_slot for rank in source_ranks):
             raise LocalizationError("coalesced plan is missing a source-rank slot")
         slots = [int(plan.rank_to_attention_slot[rank]) for rank in source_ranks]
@@ -977,14 +843,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
         transfer_order: tuple[NixlPlanPosition, ...] = ()
         if localization_enabled:
-            assert semantic_manifest is not None
+            assert semantic_contract is not None
             transfer_order = tuple(
                 NixlPlanPosition(
                     group_index=int(group_ids[index]),
                     source_position=int(source_positions[index]),
                     remote_block_id=int(rpos[index]),
-                    valid_token_extent=semantic_manifest.valid_token_extent,
-                    group_token_capacity=semantic_manifest.group_token_capacities[
+                    valid_token_extent=semantic_contract.valid_token_extent,
+                    group_token_capacity=semantic_contract.group_token_capacities[
                         int(group_ids[index])
                     ],
                     local_block_id=int(lpos[index]),
@@ -1030,11 +896,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         if localization_enabled:
             scatter_geometry.update(
                 source_ranks=list(source_ranks),
+                source_contracts=source_contracts,
                 transfer_order=transfer_order,
-                producer_engine_id=engine_id,
-                producer_request_id=meta.remote.request_id,
-                offer_generation=meta.remote.p2d_offer_generation,
-                iteration=meta.remote.p2d_iteration,
             )
         if self._audit_enabled:
             tail_exclude = self._audit_tail_exclude
@@ -1075,48 +938,20 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     NixlPlanRecord(
                         record_type=NixlPlanRecord.RECORD_TYPE,
                         schema_version=IntegrityIdentity.SCHEMA_VERSION,
-                        run_id=self._localization_config.run_id,
-                        transport_arm=self._localization_config.transport_arm,
-                        producer_engine_id=engine_id,
-                        producer_request_id=meta.remote.request_id,
-                        registration_generations=tuple(
-                            self._remote_registration_generations[engine_id][
-                                int(spec.remote_rank)
-                            ]
-                            for spec in read_specs
-                        ),
-                        source_manifest_digests=tuple(
-                            self._localization_expected_by_request[req_id][
-                                int(spec.remote_rank)
-                            ].manifest_digest
-                            for spec in read_specs
-                        ),
-                        offer_generation=int(meta.remote.p2d_offer_generation),
-                        iteration=int(meta.remote.p2d_iteration),
+                        source_contracts=source_contracts,
                         child_request_id=req_id,
                         observer_engine_id=self.engine_id,
                         observer_rank=self.tp_rank,
-                        source_ranks=source_ranks,
                         rank_slots=tuple(int(slot) for slot in slots),
-                        rank_slot_contract=tuple(
-                            sorted(
-                                (
-                                    int(rank),
-                                    int(slot),
-                                )
-                                for rank, slot in (plan.rank_to_attention_slot.items())
-                            )
-                        ),
                         destination_group_planes=tuple(
                             1 if flag else 2 for flag in sp_flags
                         ),
-                        region_lengths=tuple(int(length) for length in blens),
-                        regions=tuple(
-                            self._remote_regions[engine_id][int(spec.remote_rank)]
-                            for spec in read_specs
+                        destination_group_token_capacities=(
+                            self._physical_group_token_capacities()
                         ),
                         local_regions=self._region_descriptors,
-                        raw_remote_groups=raw_remote_groups,
+                        untrimmed_local_groups=untrimmed_local_groups,
+                        skipped_groups=tuple(sorted(self._skip_pull_groups)),
                         selected_remote_groups=tuple(
                             tuple(int(block_id) for block_id in group)
                             for group in remote_ids
@@ -1361,7 +1196,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     self._mark_rid_released(rid)
                     still_parked = []
                     for item in self._coalesce_pending:
-                        p_req_id, p_meta, p_specs = item
+                        p_req_id, p_meta, _, _ = item
                         if (
                             p_meta.remote is not None
                             and p_meta.remote.request_id == rid

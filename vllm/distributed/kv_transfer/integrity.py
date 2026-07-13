@@ -58,7 +58,7 @@ class IntegrityIdentity:
     :ivar byte_length: Exact number of bytes covered by the digest.
     """
 
-    SCHEMA_VERSION: ClassVar[int] = 1
+    SCHEMA_VERSION: ClassVar[int] = 2
 
     run_id: str
     transport_arm: str

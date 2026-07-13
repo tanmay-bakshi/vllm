@@ -3,23 +3,16 @@
 """CPU tests for authoritative P-to-D localization artifacts."""
 
 import time
-from collections.abc import Iterator
-from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
-from queue import Queue
 from unittest.mock import MagicMock
 
 import msgspec
 import pytest
-import zmq
 
 from vllm.distributed.kv_transfer.integrity import (
     IntegrityIdentity,
     IntegrityPayloadKind,
     IntegrityStage,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
-    pull_worker as pull_worker_module,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     RemoteMeta,
@@ -31,11 +24,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
     NixlPullConnectorWorker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpec
 from vllm.distributed.kv_transfer.nixl_localization import (
     LocalizationArtifactWriter,
     LocalizationError,
     LocalizationMode,
-    ManifestStatus,
     NixlCaptureRecord,
     NixlEventRecord,
     NixlIntegrityLeaf,
@@ -43,14 +36,16 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlPlanPosition,
     NixlPlanRecord,
     NixlRegionDescriptor,
+    NixlSourceContract,
     NixlSourceManifest,
     NixlSourceManifestRecord,
-    NixlSourceManifestResponse,
+    NixlSourceRoster,
     build_integrity_identity,
     build_integrity_leaf,
     compute_semantic_contract_digest,
-    resolve_source_manifest_request,
     seal_source_manifest,
+    source_contract_from_manifest,
+    validate_source_contract_structure,
     validate_source_manifest_structure,
 )
 from vllm.distributed.kv_transfer.nixl_localization_validator import (
@@ -61,60 +56,6 @@ from vllm.distributed.kv_transfer.nixl_localization_validator import (
 
 HTTP_TARGET_REQUEST_ID = "p2d-phase2db-separated-score2-20260713-p000-s000637"
 TARGET_REQUEST_ID_BASE = f"chatcmpl-{HTTP_TARGET_REQUEST_ID}"
-
-
-class _ManifestTransport:
-    """Factory supplying one scripted socket per manifest exchange."""
-
-    scripts: list[list[bytes | BaseException]]
-    sockets: list[MagicMock]
-    exit_counts: list[int]
-
-    def __init__(self, scripts: list[list[bytes | BaseException]]) -> None:
-        """
-        :param scripts: Receive scripts for successive exchanges.
-        """
-        self.scripts = [list(script) for script in scripts]
-        self.sockets = []
-        self.exit_counts = []
-
-    def __call__(
-        self,
-        socket_type: int,
-        address: str,
-    ) -> AbstractContextManager[MagicMock]:
-        """
-        :param socket_type: Requested ZMQ socket type.
-        :param address: Producer side-channel address.
-        :returns: A fresh scripted exchange context.
-        """
-        assert socket_type == zmq.REQ
-        assert address == "tcp://127.0.0.1:5601"
-        if len(self.scripts) == 0:
-            raise AssertionError("unexpected source-manifest exchange")
-        socket = MagicMock()
-        socket.recv.side_effect = self.scripts.pop(0)
-        exchange_index = len(self.sockets)
-        self.sockets.append(socket)
-        self.exit_counts.append(0)
-        return self._exchange(exchange_index, socket)
-
-    @contextmanager
-    def _exchange(
-        self,
-        exchange_index: int,
-        socket: MagicMock,
-    ) -> Iterator[MagicMock]:
-        """Track closure of a manually retained exchange.
-
-        :param exchange_index: Index of the exchange being entered.
-        :param socket: Scripted socket yielded to the worker.
-        :yields: Scripted socket for one manifest exchange.
-        """
-        try:
-            yield socket
-        finally:
-            self.exit_counts[exchange_index] += 1
 
 
 def _config(
@@ -130,7 +71,6 @@ def _config(
         transport_arm="tcp-shm-cuda-copy",
         target_request_id=target_request_id,
         artifact_dir=artifact_dir,
-        manifest_timeout_s=30.0,
         copy_chunk_bytes=64 * 1024 * 1024,
         strict_zero_byte=False,
     )
@@ -140,18 +80,21 @@ def _region(
     *,
     base_address: int = 0x100000,
     group_semantic_name: str = "model.layers.0:transfer_region_0",
-    shape: tuple[int, ...] = (16, 8),
-    strides: tuple[int, ...] = (8, 1),
+    row_bytes: int = 8,
+    shape: tuple[int, ...] | None = None,
+    strides: tuple[int, ...] | None = None,
 ) -> NixlRegionDescriptor:
+    region_shape = shape if shape is not None else (16, row_bytes)
+    region_strides = strides if strides is not None else (row_bytes, 1)
     return NixlRegionDescriptor(
         semantic_name=group_semantic_name,
         group_indices=(0,),
         group_semantic_names=((0, group_semantic_name),),
         base_address=base_address,
-        registered_bytes=128,
-        row_bytes=8,
-        shape=shape,
-        strides=strides,
+        registered_bytes=region_shape[0] * row_bytes,
+        row_bytes=row_bytes,
+        shape=region_shape,
+        strides=region_strides,
         dtype="torch.uint8",
         element_size_bytes=1,
         layout="HND",
@@ -166,6 +109,7 @@ def _manifest(
     source_rank: int = 0,
     registration_generation: str = "registration-1",
     producer_request_id: str | None = None,
+    source_planes: int = 2,
 ) -> NixlSourceManifest:
     source_region = region if region is not None else _region()
     request_id = (
@@ -177,7 +121,7 @@ def _manifest(
         region=source_region,
         group_index=0,
         group_token_capacity=64,
-        source_plane_contract=2,
+        source_plane_contract=source_planes,
     )
     leaves: list[NixlIntegrityLeaf] = []
     for source_position, block_id in enumerate(blocks):
@@ -228,7 +172,7 @@ def _manifest(
             source_rank=source_rank,
             region_lengths=(8,),
             regions=(source_region,),
-            source_group_planes=(2,),
+            source_group_planes=(source_planes,),
             valid_token_extent=100,
             group_token_capacities=(64,),
             block_ids=(blocks,),
@@ -242,84 +186,26 @@ def _manifest(
     )
 
 
-def _manifest_response(
-    status: ManifestStatus,
-    manifests: tuple[NixlSourceManifest, ...] = (),
-) -> bytes:
-    """Encode one producer response for the decoder gate.
-
-    :param status: Producer-side manifest status.
-    :param manifests: Source manifests carried by a ready response.
-    :returns: Encoded side-channel payload.
-    """
-    return msgspec.msgpack.encode(
-        NixlSourceManifestResponse(
-            schema_version=IntegrityIdentity.SCHEMA_VERSION,
-            status=status,
-            detail=status.value,
-            manifests=manifests,
-        )
-    )
-
-
-def _source_gate_worker(
-    artifact_dir: Path,
-) -> tuple[NixlPullConnectorWorker, str, ReqMeta, NixlSourceManifest]:
-    """Build the target-only worker state needed by the source gate.
-
-    :param artifact_dir: Localization artifact directory.
-    :returns: Worker, decoder request, transfer metadata, and source manifest.
-    """
-    config = _config(artifact_dir)
-    producer_request_id = f"{TARGET_REQUEST_ID_BASE}-11111111"
-    child_request_id = f"{TARGET_REQUEST_ID_BASE}-22222222"
-    manifest = _manifest(config, producer_request_id=producer_request_id)
-    worker = object.__new__(NixlPullConnectorWorker)
-    worker._localization_config = config
-    worker._localization_expected_by_request = {}
-    worker._localization_manifest_deadlines = {}
-    worker._localization_manifest_requests = {}
-    worker._localization_waiting = {}
-    worker._remote_registration_generations = {
-        "prefill": {0: manifest.registration_generation}
-    }
-    worker._remote_regions = {"prefill": {0: manifest.regions}}
-    metadata = ReqMeta(
-        local_block_ids=(),
-        local_physical_block_ids=(),
-        tp_size=4,
-        remote=RemoteMeta(
-            block_ids=manifest.block_ids,
-            host="127.0.0.1",
-            port=5601,
-            engine_id=manifest.producer_engine_id,
-            request_id=manifest.producer_request_id,
-            p2d_run_id=config.run_id,
-            p2d_transport_arm=config.transport_arm,
-            p2d_offer_generation=manifest.offer_generation,
-            p2d_iteration=manifest.iteration,
-        ),
-    )
-    return worker, child_request_id, metadata, manifest
-
-
 def _plan(
-    manifest: NixlSourceManifest,
+    contract: NixlSourceContract,
     *,
+    source_contracts: tuple[NixlSourceContract, ...] | None = None,
+    rank_slots: tuple[int, ...] | None = None,
     selected_remote: tuple[int, ...] | None = None,
     selected_local: tuple[int, ...] | None = None,
     destination_planes: int = 2,
     positions: tuple[NixlPlanPosition, ...] | None = None,
     local_region: NixlRegionDescriptor | None = None,
     child_request_id: str | None = None,
+    observer_rank: int = 0,
 ) -> NixlPlanRecord:
-    remote = selected_remote if selected_remote is not None else manifest.block_ids[0]
+    contracts = source_contracts if source_contracts is not None else (contract,)
+    slots = rank_slots if rank_slots is not None else tuple(range(len(contracts)))
+    remote = selected_remote if selected_remote is not None else contract.block_ids[0]
     if selected_local is None:
         selected_local = tuple(100 + index for index in range(len(remote)))
     source_start = (
-        list(manifest.block_ids[0]).index(remote[0])
-        if len(remote) > 0
-        else 0
+        list(contract.block_ids[0]).index(remote[0]) if len(remote) > 0 else 0
     )
     if positions is None:
         positions = tuple(
@@ -327,17 +213,15 @@ def _plan(
                 group_index=0,
                 source_position=source_start + index,
                 remote_block_id=block_id,
-                valid_token_extent=manifest.valid_token_extent,
-                group_token_capacity=manifest.group_token_capacities[0],
+                valid_token_extent=contract.valid_token_extent,
+                group_token_capacity=contract.group_token_capacities[0],
                 local_block_id=(
                     selected_local[index]
                     if destination_planes == 2
                     else selected_local[index // 2]
                 ),
                 plane_index=(
-                    -1
-                    if destination_planes == 2
-                    else (source_start + index) % 2
+                    -1 if destination_planes == 2 else (source_start + index) % 2
                 ),
             )
             for index, block_id in enumerate(remote)
@@ -356,44 +240,36 @@ def _plan(
     return NixlPlanRecord(
         record_type=NixlPlanRecord.RECORD_TYPE,
         schema_version=IntegrityIdentity.SCHEMA_VERSION,
-        run_id=manifest.run_id,
-        transport_arm=manifest.transport_arm,
-        producer_engine_id=manifest.producer_engine_id,
-        producer_request_id=manifest.producer_request_id,
-        registration_generations=(manifest.registration_generation,),
-        source_manifest_digests=(manifest.manifest_digest,),
-        offer_generation=manifest.offer_generation,
-        iteration=manifest.iteration,
+        source_contracts=contracts,
         child_request_id=(
             child_request_id
             if child_request_id is not None
-            else manifest.producer_request_id
+            else contract.producer_request_id
         ),
         observer_engine_id="decoder",
-        observer_rank=0,
-        source_ranks=(0,),
-        rank_slots=(0,),
-        rank_slot_contract=((0, 0),),
+        observer_rank=observer_rank,
+        rank_slots=slots,
         destination_group_planes=(destination_planes,),
-        region_lengths=manifest.region_lengths,
-        regions=(manifest.regions,),
+        destination_group_token_capacities=contract.group_token_capacities,
         local_regions=(
-            local_region if local_region is not None else manifest.regions[0],
+            local_region if local_region is not None else contract.regions[0],
         ),
-        raw_remote_groups=manifest.block_ids,
+        untrimmed_local_groups=(selected_local,),
+        skipped_groups=(),
         selected_remote_groups=(remote,),
         selected_local_groups=(selected_local,),
         transfer_order=positions,
         runs=tuple(runs),
         region_offsets=(0,),
         staging_offset=0,
-        staging_size=len(positions) * manifest.region_lengths[0],
+        staging_size=(len(positions) * len(contracts) * contract.region_lengths[0]),
     )
 
 
 def _mapped_wire_leaf(
     source_leaf: NixlIntegrityLeaf,
     position: NixlPlanPosition,
+    rank_slot: int,
 ) -> NixlIntegrityLeaf:
     return NixlIntegrityLeaf(
         region_index=source_leaf.region_index,
@@ -406,7 +282,7 @@ def _mapped_wire_leaf(
         local_block_id=position.local_block_id,
         plane_index=source_leaf.plane_index,
         destination_half=position.plane_index,
-        rank_slot=0,
+        rank_slot=rank_slot,
         payload_kind=source_leaf.payload_kind,
         byte_length=source_leaf.byte_length,
         digest=source_leaf.digest,
@@ -425,10 +301,13 @@ def _capture(
         for leaf in manifest.leaves
         if leaf.payload_kind is IntegrityPayloadKind.WIRE
     }
+    source_ranks = tuple(contract.source_rank for contract in plan.source_contracts)
+    rank_slot = plan.rank_slots[source_ranks.index(manifest.source_rank)]
     leaves = tuple(
         _mapped_wire_leaf(
             source_wires[(position.source_position, position.remote_block_id)],
             position,
+            rank_slot,
         )
         for position in plan.transfer_order
     )
@@ -461,9 +340,7 @@ def _capture(
         IntegrityStage.DESTINATION: (
             "post_scatter_device_synchronize_before_publication"
         ),
-        IntegrityStage.PRE_READ: (
-            "after_transfer_phase_drain_before_model_forward"
-        ),
+        IntegrityStage.PRE_READ: ("after_transfer_phase_drain_before_model_forward"),
     }
     return NixlCaptureRecord(
         record_type=NixlCaptureRecord.RECORD_TYPE,
@@ -474,7 +351,6 @@ def _capture(
         producer_engine_id=manifest.producer_engine_id,
         producer_request_id=manifest.producer_request_id,
         registration_generation=manifest.registration_generation,
-        source_manifest_digest=manifest.manifest_digest,
         offer_generation=manifest.offer_generation,
         iteration=manifest.iteration,
         child_request_id=plan.child_request_id,
@@ -497,63 +373,121 @@ def _write_trace(
     include_event: bool = True,
     producer_request_id: str | None = None,
     child_request_id: str | None = None,
-) -> tuple[tuple[Path, Path], NixlSourceManifest, NixlPlanRecord]:
+    decoder_world_size: int = 1,
+    rank_slots: tuple[int, ...] | None = None,
+    complete_decoder_world: bool = False,
+    source_block_rosters: dict[int, tuple[int, ...]] | None = None,
+) -> tuple[tuple[Path, ...], NixlSourceManifest, NixlPlanRecord]:
     config = _config(artifact_dir)
-    manifest = _manifest(config, producer_request_id=producer_request_id)
-    plan = _plan(manifest, child_request_id=child_request_id)
-    source_writer = LocalizationArtifactWriter(config, "prefill", 0)
-    source_writer.write(
-        NixlSourceManifestRecord(
-            record_type=NixlSourceManifestRecord.RECORD_TYPE,
-            stage=IntegrityStage.SOURCE_PRE,
-            manifest=manifest,
+    source_world_size = decoder_world_size * 2
+    manifests = tuple(
+        _manifest(
+            config,
+            region=_region(base_address=0x100000 + source_rank * 0x10000),
+            blocks=(
+                source_block_rosters[source_rank]
+                if source_block_rosters is not None
+                and source_rank in source_block_rosters
+                else (10, 11)
+            ),
+            source_rank=source_rank,
+            registration_generation=f"registration-{source_rank}",
+            producer_request_id=producer_request_id,
         )
+        for source_rank in range(source_world_size)
     )
-    source_writer.write(
-        NixlSourceManifestRecord(
-            record_type=NixlSourceManifestRecord.RECORD_TYPE,
-            stage=IntegrityStage.SOURCE_POST,
-            manifest=manifest,
+    source_writers: list[LocalizationArtifactWriter] = []
+    for source_rank, manifest in enumerate(manifests):
+        source_writer = LocalizationArtifactWriter(
+            config,
+            "prefill",
+            source_rank,
+            source_world_size,
+            8,
         )
-    )
-    source_writer.close()
+        source_writer.write(
+            NixlSourceManifestRecord(
+                record_type=NixlSourceManifestRecord.RECORD_TYPE,
+                stage=IntegrityStage.SOURCE_POST,
+                manifest=manifest,
+            )
+        )
+        source_writer.close()
+        source_writers.append(source_writer)
 
-    decoder_writer = LocalizationArtifactWriter(config, "decoder", 0)
-    decoder_writer.write(plan)
-    for stage in (
-        IntegrityStage.STAGING_RAW,
-        IntegrityStage.STAGING_FENCED_CONTROL,
-        IntegrityStage.DESTINATION,
-        IntegrityStage.PRE_READ,
-    ):
-        decoder_writer.write(
-            _capture(
-                manifest,
-                plan,
-                stage,
-                corrupt=stage is corrupt_stage,
-            )
+    decoder_ranks = range(decoder_world_size) if complete_decoder_world else range(1)
+    decoder_writers: list[LocalizationArtifactWriter] = []
+    plans: list[NixlPlanRecord] = []
+    for decoder_rank in decoder_ranks:
+        source_start = decoder_rank * 2
+        participating_manifests = manifests[source_start : source_start + 2]
+        contracts = tuple(
+            source_contract_from_manifest(manifest)
+            for manifest in participating_manifests
         )
-    if include_event:
-        decoder_writer.write(
-            NixlEventRecord(
-                record_type=NixlEventRecord.RECORD_TYPE,
-                schema_version=IntegrityIdentity.SCHEMA_VERSION,
-                run_id=config.run_id,
-                transport_arm=config.transport_arm,
-                code="VERIFIED_PRE_READ",
-                evidentiary=True,
-                producer_engine_id=manifest.producer_engine_id,
-                producer_request_id=manifest.producer_request_id,
-                child_request_id=plan.child_request_id,
-                observer_engine_id=plan.observer_engine_id,
-                observer_rank=plan.observer_rank,
-                detail="all required ranks and stages matched before first read",
-                created_ns=time.time_ns(),
-            )
+        plan = _plan(
+            contracts[0],
+            source_contracts=contracts,
+            rank_slots=rank_slots,
+            local_region=_region(
+                base_address=0x200000 + decoder_rank * 0x10000,
+                row_bytes=16,
+            ),
+            child_request_id=child_request_id,
+            observer_rank=decoder_rank,
         )
-    decoder_writer.close()
-    return (source_writer.path, decoder_writer.path), manifest, plan
+        plans.append(plan)
+
+        decoder_writer = LocalizationArtifactWriter(
+            config,
+            "decoder",
+            decoder_rank,
+            decoder_world_size,
+            8,
+        )
+        decoder_writer.write(plan)
+        for stage in (
+            IntegrityStage.STAGING_RAW,
+            IntegrityStage.STAGING_FENCED_CONTROL,
+            IntegrityStage.DESTINATION,
+            IntegrityStage.PRE_READ,
+        ):
+            for manifest in participating_manifests:
+                decoder_writer.write(
+                    _capture(
+                        manifest,
+                        plan,
+                        stage,
+                        corrupt=(manifest.source_rank == 0 and stage is corrupt_stage),
+                    )
+                )
+        if include_event:
+            manifest = participating_manifests[0]
+            decoder_writer.write(
+                NixlEventRecord(
+                    record_type=NixlEventRecord.RECORD_TYPE,
+                    schema_version=IntegrityIdentity.SCHEMA_VERSION,
+                    run_id=config.run_id,
+                    transport_arm=config.transport_arm,
+                    code="CAPTURE_COMPLETE",
+                    evidentiary=False,
+                    producer_engine_id=manifest.producer_engine_id,
+                    producer_request_id=manifest.producer_request_id,
+                    child_request_id=plan.child_request_id,
+                    observer_engine_id=plan.observer_engine_id,
+                    observer_rank=plan.observer_rank,
+                    detail=(
+                        "all decoder stages captured; offline source comparison pending"
+                    ),
+                    created_ns=time.time_ns(),
+                )
+            )
+        decoder_writer.close()
+        decoder_writers.append(decoder_writer)
+    paths = tuple(writer.path for writer in source_writers) + (
+        tuple(writer.path for writer in decoder_writers)
+    )
+    return paths, manifests[0], plans[0]
 
 
 @pytest.mark.cpu_test
@@ -602,7 +536,7 @@ def test_normal_consumer_metadata_names_only_the_actual_forward() -> None:
     scheduler._reqs_need_recv = {}
     scheduler._reqs_need_save = {}
     scheduler._reqs_need_send = {}
-    scheduler._source_integrity_rosters = {}
+    scheduler._source_rosters = {}
     scheduler._reqs_in_batch = set()
     scheduler._reqs_not_processed = set()
     scheduler._audit_finished_reqs = set()
@@ -618,6 +552,7 @@ def test_normal_consumer_metadata_names_only_the_actual_forward() -> None:
         "remote_request_id": f"{TARGET_REQUEST_ID_BASE}-11111111",
         "remote_host": "127.0.0.1",
         "remote_port": 5601,
+        "remote_num_tokens": 128,
         "tp_size": 4,
     }
     blocks = MagicMock()
@@ -646,24 +581,25 @@ def test_pre_read_waits_for_the_target_forward(tmp_path: Path) -> None:
     """Unrelated forwards preserve a plan; its target consumes it exactly once."""
     child_request_id = f"{TARGET_REQUEST_ID_BASE}-22222222"
     producer_request_id = f"{TARGET_REQUEST_ID_BASE}-11111111"
+    manifest = _manifest(
+        _config(tmp_path),
+        producer_request_id=producer_request_id,
+    )
+    contract = source_contract_from_manifest(manifest)
     plan: dict[str, object] = {
-        "producer_engine_id": "prefill",
-        "producer_request_id": producer_request_id,
+        "source_contracts": (contract,),
     }
     worker = object.__new__(NixlPullConnectorWorker)
     worker._localization_config = _config(tmp_path)
     worker._localization_pre_read_plans = {child_request_id: plan}
-    worker._localization_expected_by_request = {child_request_id: {}}
     capture = MagicMock()
     record = MagicMock()
-    worker.shutdown = MagicMock()
     worker._localization_capture_destination = capture
     worker._localization_record_event = record
 
     worker._localization_capture_pre_read({"chatcmpl-unrelated"})
 
     assert worker._localization_pre_read_plans == {child_request_id: plan}
-    assert child_request_id in worker._localization_expected_by_request
     capture.assert_not_called()
     record.assert_not_called()
 
@@ -676,175 +612,182 @@ def test_pre_read_waits_for_the_target_forward(tmp_path: Path) -> None:
         "after_transfer_phase_drain_before_model_forward",
     )
     record.assert_called_once_with(
-        code="VERIFIED_PRE_READ",
-        evidentiary=True,
+        code="CAPTURE_COMPLETE",
+        evidentiary=False,
         child_request_id=child_request_id,
         producer_engine_id="prefill",
         producer_request_id=producer_request_id,
-        detail="all required ranks and stages matched before first read",
+        detail="all decoder stages captured; offline source comparison pending",
     )
     assert worker._localization_pre_read_plans == {}
-    assert child_request_id not in worker._localization_expected_by_request
 
 
-@pytest.mark.cpu_test
-def test_non_target_source_gate_rejects_localization_lineage(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    transport = _ManifestTransport([])
-    monkeypatch.setattr(pull_worker_module, "zmq_ctx", transport)
+def _contract_worker(
+    artifact_dir: Path,
+) -> tuple[
+    NixlPullConnectorWorker,
+    str,
+    ReqMeta,
+    list[ReadSpec],
+    NixlSourceContract,
+]:
+    """Build one structurally complete decoder contract fixture.
+
+    :param artifact_dir: Localization artifact directory.
+    :returns: Worker, child id, transfer metadata, read specs, and contract.
+    """
+    config = _config(artifact_dir)
+    producer_request_id = f"{TARGET_REQUEST_ID_BASE}-11111111"
+    child_request_id = f"{TARGET_REQUEST_ID_BASE}-22222222"
+    manifest = _manifest(config, producer_request_id=producer_request_id)
+    contract = source_contract_from_manifest(manifest)
     worker = object.__new__(NixlPullConnectorWorker)
-    worker._localization_config = _config(tmp_path)
-    worker._localization_manifest_requests = {}
-    remote = RemoteMeta(
-        block_ids=(),
-        host="127.0.0.1",
-        port=5601,
-        engine_id="prefill",
-        request_id="chatcmpl-unrelated",
+    worker._localization_config = config
+    worker._region_descriptors = manifest.regions
+    worker._sp_group_flags = MagicMock(return_value=[False])
+    worker._physical_group_token_capacities = MagicMock(
+        return_value=manifest.group_token_capacities
     )
-    metadata = ReqMeta(
-        local_block_ids=(),
-        local_physical_block_ids=(),
-        tp_size=4,
-        remote=remote,
-    )
-
-    assert worker._localization_source_gate("chatcmpl-unrelated", metadata, ())
-    assert len(transport.sockets) == 0
-    assert worker._localization_manifest_requests == {}
-    remote.request_id = f"{TARGET_REQUEST_ID_BASE}-1234abcd"
-    with pytest.raises(LocalizationError, match="outside the decoder target"):
-        worker._localization_source_gate("chatcmpl-unrelated", metadata, ())
-    remote.request_id = "chatcmpl-unrelated"
-    remote.p2d_run_id = "stray-run"
-    with pytest.raises(LocalizationError, match="outside the decoder target"):
-        worker._localization_source_gate("chatcmpl-unrelated", metadata, ())
-    assert len(transport.sockets) == 0
-    assert worker._localization_manifest_requests == {}
-
-
-@pytest.mark.cpu_test
-def test_source_gate_preserves_slow_retry_and_accepts_queued_ready(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    worker, req_id, metadata, manifest = _source_gate_worker(tmp_path)
-    transport = _ManifestTransport(
-        [
-            [_manifest_response(ManifestStatus.PENDING)],
-            [
-                zmq.Again(),
-                zmq.Again(),
-                _manifest_response(ManifestStatus.READY, (manifest,)),
-            ],
-        ]
-    )
-    monkeypatch.setattr(pull_worker_module, "zmq_ctx", transport)
-
-    assert worker._localization_source_gate(req_id, metadata, (0,)) is False
-    deadline = worker._localization_manifest_deadlines[req_id]
-    assert transport.exit_counts == [1]
-    assert req_id not in worker._localization_manifest_requests
-
-    assert worker._localization_source_gate(req_id, metadata, (0,)) is False
-    request_state = worker._localization_manifest_requests[req_id]
-    assert worker._localization_source_gate(req_id, metadata, (0,)) is False
-
-    assert worker._localization_manifest_deadlines[req_id] == deadline
-    assert worker._localization_manifest_requests[req_id] is request_state
-    assert worker._localization_waiting[req_id] is metadata
-    assert len(transport.sockets) == 2
-    assert transport.exit_counts == [1, 0]
-    assert transport.sockets[1].send.call_count == 1
-    worker._localization_manifest_deadlines[req_id] = time.perf_counter() - 1.0
-    assert worker._localization_source_gate(req_id, metadata, (0,))
-
-    assert worker._localization_expected_by_request[req_id] == {0: manifest}
-    assert req_id not in worker._localization_manifest_requests
-    assert req_id not in worker._localization_manifest_deadlines
-    assert req_id not in worker._localization_waiting
-    assert len(transport.sockets) == 2
-    assert transport.exit_counts == [1, 1]
-    socket = transport.sockets[1]
-    assert socket.send.call_count == 1
-    assert socket.recv.call_count == 3
-
-
-@pytest.mark.cpu_test
-def test_source_gate_deadline_closes_exchange_and_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    worker, req_id, metadata, _ = _source_gate_worker(tmp_path)
-    transport = _ManifestTransport([[zmq.Again(), zmq.Again()]])
-    monkeypatch.setattr(pull_worker_module, "zmq_ctx", transport)
-
-    assert worker._localization_source_gate(req_id, metadata, (0,)) is False
-    worker._localization_manifest_deadlines[req_id] = time.perf_counter() - 1.0
-
-    with pytest.raises(LocalizationError, match="source-manifest gate timed out"):
-        worker._localization_source_gate(req_id, metadata, (0,))
-
-    assert req_id not in worker._localization_manifest_requests
-    assert req_id not in worker._localization_manifest_deadlines
-    assert req_id not in worker._localization_waiting
-    assert transport.exit_counts == [1]
-
-
-@pytest.mark.cpu_test
-def test_aborted_localization_request_closes_pending_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    worker, req_id, metadata, _ = _source_gate_worker(tmp_path)
-    transport = _ManifestTransport([[zmq.Again()]])
-    monkeypatch.setattr(pull_worker_module, "zmq_ctx", transport)
-    assert worker._localization_source_gate(req_id, metadata, (0,)) is False
-
-    worker._ready_requests = Queue()
-    worker._reqs_to_process = set()
-    worker._reqs_to_send = {}
-    assert metadata.remote is not None
-    worker._localization_pre_read_plans = {
-        req_id: {
-            "producer_engine_id": "prefill",
-            "producer_request_id": metadata.remote.request_id,
+    worker._remote_layout = {"prefill": {0: ([8], manifest.regions[0].shape[0], 0)}}
+    worker._remote_regions = {"prefill": {0: manifest.regions}}
+    worker._remote_registration_generations = {
+        "prefill": {0: manifest.registration_generation}
+    }
+    worker._remote_source_semantics = {
+        "prefill": {
+            0: (
+                manifest.source_group_planes,
+                manifest.group_token_capacities,
+            )
         }
     }
-    worker._localization_waiting.pop(req_id)
-    monkeypatch.setattr(worker, "_begin_transfer_phase", lambda: None)
-    monkeypatch.setattr(worker, "_localization_capture_pre_read", lambda _: None)
-    monkeypatch.setattr(worker, "_audit_retire", lambda _: None)
-    monkeypatch.setattr(
-        worker,
-        "_localization_capture_source_rosters",
-        lambda _: None,
+    worker.kv_caches_base_addr = {"prefill": {0: [manifest.regions[0].base_address]}}
+    metadata = ReqMeta(
+        local_block_ids=((100, 101),),
+        local_physical_block_ids=((100, 101),),
+        tp_size=1,
+        remote=RemoteMeta(
+            block_ids=manifest.block_ids,
+            host="127.0.0.1",
+            port=5601,
+            engine_id=manifest.producer_engine_id,
+            request_id=manifest.producer_request_id,
+            remote_num_tokens=manifest.valid_token_extent,
+            p2d_run_id=config.run_id,
+            p2d_transport_arm=config.transport_arm,
+            p2d_offer_generation=manifest.offer_generation,
+            p2d_iteration=manifest.iteration,
+        ),
     )
-    record = MagicMock()
-    monkeypatch.setattr(worker, "_localization_record_event", record)
-    monkeypatch.setattr(worker, "_send_heartbeats", lambda _: None)
-    monkeypatch.setattr(worker, "_drain_transfer_phase", lambda: None)
-    monkeypatch.setattr(worker, "_record_transfer_decode_boundary", lambda: None)
-    connector_metadata = pull_worker_module.NixlConnectorMetadata()
-    connector_metadata.reqs_not_processed.add(req_id)
+    read_specs = [
+        ReadSpec(
+            remote_rank=0,
+            local_block_ids=[[100, 101]],
+            remote_block_ids=[[10, 11]],
+        )
+    ]
+    return worker, child_request_id, metadata, read_specs, contract
 
-    worker.start_load_kv(connector_metadata)
 
-    assert req_id not in worker._localization_manifest_requests
-    assert req_id not in worker._localization_manifest_deadlines
-    assert req_id not in worker._localization_waiting
-    assert req_id not in worker._localization_pre_read_plans
-    record.assert_called_once_with(
-        code="REQUEST_ABORTED",
-        evidentiary=False,
-        child_request_id=req_id,
-        producer_engine_id="prefill",
-        producer_request_id=metadata.remote.request_id,
-        detail="request aborted before verified pre-read",
+@pytest.mark.cpu_test
+def test_source_contract_is_built_from_request_and_handshake_lineage(
+    tmp_path: Path,
+) -> None:
+    worker, req_id, metadata, read_specs, expected = _contract_worker(tmp_path)
+
+    contracts = worker._localization_build_source_contracts(
+        req_id,
+        metadata,
+        read_specs,
+        expected.block_ids,
+        expected.region_lengths,
     )
-    assert transport.exit_counts == [1]
+
+    assert contracts == (expected,)
+    assert validate_source_contract_structure(contracts[0]) == ()
+
+
+@pytest.mark.cpu_test
+def test_source_contract_rejects_mismatched_request_lineage(tmp_path: Path) -> None:
+    worker, req_id, metadata, read_specs, expected = _contract_worker(tmp_path)
+    assert metadata.remote is not None
+    metadata.remote.p2d_run_id = "different-run"
+
+    with pytest.raises(LocalizationError, match="mismatched localization lineage"):
+        worker._localization_build_source_contracts(
+            req_id,
+            metadata,
+            read_specs,
+            expected.block_ids,
+            expected.region_lengths,
+        )
+
+
+@pytest.mark.cpu_test
+def test_source_contract_rejects_handshake_outside_native_registration(
+    tmp_path: Path,
+) -> None:
+    worker, req_id, metadata, read_specs, expected = _contract_worker(tmp_path)
+    worker.kv_caches_base_addr["prefill"][0] = [
+        expected.regions[0].base_address + expected.regions[0].row_bytes
+    ]
+
+    with pytest.raises(LocalizationError, match="native registration"):
+        worker._localization_build_source_contracts(
+            req_id,
+            metadata,
+            read_specs,
+            expected.block_ids,
+            expected.region_lengths,
+        )
+
+
+@pytest.mark.cpu_test
+def test_completed_source_roster_captures_source_post_then_retires(
+    tmp_path: Path,
+) -> None:
+    req_id = f"{TARGET_REQUEST_ID_BASE}-11111111"
+    roster = NixlSourceRoster(
+        offer_generation=1,
+        iteration=0,
+        valid_token_extent=100,
+        group_token_capacities=(64,),
+        block_ids=((10, 11),),
+    )
+    worker = object.__new__(NixlPullConnectorWorker)
+    worker._localization_config = _config(tmp_path)
+    worker._localization_source_rosters = {req_id: roster}
+    capture = MagicMock()
+    worker._localization_capture_source_manifest = capture
+
+    worker._localization_capture_source_post(req_id)
+
+    capture.assert_called_once_with(req_id, roster, IntegrityStage.SOURCE_POST)
+    assert worker._localization_source_rosters == {}
+
+
+@pytest.mark.cpu_test
+def test_expired_source_roster_retires_without_source_post(tmp_path: Path) -> None:
+    req_id = f"{TARGET_REQUEST_ID_BASE}-11111111"
+    roster = NixlSourceRoster(
+        offer_generation=1,
+        iteration=0,
+        valid_token_extent=100,
+        group_token_capacities=(64,),
+        block_ids=((10, 11),),
+    )
+    worker = object.__new__(NixlPullConnectorWorker)
+    worker._localization_config = _config(tmp_path)
+    worker._localization_source_rosters = {req_id: roster}
+    capture = MagicMock()
+    worker._localization_capture_source_manifest = capture
+
+    worker._localization_discard_source_roster(req_id)
+
+    capture.assert_not_called()
+    assert worker._localization_source_rosters == {}
+    with pytest.raises(LocalizationError, match="no retained source roster"):
+        worker._localization_discard_source_roster(req_id)
 
 
 @pytest.mark.cpu_test
@@ -856,6 +799,42 @@ def test_complete_trace_validates(tmp_path: Path) -> None:
     assert report.passed
     assert report.physical_pull_count == 1
     assert report.verified_pull_count == 1
+
+
+@pytest.mark.cpu_test
+def test_complete_multi_decoder_rank_trace_validates(tmp_path: Path) -> None:
+    """Independent P4 and D2 sessions prove the complete request partition."""
+    paths, _, _ = _write_trace(
+        tmp_path,
+        decoder_world_size=2,
+        complete_decoder_world=True,
+    )
+
+    report = validate_localization_artifacts(paths)
+
+    assert report.passed
+    assert report.physical_pull_count == 1
+    assert report.verified_pull_count == 1
+
+
+@pytest.mark.cpu_test
+def test_decoder_ranks_must_share_one_source_request_contract(
+    tmp_path: Path,
+) -> None:
+    """Each D-rank partition must describe the same producer block roster."""
+    paths, _, _ = _write_trace(
+        tmp_path,
+        decoder_world_size=2,
+        complete_decoder_world=True,
+        source_block_rosters={2: (12, 13), 3: (12, 13)},
+    )
+
+    report = validate_localization_artifacts(paths)
+
+    assert not report.passed
+    assert any(
+        "disagree on the producer request contract" in error for error in report.errors
+    )
 
 
 @pytest.mark.cpu_test
@@ -899,7 +878,13 @@ def test_validator_rejects_duplicate_and_mixed_artifacts(tmp_path: Path) -> None
     assert any("duplicate" in error for error in duplicate_report.errors)
 
     mixed_config = _config(tmp_path / "mixed", run_id="other-run")
-    mixed_writer = LocalizationArtifactWriter(mixed_config, "other-engine", 0)
+    mixed_writer = LocalizationArtifactWriter(
+        mixed_config,
+        "other-engine",
+        0,
+        1,
+        8,
+    )
     mixed_writer.close()
     mixed_report = validate_localization_artifacts((*paths, mixed_writer.path))
     assert any("mixed" in error for error in mixed_report.errors)
@@ -912,6 +897,8 @@ def test_validator_rejects_duplicate_and_mixed_artifacts(tmp_path: Path) -> None
         mixed_target_config,
         "target-engine",
         0,
+        1,
+        8,
     )
     mixed_target_writer.close()
     mixed_target_report = validate_localization_artifacts(
@@ -921,123 +908,22 @@ def test_validator_rejects_duplicate_and_mixed_artifacts(tmp_path: Path) -> None
 
 
 @pytest.mark.cpu_test
-def test_source_gate_requires_exact_rank_set_and_lineage(tmp_path: Path) -> None:
-    """The producer serves no duplicate, extra, stale, or mixed rank set."""
-    config = _config(tmp_path)
-    producer_request_id = f"{TARGET_REQUEST_ID_BASE}-1234abcd"
-    rank_zero = _manifest(config, producer_request_id=producer_request_id)
-    rank_one = _manifest(
-        config,
-        source_rank=1,
-        registration_generation="registration-2",
-        producer_request_id=producer_request_id,
-    )
-    request = (
-        b"get_source_manifest_v1",
-        config.run_id,
-        config.transport_arm,
-        "prefill",
-        producer_request_id,
-        1,
-        0,
-        (0, 1),
-    )
-    store = {
-        (producer_request_id, 1): {
-            0: rank_zero,
-            1: rank_one,
-        }
-    }
+def test_validator_rejects_missing_entire_decoder_rank(tmp_path: Path) -> None:
+    """A missing process artifact cannot shrink the observed decoder world."""
+    paths, _, _ = _write_trace(tmp_path, decoder_world_size=2)
 
-    ready = resolve_source_manifest_request(request, config, store)
-    assert ready.status is ManifestStatus.READY
-    duplicate = resolve_source_manifest_request(
-        (*request[:-1], (0, 0)),
-        config,
-        store,
-    )
-    assert duplicate.status is ManifestStatus.REJECTED
-    off_target = resolve_source_manifest_request(
-        (*request[:4], "chatcmpl-unrelated", *request[5:]),
-        config,
-        store,
-    )
-    assert off_target.status is ManifestStatus.REJECTED
-    pending = resolve_source_manifest_request(
-        request,
-        config,
-        {(producer_request_id, 1): {0: rank_zero}},
-    )
-    assert pending.status is ManifestStatus.PENDING
-    subset = resolve_source_manifest_request(
-        (*request[:-1], (0,)),
-        config,
-        store,
-    )
-    assert subset.status is ManifestStatus.READY
-    assert tuple(manifest.source_rank for manifest in subset.manifests) == (0,)
-    outside_topology = resolve_source_manifest_request(
-        (*request[:-1], (0, 2)),
-        config,
-        store,
-        {0, 1},
-    )
-    assert outside_topology.status is ManifestStatus.REJECTED
-    stale = resolve_source_manifest_request(
-        (*request[:6], 1, request[7]),
-        config,
-        store,
-    )
-    assert stale.status is ManifestStatus.REJECTED
-    malformed_bool_rank = resolve_source_manifest_request(
-        (*request[:-1], (0, True)),
-        config,
-        store,
-    )
-    assert malformed_bool_rank.status is ManifestStatus.REJECTED
+    report = validate_localization_artifacts(paths)
 
-
-@pytest.mark.cpu_test
-def test_source_gate_rejects_mixed_rank_semantics(tmp_path: Path) -> None:
-    """Ranks cannot jointly serve equal-sized but semantically different rows."""
-    config = _config(tmp_path)
-    rank_zero = _manifest(config)
-    rank_one = _manifest(
-        config,
-        source_rank=1,
-        registration_generation="registration-2",
-        region=_region(
-            base_address=0x200000,
-            group_semantic_name="model.layers.60:transfer_region_0",
-        ),
+    assert not report.passed
+    assert any(
+        "engine decoder process ranks are incomplete" in error
+        for error in report.errors
     )
-    response = resolve_source_manifest_request(
-        (
-            b"get_source_manifest_v1",
-            config.run_id,
-            config.transport_arm,
-            "prefill",
-            TARGET_REQUEST_ID_BASE,
-            1,
-            0,
-            (0, 1),
-        ),
-        config,
-        {
-            (TARGET_REQUEST_ID_BASE, 1): {
-                0: rank_zero,
-                1: rank_one,
-            }
-        },
-    )
-
-    assert response.status is ManifestStatus.REJECTED
-    assert "semantic" in response.detail
 
 
 @pytest.mark.cpu_test
 def test_corruption_localizes_to_first_raw_staging_edge(tmp_path: Path) -> None:
-    """Injected payload corruption names SOURCE_PRE to STAGING_RAW first."""
+    """Injected corruption names SOURCE_POST reference versus raw staging."""
     paths, _, _ = _write_trace(
         tmp_path,
         corrupt_stage=IntegrityStage.STAGING_RAW,
@@ -1047,7 +933,7 @@ def test_corruption_localizes_to_first_raw_staging_edge(tmp_path: Path) -> None:
     assert not report.passed
     assert len(report.errors) == 0
     assert len(report.divergences) == 1
-    assert report.divergences[0].edge == "source_pre->staging_raw"
+    assert report.divergences[0].edge == "source_post_reference_vs_staging_raw"
     assert any("digest mismatch" in error for error in report.divergences[0].errors)
 
 
@@ -1066,17 +952,16 @@ def test_zero_byte_outcome_is_complete_but_non_evidentiary(tmp_path: Path) -> No
     """A full-prefix hit terminates explicitly without entering pull comparisons."""
     config = _config(tmp_path)
     manifest = _manifest(config)
-    source_writer = LocalizationArtifactWriter(config, "prefill", 0)
-    for stage in (IntegrityStage.SOURCE_PRE, IntegrityStage.SOURCE_POST):
-        source_writer.write(
-            NixlSourceManifestRecord(
-                record_type=NixlSourceManifestRecord.RECORD_TYPE,
-                stage=stage,
-                manifest=manifest,
-            )
+    source_writer = LocalizationArtifactWriter(config, "prefill", 0, 1, 8)
+    source_writer.write(
+        NixlSourceManifestRecord(
+            record_type=NixlSourceManifestRecord.RECORD_TYPE,
+            stage=IntegrityStage.SOURCE_POST,
+            manifest=manifest,
         )
+    )
     source_writer.close()
-    decoder_writer = LocalizationArtifactWriter(config, "decoder", 0)
+    decoder_writer = LocalizationArtifactWriter(config, "decoder", 0, 1, 8)
     decoder_writer.write(
         NixlEventRecord(
             record_type=NixlEventRecord.RECORD_TYPE,
@@ -1096,9 +981,7 @@ def test_zero_byte_outcome_is_complete_but_non_evidentiary(tmp_path: Path) -> No
     )
     decoder_writer.close()
 
-    report = validate_localization_artifacts(
-        (source_writer.path, decoder_writer.path)
-    )
+    report = validate_localization_artifacts((source_writer.path, decoder_writer.path))
     assert len(report.errors) == 0
     assert len(report.divergences) == 0
     assert report.physical_pull_count == 0
@@ -1129,8 +1012,8 @@ def test_semantic_contract_detects_equal_size_region_substitution(
 
     assert baseline_digest != substituted_digest
     manifest = _manifest(config, region=substituted)
-    plan = _plan(manifest, local_region=baseline)
-    errors = validate_localization_plan(plan, (manifest,))
+    plan = _plan(source_contract_from_manifest(manifest), local_region=baseline)
+    errors = validate_localization_plan(plan)
     assert any("semantic region mismatch" in error for error in errors)
 
 
@@ -1138,7 +1021,7 @@ def test_semantic_contract_detects_equal_size_region_substitution(
 def test_plan_rejects_odd_trim_relative_half_mapping(tmp_path: Path) -> None:
     """Single-plane halves derive from absolute source positions after trimming."""
     config = _config(tmp_path)
-    manifest = _manifest(config, blocks=(10, 11, 12))
+    manifest = _manifest(config, blocks=(10, 11, 12), source_planes=1)
     relative_halves = (
         NixlPlanPosition(
             group_index=0,
@@ -1160,19 +1043,19 @@ def test_plan_rejects_odd_trim_relative_half_mapping(tmp_path: Path) -> None:
         ),
     )
     plan = _plan(
-        manifest,
+        source_contract_from_manifest(manifest),
         selected_remote=(11, 12),
         selected_local=(100,),
         destination_planes=1,
         positions=relative_halves,
     )
 
-    errors = validate_localization_plan(plan, (manifest,))
+    errors = validate_localization_plan(plan)
     assert any("destination mapping mismatch" in error for error in errors)
 
 
 @pytest.mark.cpu_test
-def test_plan_rejects_swapped_destinations_with_unchanged_digests(
+def test_plan_rejects_swapped_destinations_with_unchanged_source_contract(
     tmp_path: Path,
 ) -> None:
     """Content equality cannot bless a source-to-destination permutation."""
@@ -1198,9 +1081,9 @@ def test_plan_rejects_swapped_destinations_with_unchanged_digests(
             plane_index=-1,
         ),
     )
-    plan = _plan(manifest, positions=swapped)
+    plan = _plan(source_contract_from_manifest(manifest), positions=swapped)
 
-    errors = validate_localization_plan(plan, (manifest,))
+    errors = validate_localization_plan(plan)
     assert any("destination mapping mismatch" in error for error in errors)
 
 
@@ -1208,34 +1091,30 @@ def test_plan_rejects_swapped_destinations_with_unchanged_digests(
 def test_plan_rejects_rank_slot_swap_against_topology_contract(
     tmp_path: Path,
 ) -> None:
-    """A bijective rank permutation is still wrong if topology did not choose it."""
-    config = _config(tmp_path)
-    rank_zero = _manifest(config)
-    rank_one = _manifest(
-        config,
-        source_rank=1,
-        registration_generation="registration-2",
-    )
-    baseline = _plan(rank_zero)
-    swapped = msgspec.structs.replace(
-        baseline,
-        registration_generations=(
-            rank_zero.registration_generation,
-            rank_one.registration_generation,
-        ),
-        source_manifest_digests=(
-            rank_zero.manifest_digest,
-            rank_one.manifest_digest,
-        ),
-        source_ranks=(0, 1),
-        rank_slots=(1, 0),
-        rank_slot_contract=((0, 0), (1, 1)),
-        regions=(rank_zero.regions, rank_one.regions),
-        staging_size=len(baseline.transfer_order) * 2 * 8,
+    """A bijection cannot override independently recorded P/D topology."""
+    paths, _, _ = _write_trace(tmp_path, rank_slots=(1, 0))
+
+    report = validate_localization_artifacts(paths)
+
+    assert not report.passed
+    assert any(
+        "rank slots differ from session-derived topology" in error
+        for error in report.errors
     )
 
-    errors = validate_localization_plan(swapped, (rank_zero, rank_one))
-    assert any("violates rank-slot contract" in error for error in errors)
+
+@pytest.mark.cpu_test
+def test_plan_with_skipped_group_is_non_evidentiary(tmp_path: Path) -> None:
+    """Partial group coverage cannot support a localization verdict."""
+    manifest = _manifest(_config(tmp_path))
+    plan = msgspec.structs.replace(
+        _plan(source_contract_from_manifest(manifest)),
+        skipped_groups=(0,),
+    )
+
+    errors = validate_localization_plan(plan)
+
+    assert "plan skips cache groups and is non-evidentiary" in errors
 
 
 @pytest.mark.cpu_test

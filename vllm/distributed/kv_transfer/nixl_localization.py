@@ -20,11 +20,7 @@ from vllm.distributed.kv_transfer.integrity import (
     IntegrityStage,
     compute_integrity_digest,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorWorkerMetadata,
-)
 
-GET_SOURCE_MANIFEST_MSG = b"get_source_manifest_v1"
 LOCALIZATION_ARTIFACT_MAGIC = b"P2DLOC01"
 LOCALIZATION_FRAME_PERSON = b"vllm-p2d-frame"
 LOCALIZATION_ROOT_PERSON = b"vllm-p2d-root1"
@@ -49,14 +45,6 @@ class LocalizationMode(StrEnum):
     OFF = "off"
     TRACE = "trace"
     SHAM = "sham"
-
-
-class ManifestStatus(StrEnum):
-    """Producer response to a decoder manifest query."""
-
-    READY = "ready"
-    PENDING = "pending"
-    REJECTED = "rejected"
 
 
 class LocalizationError(RuntimeError):
@@ -86,7 +74,6 @@ class NixlLocalizationConfig:
     :ivar target_request_id: Exact stable request identifier to observe before
         vLLM appends its per-engine random suffix.
     :ivar artifact_dir: Directory receiving framed MessagePack artifacts.
-    :ivar manifest_timeout_s: Maximum time D may wait before failing closed.
     :ivar copy_chunk_bytes: Upper bound for one device-to-host observer copy.
     :ivar strict_zero_byte: Whether non-evidentiary zero-byte hits fail the request.
     """
@@ -96,7 +83,6 @@ class NixlLocalizationConfig:
     transport_arm: str
     target_request_id: str
     artifact_dir: Path | None
-    manifest_timeout_s: float
     copy_chunk_bytes: int
     strict_zero_byte: bool
 
@@ -116,7 +102,7 @@ class NixlLocalizationConfig:
 
     @property
     def enabled(self) -> bool:
-        """Return whether the observer and source gate are active."""
+        """Return whether the observer is active."""
         return self.mode is not LocalizationMode.OFF
 
     def enabled_for(self, request_id: str) -> bool:
@@ -153,7 +139,6 @@ class NixlLocalizationConfig:
                 transport_arm="off",
                 target_request_id="",
                 artifact_dir=None,
-                manifest_timeout_s=0.0,
                 copy_chunk_bytes=64 * 1024 * 1024,
                 strict_zero_byte=False,
             )
@@ -174,14 +159,11 @@ class NixlLocalizationConfig:
         if len(artifact_dir_text) == 0:
             raise ValueError("VLLM_NIXL_P2D_ARTIFACT_DIR is required")
 
-        timeout_s = float(os.environ.get("VLLM_NIXL_P2D_MANIFEST_TIMEOUT_S", "30"))
         chunk_mb = int(os.environ.get("VLLM_NIXL_P2D_COPY_CHUNK_MB", "64"))
         strict_zero_byte_text = os.environ.get(
             "VLLM_NIXL_P2D_STRICT_ZERO_BYTE",
             "0",
         )
-        if timeout_s <= 0.0:
-            raise ValueError("manifest timeout must be positive")
         if chunk_mb <= 0:
             raise ValueError("copy chunk size must be positive")
         if strict_zero_byte_text not in ("0", "1"):
@@ -193,7 +175,6 @@ class NixlLocalizationConfig:
             transport_arm=transport_arm,
             target_request_id=target_request_id,
             artifact_dir=Path(artifact_dir_text),
-            manifest_timeout_s=timeout_s,
             copy_chunk_bytes=chunk_mb * 1024 * 1024,
             strict_zero_byte=strict_zero_byte_text == "1",
         )
@@ -219,7 +200,7 @@ class NixlIntegrityLeaf(msgspec.Struct, array_like=True, frozen=True):
 
 
 class NixlSourceRoster(msgspec.Struct, array_like=True, frozen=True):
-    """Exact producer block roster awaiting a pre-transfer snapshot."""
+    """Exact producer block roster retained until transfer completion."""
 
     offer_generation: int
     iteration: int
@@ -244,8 +225,28 @@ class NixlRegionDescriptor(msgspec.Struct, array_like=True, frozen=True):
     layout: str
 
 
+class NixlSourceContract(msgspec.Struct, array_like=True, frozen=True):
+    """Content-free identity and geometry of one producer-rank transfer."""
+
+    schema_version: int
+    run_id: str
+    transport_arm: str
+    producer_engine_id: str
+    producer_request_id: str
+    registration_generation: str
+    offer_generation: int
+    iteration: int
+    source_rank: int
+    region_lengths: tuple[int, ...]
+    regions: tuple[NixlRegionDescriptor, ...]
+    source_group_planes: tuple[int, ...]
+    valid_token_extent: int
+    group_token_capacities: tuple[int, ...]
+    block_ids: tuple[tuple[int, ...], ...]
+
+
 class NixlSourceManifest(msgspec.Struct, array_like=True, frozen=True):
-    """One P-rank source snapshot served to gated decoders."""
+    """One producer-rank snapshot taken after a completed remote read."""
 
     schema_version: int
     run_id: str
@@ -268,51 +269,6 @@ class NixlSourceManifest(msgspec.Struct, array_like=True, frozen=True):
     duration_ns: int
     manifest_digest: bytes
     leaves: tuple[NixlIntegrityLeaf, ...]
-
-
-class NixlSourceManifestResponse(msgspec.Struct, array_like=True, frozen=True):
-    """Versioned response to a decoder's source-manifest query."""
-
-    schema_version: int
-    status: ManifestStatus
-    detail: str
-    manifests: tuple[NixlSourceManifest, ...]
-
-
-@dataclass(slots=True)
-class NixlLocalizationWorkerMetadata(KVConnectorWorkerMetadata):
-    """Source manifests returned from P workers to the P scheduler.
-
-    :ivar manifests: Producer request and generation to per-rank manifests.
-    """
-
-    manifests: dict[tuple[str, int], dict[int, NixlSourceManifest]]
-
-    def aggregate(
-        self,
-        other: KVConnectorWorkerMetadata,
-    ) -> "NixlLocalizationWorkerMetadata":
-        """Merge disjoint rank manifests from one engine step.
-
-        :param other: Metadata emitted by another tensor-parallel worker.
-        :returns: New aggregate without mutating either input.
-        :raises LocalizationError: If workers disagree about one rank manifest.
-        """
-        if not isinstance(other, NixlLocalizationWorkerMetadata):
-            raise TypeError("cannot aggregate non-localization worker metadata")
-        merged = {
-            key: dict(rank_manifests)
-            for key, rank_manifests in self.manifests.items()
-        }
-        for key, rank_manifests in other.manifests.items():
-            target = merged.setdefault(key, {})
-            overlap = set(target) & set(rank_manifests)
-            if len(overlap) > 0:
-                raise LocalizationError(
-                    f"duplicate P-rank source manifests for {key}: {sorted(overlap)}"
-                )
-            target.update(rank_manifests)
-        return NixlLocalizationWorkerMetadata(manifests=merged)
 
 
 class NixlPlanPosition(msgspec.Struct, array_like=True, frozen=True):
@@ -340,7 +296,6 @@ class NixlCaptureRecord(msgspec.Struct, array_like=True, frozen=True):
     producer_engine_id: str
     producer_request_id: str
     registration_generation: str
-    source_manifest_digest: bytes
     offer_generation: int
     iteration: int
     child_request_id: str | None
@@ -362,25 +317,16 @@ class NixlPlanRecord(msgspec.Struct, array_like=True, frozen=True):
 
     record_type: str
     schema_version: int
-    run_id: str
-    transport_arm: str
-    producer_engine_id: str
-    producer_request_id: str
-    registration_generations: tuple[str, ...]
-    source_manifest_digests: tuple[bytes, ...]
-    offer_generation: int
-    iteration: int
+    source_contracts: tuple[NixlSourceContract, ...]
     child_request_id: str
     observer_engine_id: str
     observer_rank: int
-    source_ranks: tuple[int, ...]
     rank_slots: tuple[int, ...]
-    rank_slot_contract: tuple[tuple[int, int], ...]
     destination_group_planes: tuple[int, ...]
-    region_lengths: tuple[int, ...]
-    regions: tuple[tuple[NixlRegionDescriptor, ...], ...]
+    destination_group_token_capacities: tuple[int, ...]
     local_regions: tuple[NixlRegionDescriptor, ...]
-    raw_remote_groups: tuple[tuple[int, ...], ...]
+    untrimmed_local_groups: tuple[tuple[int, ...], ...]
+    skipped_groups: tuple[int, ...]
     selected_remote_groups: tuple[tuple[int, ...], ...]
     selected_local_groups: tuple[tuple[int, ...], ...]
     transfer_order: tuple[NixlPlanPosition, ...]
@@ -391,7 +337,7 @@ class NixlPlanRecord(msgspec.Struct, array_like=True, frozen=True):
 
 
 class NixlSessionRecord(msgspec.Struct, array_like=True, frozen=True):
-    """Header proving observer configuration for one process artifact."""
+    """Header recording observer and model topology for one process artifact."""
 
     RECORD_TYPE: ClassVar[str] = "session"
 
@@ -403,6 +349,8 @@ class NixlSessionRecord(msgspec.Struct, array_like=True, frozen=True):
     target_request_id: str
     engine_id: str
     rank: int
+    world_size: int
+    total_num_kv_heads: int
     pid: int
     observer: bool
     claim_scope: str
@@ -412,7 +360,7 @@ class NixlSessionRecord(msgspec.Struct, array_like=True, frozen=True):
 
 
 class NixlSourceManifestRecord(msgspec.Struct, array_like=True, frozen=True):
-    """Source PRE or POST manifest preserved as a first-class artifact."""
+    """Producer SOURCE_POST manifest preserved as a first-class artifact."""
 
     RECORD_TYPE: ClassVar[str] = "source_manifest"
 
@@ -480,15 +428,23 @@ class LocalizationArtifactWriter:
         config: NixlLocalizationConfig,
         engine_id: str,
         rank: int,
+        world_size: int,
+        total_num_kv_heads: int,
     ) -> None:
         """Open a unique artifact and write its session header.
 
         :param config: Enabled localization configuration.
         :param engine_id: Local engine identifier.
         :param rank: Local tensor-parallel rank.
+        :param world_size: Tensor-parallel process count for the engine.
+        :param total_num_kv_heads: Model-wide KV-head count computed locally.
         """
         if config.enabled is False or config.artifact_dir is None:
             raise ValueError("artifact writer requires enabled localization")
+        if world_size <= 0 or rank < 0 or rank >= world_size:
+            raise ValueError("artifact writer rank must belong to its world size")
+        if total_num_kv_heads <= 0:
+            raise ValueError("artifact writer requires a positive KV-head count")
         self._config = config
         config.artifact_dir.mkdir(parents=True, exist_ok=True)
         pid = os.getpid()
@@ -514,6 +470,8 @@ class LocalizationArtifactWriter:
                 target_request_id=config.target_request_id,
                 engine_id=engine_id,
                 rank=rank,
+                world_size=world_size,
+                total_num_kv_heads=total_num_kv_heads,
                 pid=pid,
                 observer=True,
                 claim_scope="instrumented_only",
@@ -548,9 +506,8 @@ class LocalizationArtifactWriter:
         if self._closed:
             raise ValueError("localization artifact is already closed")
         artifact_record = record
-        if (
-            self._config.mode is LocalizationMode.SHAM
-            and isinstance(record, NixlCaptureRecord)
+        if self._config.mode is LocalizationMode.SHAM and isinstance(
+            record, NixlCaptureRecord
         ):
             redacted_leaves = tuple(
                 NixlIntegrityLeaf(
@@ -580,7 +537,6 @@ class LocalizationArtifactWriter:
                 producer_engine_id=record.producer_engine_id,
                 producer_request_id=record.producer_request_id,
                 registration_generation=record.registration_generation,
-                source_manifest_digest=record.source_manifest_digest,
                 offer_generation=record.offer_generation,
                 iteration=record.iteration,
                 child_request_id=record.child_request_id,
@@ -746,7 +702,7 @@ def build_integrity_identity(
 def compute_source_manifest_digest(manifest: NixlSourceManifest) -> bytes:
     """Hash a source manifest, excluding its self-referential digest field.
 
-    :param manifest: Manifest to authenticate against accidental corruption,
+    :param manifest: Manifest to protect against accidental corruption,
         truncation, or substitution.
     :returns: Thirty-two-byte BLAKE2b digest.
     """
@@ -809,6 +765,33 @@ def seal_source_manifest(manifest: NixlSourceManifest) -> NixlSourceManifest:
         duration_ns=manifest.duration_ns,
         manifest_digest=compute_source_manifest_digest(manifest),
         leaves=manifest.leaves,
+    )
+
+
+def source_contract_from_manifest(
+    manifest: NixlSourceManifest,
+) -> NixlSourceContract:
+    """Extract the content-free transfer contract from a source snapshot.
+
+    :param manifest: Producer snapshot to describe.
+    :returns: Exact lineage, region geometry, and source roster contract.
+    """
+    return NixlSourceContract(
+        schema_version=manifest.schema_version,
+        run_id=manifest.run_id,
+        transport_arm=manifest.transport_arm,
+        producer_engine_id=manifest.producer_engine_id,
+        producer_request_id=manifest.producer_request_id,
+        registration_generation=manifest.registration_generation,
+        offer_generation=manifest.offer_generation,
+        iteration=manifest.iteration,
+        source_rank=manifest.source_rank,
+        region_lengths=manifest.region_lengths,
+        regions=manifest.regions,
+        source_group_planes=manifest.source_group_planes,
+        valid_token_extent=manifest.valid_token_extent,
+        group_token_capacities=manifest.group_token_capacities,
+        block_ids=manifest.block_ids,
     )
 
 
@@ -875,9 +858,7 @@ def select_source_manifest(
     missing = keys - available
     if len(missing) > 0:
         raise LocalizationError(f"selected source leaves are absent: {sorted(missing)}")
-    selected = tuple(
-        leaf for leaf in manifest.leaves if leaf_source_key(leaf) in keys
-    )
+    selected = tuple(leaf for leaf in manifest.leaves if leaf_source_key(leaf) in keys)
     return seal_source_manifest(
         NixlSourceManifest(
             schema_version=manifest.schema_version,
@@ -905,34 +886,43 @@ def select_source_manifest(
     )
 
 
-def validate_source_manifest_structure(
-    manifest: NixlSourceManifest,
+def validate_source_contract_structure(
+    contract: NixlSourceContract,
 ) -> tuple[str, ...]:
-    """Validate source-manifest cardinality, uniqueness, and leaf contracts.
+    """Validate source-contract lineage, cardinality, and region geometry.
 
-    :param manifest: Sealed producer manifest.
-    :returns: Structural errors; empty means the manifest is internally sound.
+    :param contract: Content-free producer transfer contract.
+    :returns: Structural errors; empty means the contract is internally sound.
     """
     errors: list[str] = []
-    if manifest.schema_version != IntegrityIdentity.SCHEMA_VERSION:
-        errors.append("source manifest schema mismatch")
-    if len(manifest.region_lengths) != len(manifest.regions):
-        errors.append("source manifest region cardinality mismatch")
-    num_groups = len(manifest.block_ids)
-    if len(manifest.source_group_planes) != num_groups:
-        errors.append("source manifest plane-contract cardinality mismatch")
-    if len(manifest.group_token_capacities) != num_groups:
-        errors.append("source manifest token-capacity cardinality mismatch")
-    if any(planes not in (1, 2) for planes in manifest.source_group_planes):
-        errors.append("source manifest contains an invalid source plane contract")
-    if manifest.valid_token_extent <= 0:
-        errors.append("source manifest has an invalid request token extent")
-    keys = [leaf_source_key(leaf) for leaf in manifest.leaves]
-    if len(set(keys)) != len(keys):
-        errors.append("source manifest contains duplicate leaves")
+    if contract.schema_version != IntegrityIdentity.SCHEMA_VERSION:
+        errors.append("source contract schema mismatch")
+    if (
+        len(contract.run_id) == 0
+        or len(contract.transport_arm) == 0
+        or len(contract.producer_engine_id) == 0
+        or len(contract.producer_request_id) == 0
+        or len(contract.registration_generation) == 0
+    ):
+        errors.append("source contract has incomplete lineage")
+    if contract.offer_generation < 0 or contract.iteration < 0:
+        errors.append("source contract has invalid generation lineage")
+    if contract.source_rank < 0:
+        errors.append("source contract has invalid source rank")
+    if len(contract.region_lengths) != len(contract.regions):
+        errors.append("source contract region cardinality mismatch")
+    num_groups = len(contract.block_ids)
+    if len(contract.source_group_planes) != num_groups:
+        errors.append("source contract plane cardinality mismatch")
+    if len(contract.group_token_capacities) != num_groups:
+        errors.append("source contract token-capacity cardinality mismatch")
+    if any(planes not in (1, 2) for planes in contract.source_group_planes):
+        errors.append("source contract has an invalid source plane count")
+    if contract.valid_token_extent <= 0:
+        errors.append("source contract has an invalid request token extent")
 
     owned_groups: set[int] = set()
-    for region_index, region in enumerate(manifest.regions):
+    for region_index, region in enumerate(contract.regions):
         region_groups = tuple(sorted(set(region.group_indices)))
         if len(region.group_indices) == 0:
             errors.append(f"source region {region_index} has no semantic owners")
@@ -971,12 +961,50 @@ def validate_source_manifest_structure(
     if owned_groups != set(range(num_groups)):
         errors.append("source semantic regions do not cover every cache group")
 
-    for group_index, _ in enumerate(manifest.block_ids):
-        if group_index >= len(manifest.group_token_capacities):
+    for group_index, _ in enumerate(contract.block_ids):
+        if group_index >= len(contract.group_token_capacities):
             continue
-        capacity = manifest.group_token_capacities[group_index]
+        capacity = contract.group_token_capacities[group_index]
         if capacity <= 0:
             errors.append(f"source group {group_index} has invalid token capacity")
+        blocks = contract.block_ids[group_index]
+        if any(type(block_id) is not int or block_id < 0 for block_id in blocks):
+            errors.append(f"source group {group_index} has an invalid block id")
+        if len(set(blocks)) != len(blocks):
+            errors.append(f"source group {group_index} has duplicate block ids")
+        for region_index, region in enumerate(contract.regions):
+            if group_index in region.group_indices and any(
+                block_id >= region.shape[0]
+                for block_id in blocks
+                if type(block_id) is int and block_id >= 0
+            ):
+                errors.append(
+                    f"source group {group_index} exceeds region {region_index}"
+                )
+    for region_index, region in enumerate(contract.regions):
+        if region_index >= len(contract.region_lengths):
+            continue
+        if region.row_bytes != contract.region_lengths[region_index]:
+            errors.append(f"source region {region_index} row length mismatch")
+        if region.row_bytes <= 0 or region.row_bytes % 2 != 0:
+            errors.append(f"source region {region_index} has invalid row length")
+    return tuple(errors)
+
+
+def validate_source_manifest_structure(
+    manifest: NixlSourceManifest,
+) -> tuple[str, ...]:
+    """Validate source-manifest cardinality, uniqueness, and leaf contracts.
+
+    :param manifest: Sealed producer manifest.
+    :returns: Structural errors; empty means the manifest is internally sound.
+    """
+    errors = list(
+        validate_source_contract_structure(source_contract_from_manifest(manifest))
+    )
+    keys = [leaf_source_key(leaf) for leaf in manifest.leaves]
+    if len(set(keys)) != len(keys):
+        errors.append("source manifest contains duplicate leaves")
 
     expected_keys: set[IntegrityLeafKey] = set()
     expected_lengths: dict[IntegrityLeafKey, int] = {}
@@ -999,12 +1027,8 @@ def validate_source_manifest_structure(
                 semantic_contract_digest = compute_semantic_contract_digest(
                     region=region,
                     group_index=group_index,
-                    group_token_capacity=(
-                        manifest.group_token_capacities[group_index]
-                    ),
-                    source_plane_contract=manifest.source_group_planes[
-                        group_index
-                    ],
+                    group_token_capacity=(manifest.group_token_capacities[group_index]),
+                    source_plane_contract=manifest.source_group_planes[group_index],
                 )
             except LocalizationError:
                 errors.append(
@@ -1058,168 +1082,6 @@ def validate_source_manifest_structure(
     if compute_source_manifest_digest(manifest) != manifest.manifest_digest:
         errors.append("source manifest content digest mismatch")
     return tuple(errors)
-
-
-def resolve_source_manifest_request(
-    request: list[object] | tuple[object, ...],
-    config: NixlLocalizationConfig,
-    stored_manifests: dict[
-        tuple[str, int], dict[int, NixlSourceManifest]
-    ],
-    available_ranks: set[int] | None = None,
-) -> NixlSourceManifestResponse:
-    """Resolve one untrusted decoder query without mutating producer state.
-
-    :param request: Decoded side-channel request.
-    :param config: Producer localization configuration.
-    :param stored_manifests: Prepared manifests keyed by request and offer.
-    :param available_ranks: Producer ranks valid for this engine incarnation.
-    :returns: Ready, pending, or fail-closed rejection response.
-    """
-    def rejected(detail: str) -> NixlSourceManifestResponse:
-        return NixlSourceManifestResponse(
-            schema_version=IntegrityIdentity.SCHEMA_VERSION,
-            status=ManifestStatus.REJECTED,
-            detail=detail,
-            manifests=(),
-        )
-
-    if len(request) != 8 or request[0] != GET_SOURCE_MANIFEST_MSG:
-        return rejected("invalid source-manifest request schema")
-    (
-        _,
-        run_id,
-        transport_arm,
-        producer_engine_id,
-        producer_request_id,
-        offer_generation,
-        iteration,
-        required_ranks_raw,
-    ) = request
-    if (
-        not isinstance(run_id, str)
-        or len(run_id) == 0
-        or not isinstance(transport_arm, str)
-        or len(transport_arm) == 0
-        or not isinstance(producer_engine_id, str)
-        or len(producer_engine_id) == 0
-        or not isinstance(producer_request_id, str)
-        or len(producer_request_id) == 0
-        or type(offer_generation) is not int
-        or offer_generation < 0
-        or type(iteration) is not int
-        or iteration < 0
-        or not isinstance(required_ranks_raw, (list, tuple))
-    ):
-        return rejected("invalid source-manifest request fields")
-    if len(required_ranks_raw) == 0 or any(
-        type(rank) is not int or rank < 0 for rank in required_ranks_raw
-    ):
-        return rejected("invalid required source ranks")
-    required_ranks = tuple(int(rank) for rank in required_ranks_raw)
-    if len(set(required_ranks)) != len(required_ranks):
-        return rejected("duplicate required source ranks")
-    if available_ranks is not None and not set(required_ranks).issubset(
-        available_ranks
-    ):
-        return rejected("required source ranks are outside the producer topology")
-    if config.enabled is False:
-        return rejected("producer localization observer is disabled")
-    if config.enabled_for(producer_request_id) is False:
-        return rejected("producer request is outside the localization target")
-    if run_id != config.run_id or transport_arm != config.transport_arm:
-        return rejected("localization run or transport arm mismatch")
-
-    key = (producer_request_id, offer_generation)
-    rank_manifests = stored_manifests.get(key)
-    if rank_manifests is None:
-        return NixlSourceManifestResponse(
-            schema_version=IntegrityIdentity.SCHEMA_VERSION,
-            status=ManifestStatus.PENDING,
-            detail="waiting for required P-rank snapshots",
-            manifests=(),
-        )
-    stored_ranks = set(rank_manifests)
-    required_rank_set = set(required_ranks)
-    if not required_rank_set.issubset(stored_ranks):
-        return NixlSourceManifestResponse(
-            schema_version=IntegrityIdentity.SCHEMA_VERSION,
-            status=ManifestStatus.PENDING,
-            detail="waiting for required P-rank snapshots",
-            manifests=(),
-        )
-
-    manifests = tuple(rank_manifests[rank] for rank in required_ranks)
-    reference = manifests[0]
-    reference_semantics = (
-        reference.region_lengths,
-        tuple(
-            (
-                region.semantic_name,
-                region.group_indices,
-                region.group_semantic_names,
-                region.registered_bytes,
-                region.row_bytes,
-                region.shape,
-                region.strides,
-                region.dtype,
-                region.element_size_bytes,
-                region.layout,
-            )
-            for region in reference.regions
-        ),
-        reference.source_group_planes,
-        reference.valid_token_extent,
-        reference.group_token_capacities,
-        reference.block_ids,
-    )
-    for rank, manifest in zip(required_ranks, manifests, strict=True):
-        structure_errors = validate_source_manifest_structure(manifest)
-        if len(structure_errors) > 0:
-            return rejected(
-                f"invalid source manifest rank {rank}: {structure_errors[0]}"
-            )
-        if (
-            manifest.run_id != run_id
-            or manifest.transport_arm != transport_arm
-            or manifest.producer_engine_id != producer_engine_id
-            or manifest.producer_request_id != producer_request_id
-            or manifest.offer_generation != offer_generation
-            or manifest.iteration != iteration
-            or manifest.source_rank != rank
-            or manifest.observer is False
-        ):
-            return rejected(f"source manifest lineage mismatch on rank {rank}")
-        semantics = (
-            manifest.region_lengths,
-            tuple(
-                (
-                    region.semantic_name,
-                    region.group_indices,
-                    region.group_semantic_names,
-                    region.registered_bytes,
-                    region.row_bytes,
-                    region.shape,
-                    region.strides,
-                    region.dtype,
-                    region.element_size_bytes,
-                    region.layout,
-                )
-                for region in manifest.regions
-            ),
-            manifest.source_group_planes,
-            manifest.valid_token_extent,
-            manifest.group_token_capacities,
-            manifest.block_ids,
-        )
-        if semantics != reference_semantics:
-            return rejected("source ranks disagree on semantic transfer contract")
-    return NixlSourceManifestResponse(
-        schema_version=IntegrityIdentity.SCHEMA_VERSION,
-        status=ManifestStatus.READY,
-        detail="all required P-rank snapshots are ready",
-        manifests=manifests,
-    )
 
 
 def validate_capture(

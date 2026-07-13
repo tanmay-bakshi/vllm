@@ -29,7 +29,7 @@ def _contains_call(node: ast.AST, name: str) -> bool:
 
 @pytest.mark.cpu_test
 def test_delayed_draft_proposal_is_joined_before_every_connector_path() -> None:
-    """The source gate cannot run before a prior proposal stream is quiescent."""
+    """KV transfer cannot observe a still-running proposal stream."""
     repository_root = Path(__file__).resolve().parents[4]
     runner_path = repository_root / "vllm/v1/worker/gpu_model_runner.py"
     module = ast.parse(runner_path.read_text())
@@ -43,8 +43,7 @@ def test_delayed_draft_proposal_is_joined_before_every_connector_path() -> None:
         for index, statement in enumerate(execute_model.body)
         if _contains_call(statement, "wait_stream")
         and any(
-            isinstance(child, ast.Attribute)
-            and child.attr == "draft_propose_stream"
+            isinstance(child, ast.Attribute) and child.attr == "draft_propose_stream"
             for child in ast.walk(statement)
         )
     )
@@ -65,8 +64,7 @@ def test_delayed_draft_proposal_is_joined_before_every_connector_path() -> None:
     assert barrier_index < min(connector_indices)
     barrier = execute_model.body[barrier_index]
     assert any(
-        isinstance(child, ast.Attribute)
-        and child.attr == "_draft_propose_input_refs"
+        isinstance(child, ast.Attribute) and child.attr == "_draft_propose_input_refs"
         for child in ast.walk(barrier)
     )
 
@@ -103,15 +101,14 @@ def test_pre_read_capture_follows_transfer_drain_and_precedes_model_return() -> 
 
     assert drain_index < pre_read_index < boundary_index
     assert any(
-        isinstance(child, ast.Attribute)
-        and child.attr == "scheduled_request_ids"
+        isinstance(child, ast.Attribute) and child.attr == "scheduled_request_ids"
         for child in ast.walk(pre_read)
     )
 
 
 @pytest.mark.cpu_test
-def test_zero_byte_record_does_not_bypass_source_gate() -> None:
-    """Default full-prefix handling records exclusion, gates, then releases P."""
+def test_targeted_read_path_has_no_pre_transfer_source_gate() -> None:
+    """Targeted reads post from structural contracts without a source gate."""
     repository_root = Path(__file__).resolve().parents[4]
     worker_path = repository_root / (
         "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py"
@@ -120,20 +117,33 @@ def test_zero_byte_record_does_not_bypass_source_gate() -> None:
     read_blocks = next(
         node
         for node in ast.walk(module)
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_read_blocks_for_req"
+        if isinstance(node, ast.FunctionDef) and node.name == "_read_blocks_for_req"
     )
-    zero_index = next(
-        index
-        for index, statement in enumerate(read_blocks.body)
-        if "NON_EVIDENTIARY_ZERO_BYTE" in ast.unparse(statement)
+    coalesced_read = next(
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.FunctionDef) and node.name == "_coalesced_read_request"
     )
-    gate_index = next(
-        index
-        for index, statement in enumerate(read_blocks.body)
-        if _contains_call(statement, "_localization_source_gate")
+    contract_call = next(
+        node
+        for node in ast.walk(read_blocks)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_localization_build_source_contracts"
     )
-    zero_branch = read_blocks.body[zero_index]
+    dispatch_call = next(
+        node
+        for node in ast.walk(read_blocks)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_coalesced_read_request"
+        and len(node.args) == 4
+    )
 
-    assert zero_index < gate_index
-    assert not any(isinstance(node, ast.Return) for node in ast.walk(zero_branch))
+    assert not _contains_call(read_blocks, "_localization_source_gate")
+    assert not any(
+        isinstance(node, ast.FunctionDef) and node.name == "_localization_source_gate"
+        for node in ast.walk(module)
+    )
+    assert contract_call.lineno < dispatch_call.lineno
+    assert _contains_call(coalesced_read, "_initialize_and_post_coalesced")
