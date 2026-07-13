@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base worker-side logic for the NIXL connector."""
 
+import heapq
 import json
 import logging
 import os
@@ -91,6 +92,7 @@ from vllm.distributed.kv_transfer.staging_ownership import (
     HandleState,
     StagingRangeAllocator,
     StagingSafetyError,
+    TransferQuiescenceError,
 )
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.distributed.parallel_state import (
@@ -615,6 +617,7 @@ class NixlBaseConnectorWorker:
         # Liveness deadlines for source requests waiting to be transferred.
         # Removing a deadline never releases the source allocation.
         self._reqs_to_send: dict[ReqId, float] = {}
+        self._source_lease_heap: list[tuple[float, ReqId]] = []
         # Release fence: remote rids whose expected consumer set completed.
         # Bounded FIFO. A pull must never be issued for -- nor a completion
         # committed against -- a released rid.
@@ -1071,7 +1074,7 @@ class NixlBaseConnectorWorker:
                     error=e,
                     meta=meta,
                 )
-                self._handle_failed_transfer(req_id, None)
+                self._handle_failed_transfer(req_id)
 
         fut.add_done_callback(request_ready)
 
@@ -3911,21 +3914,49 @@ class NixlBaseConnectorWorker:
 
         :param now: Current monotonic time.
         """
-        while self._reqs_to_send:
-            req_id, expires = next(iter(self._reqs_to_send.items()))
-            # Sorted dict, oldest requests are put first so we can exit early.
+        while len(self._source_lease_heap) > 0:
+            expires, req_id = self._source_lease_heap[0]
             if now < expires:
-                break
+                return
+            heapq.heappop(self._source_lease_heap)
+            if self._reqs_to_send.get(req_id) != expires:
+                continue
             count = self.consumer_notification_counts_by_req.get(req_id, 0)
             self.xfer_stats.record_kv_expired_req()
             del self._reqs_to_send[req_id]
             logger.error(
                 "Source lease expired for request %s after %d consumer "
-                "completion(s); retaining its blocks until transfer completion "
-                "proves every remote operation quiescent.",
+                "completion(s); resolving through the connector mode's "
+                "ownership path without treating time as quiescence.",
                 req_id,
                 count,
             )
+            self._on_source_lease_expired(req_id, count)
+
+    def _set_source_lease(self, req_id: ReqId, expires: float) -> None:
+        """Install or extend one source liveness deadline.
+
+        :param req_id: Source request whose deadline is changing.
+        :param expires: Absolute monotonic expiration time.
+        """
+        current_expiry = self._reqs_to_send.get(req_id)
+        if current_expiry is not None and current_expiry >= expires:
+            return
+        self._reqs_to_send[req_id] = expires
+        heapq.heappush(self._source_lease_heap, (expires, req_id))
+
+    def _on_source_lease_expired(self, req_id: ReqId, completion_count: int) -> None:
+        """Terminate when remote READ quiescence cannot be established.
+
+        :param req_id: Source request whose liveness lease expired.
+        :param completion_count: Authoritative completions already observed.
+        :raises TransferQuiescenceError: Always, without releasing the source.
+        """
+        raise TransferQuiescenceError(
+            f"source lease expired for {req_id} after {completion_count} "
+            "completion(s); process teardown is required because this worker "
+            "cannot revoke or observe remote READ handles"
+        )
 
     # ------------------------------------------------------------------
     # Resident-KV checksum auditor (VLLM_GEMMA4_KV_AUDIT)
@@ -4147,7 +4178,7 @@ class NixlBaseConnectorWorker:
         for req_id in payload.split(","):
             if req_id in self._reqs_to_send:
                 old = self._reqs_to_send[req_id]
-                self._reqs_to_send[req_id] = max(old, new_expiry)
+                self._set_source_lease(req_id, max(old, new_expiry))
                 logger.debug(
                     "Heartbeat extended lease for request %s "
                     "by %ds (old_expiry=%.1f, new_expiry=%.1f)",
@@ -4158,60 +4189,83 @@ class NixlBaseConnectorWorker:
                 )
 
     def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
-        """
-        Pop completed xfers by checking for DONE state.
-        Args:
-            transfers: dict of req_id -> list[running_xfer]
-        Returns:
-            set of req_ids that have all done xfers
+        """Retire requests only after every native handle reports ``DONE``.
+
+        :param transfers: Request IDs mapped to their owned native handles.
+        :returns: Requests whose handles were all quiescent and released.
+        :raises TransferQuiescenceError: If status or handle ownership becomes
+            ambiguous.
         """
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
-            in_progress = []
-            for handle in handles:
+            in_progress: list[int] = []
+            for index, handle in enumerate(handles):
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
-                    if xfer_state == "DONE":
-                        # Get telemetry from NIXL
-                        res = self.nixl_wrapper.get_xfer_telemetry(handle)
-                        self.xfer_stats.record_transfer(res)
-                        self.nixl_wrapper.release_xfer_handle(handle)
-                    elif xfer_state == "PROC":
-                        in_progress.append(handle)
-                        continue
-                    else:
-                        self._log_failure(
-                            failure_type="transfer_failed",
-                            msg="Marking blocks as invalid",
-                            req_id=req_id,
-                            xfer_state=xfer_state,
-                        )
-                        self._handle_failed_transfer(req_id, handle)
-                except Exception as e:
+                except Exception as error:
+                    stacktrace = traceback.format_exc()
+                    transfers[req_id] = in_progress + handles[index:]
                     self._log_failure(
-                        failure_type="transfer_exception",
-                        msg="Marking blocks as invalid",
+                        failure_type="transfer_status_ambiguous",
+                        msg="Retaining native ownership and terminating",
                         req_id=req_id,
-                        error=e,
+                        error=error,
+                        native_handle=repr(handle),
+                        stacktrace=stacktrace,
                     )
-                    self._handle_failed_transfer(req_id, handle)
+                    raise TransferQuiescenceError(
+                        f"status query failed for request {req_id}; native handle "
+                        "ownership is retained until process teardown"
+                    ) from error
 
-            if not in_progress:
-                # Only report request as completed when all transfers are done.
+                if xfer_state == "PROC":
+                    in_progress.append(handle)
+                    continue
+                if xfer_state != "DONE":
+                    transfers[req_id] = in_progress + handles[index:]
+                    self._log_failure(
+                        failure_type="transfer_status_ambiguous",
+                        msg="Retaining native ownership and terminating",
+                        req_id=req_id,
+                        xfer_state=xfer_state,
+                        native_handle=repr(handle),
+                    )
+                    raise TransferQuiescenceError(
+                        f"request {req_id} reached native state {xfer_state!r}; "
+                        "only DONE proves memory quiescence"
+                    )
+
+                try:
+                    telemetry = self.nixl_wrapper.get_xfer_telemetry(handle)
+                    self.xfer_stats.record_transfer(telemetry)
+                    self.nixl_wrapper.release_xfer_handle(handle)
+                except Exception as error:
+                    stacktrace = traceback.format_exc()
+                    transfers[req_id] = in_progress + handles[index:]
+                    self._log_failure(
+                        failure_type="transfer_cleanup_ambiguous",
+                        msg="Retaining native ownership and terminating",
+                        req_id=req_id,
+                        error=error,
+                        native_handle=repr(handle),
+                        stacktrace=stacktrace,
+                    )
+                    raise TransferQuiescenceError(
+                        f"DONE handle cleanup failed for request {req_id}; "
+                        "native ownership is retained until process teardown"
+                    ) from error
+
+            if len(in_progress) == 0:
                 done_req_ids.add(req_id)
                 del transfers[req_id]
             else:
                 transfers[req_id] = in_progress
         return done_req_ids
 
-    def _handle_failed_transfer(self, req_id: str, handle: int | None):
-        """
-        Handle a failed transfer by marking all (logical) blocks as invalid and
-        recording the failure.
+    def _handle_failed_transfer(self, req_id: str) -> None:
+        """Fail a request for which no native operation can still run.
 
-        Args:
-            req_id: The request ID.
-            handle: The transfer handle.
+        :param req_id: Request whose transfer failed before native posting.
         """
         meta = self._recving_metadata.get(req_id)
         remote = meta.remote if meta is not None else None
@@ -4229,8 +4283,6 @@ class NixlBaseConnectorWorker:
         if meta is not None and not self._is_hma_required:
             self._invalid_block_ids.put(set(meta.local_block_ids[0]))
         self._failed_recv_reqs.put(req_id)
-        if handle is not None:
-            self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
 
     def _send_heartbeats(self, metadata: NixlConnectorMetadata) -> None:
@@ -4563,7 +4615,6 @@ class NixlBaseConnectorWorker:
                 "remote-engine cleanup would release resources with live staging "
                 + "; ".join(plan.describe() for plan in unsafe_plans)
             )
-
         for handle in self.dst_xfer_side_handles.pop(engine_id).values():
             self.nixl_wrapper.release_dlist_handle(handle)
         for agent_name in self._remote_agents.pop(engine_id).values():
@@ -4589,9 +4640,9 @@ class NixlBaseConnectorWorker:
     def __del__(self) -> None:
         try:
             self.shutdown()
-        except StagingSafetyError:
+        except TransferQuiescenceError:
             logger.critical(
-                "Refusing in-process NIXL teardown with unresolved staging ownership",
+                "Refusing in-process NIXL teardown with unresolved transfer ownership",
                 exc_info=True,
             )
 
@@ -4608,13 +4659,20 @@ class NixlBaseConnectorWorker:
                 "in-process shutdown cannot quiesce coalesced staging: "
                 + "; ".join(plan.describe() for plan in unsafe_plans)
             )
+        active_requests = {
+            req_id: len(handles)
+            for req_id, handles in self._recving_transfers.items()
+            if len(handles) > 0
+        }
+        if len(active_requests) > 0:
+            raise TransferQuiescenceError(
+                "in-process shutdown cannot release active stock transfers: "
+                f"{active_requests}"
+            )
         if self._localization_writer is not None:
             self._localization_writer.close()
             self._localization_writer = None
         self._handshake_initiation_executor.shutdown(wait=False)
-        for handles in self._recving_transfers.values():
-            for handle in handles:
-                self.nixl_wrapper.release_xfer_handle(handle)
         self._recving_transfers.clear()
         for handle in self.src_xfer_handles_by_block_size.values():
             self.nixl_wrapper.release_dlist_handle(handle)

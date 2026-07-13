@@ -18,17 +18,17 @@ requiring a real NIXL agent or network:
 * ``get_finished`` enqueues evictions for the writer.
 """
 
-from __future__ import annotations
-
 import logging
 import queue
 import threading
 import time
 from collections import defaultdict
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import msgspec
+import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
@@ -37,9 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
-    get_base_request_id,
-)
+from vllm.distributed.kv_transfer.staging_ownership import TransferQuiescenceError
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import make_nixl_push_scheduler
@@ -127,6 +125,7 @@ class TestPushScheduler:
         reg = sched._push_pending_registrations[request.request_id]
         # ``request_id`` is D's own vLLM request id; plus our own (D) coords.
         assert reg["request_id"] == request.request_id
+        assert reg["producer_request_id"] == "prefill-req-d-1"
         assert reg["decode_engine_id"] == sched.engine_id
         assert reg["decode_host"] == sched.side_channel_host
         assert reg["decode_port"] == sched.side_channel_port
@@ -234,6 +233,26 @@ class TestPushScheduler:
         )
         assert sched.has_pending_push_work() is False
 
+    def test_destination_deadline_keeps_watchdog_stepping(self):
+        sched = make_nixl_push_scheduler()
+        _stub_sw_clipping(sched)
+        request = _make_request(request_id="req-d-watchdog")
+        sched.update_state_after_alloc(
+            request, _BlocksMock(([1, 2],)), num_external_tokens=32
+        )
+        sched._push_pending_registrations.clear()
+
+        assert sched.has_pending_push_work() is True
+
+        sched.update_connector_output(
+            KVConnectorOutput(
+                finished_sending=set(),
+                finished_recving={request.request_id},
+                invalid_block_ids=set(),
+            )
+        )
+        assert sched.has_pending_push_work() is False
+
     def test_update_connector_output_clears_lease_and_watchdog(self):
         sched = make_nixl_push_scheduler()
         _stub_sw_clipping(sched)
@@ -255,15 +274,8 @@ class TestPushScheduler:
         assert "req-p-x" not in sched._finished_request_blocks
         assert "req-d-x" not in sched._push_registration_deadlines
 
-    def test_registration_watchdog_expires(self, caplog):
-        """Stale D registrations whose deadline has passed are dropped at
-        ``build_connector_meta`` time."""
-        # Watchdog logs a WARNING when it drops the stale entry; that's
-        # what this test is verifying, so silence it in the test report.
-        caplog.set_level(
-            logging.CRITICAL,
-            logger=("vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler"),
-        )
+    def test_registration_watchdog_fails_closed(self):
+        """D cannot recycle a destination while P's WRITE is unobservable."""
         sched = make_nixl_push_scheduler()
         _stub_sw_clipping(sched)
 
@@ -279,16 +291,18 @@ class TestPushScheduler:
         scheduler_output.scheduled_cached_reqs = MagicMock(
             req_ids=[], resumed_req_ids=set()
         )
-        with patch.object(
-            sched.__class__.__mro__[1],
-            "build_connector_meta",
-            return_value=NixlConnectorMetadata(),
+        with (
+            patch.object(
+                sched.__class__.__mro__[1],
+                "build_connector_meta",
+                return_value=NixlConnectorMetadata(),
+            ),
+            pytest.raises(TransferQuiescenceError, match="cannot observe"),
         ):
-            meta = sched.build_connector_meta(scheduler_output)
+            sched.build_connector_meta(scheduler_output)
 
-        assert d_req.request_id not in sched._push_registration_deadlines
-        assert d_req.request_id not in sched._push_pending_registrations
-        assert d_req.request_id not in meta.push_registrations
+        assert d_req.request_id in sched._push_registration_deadlines
+        assert d_req.request_id in sched._push_pending_registrations
 
 
 # ----------------------------------------------------------------- #
@@ -301,7 +315,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
     the matching/notif logic without bringing up NIXL or torch."""
 
     @classmethod
-    def fresh(cls) -> _StubWriterWorker:
+    def fresh(cls) -> "_StubWriterWorker":
         w = object.__new__(cls)
 
         # Push-specific state managed by NixlPushConnectorWorker.
@@ -317,7 +331,11 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._reg_send_inbox = queue.Queue()
         w._finished_blocks_inbox = queue.Queue()
         w._pending_completion_notifs = queue.Queue()
+        w._push_recv_producer_ranks = defaultdict(set)
+        w._expired_push_inbox = queue.Queue()
         w._evict_finished_inbox = queue.Queue()
+        w._fenced_push_sources = set()
+        w._push_writer_fault = None
         w._push_writer_wake = threading.Event()
         w._push_writer_stop = threading.Event()
         w._push_writer_thread = None
@@ -327,6 +345,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._recving_transfers = defaultdict(list)
         w._reqs_to_process = set()
         w._reqs_to_send = {}
+        w._source_lease_heap = []
         w.consumer_notification_counts_by_req = defaultdict(int)
         w.tp_rank = 0
         w.world_size = 1
@@ -351,6 +370,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
 def _registration_data(
     request_id: str,
     *,
+    producer_request_id: str | None = None,
     decode_engine_id: str = "decode-engine",
     decode_host: str = "10.0.0.2",
     decode_port: int = 5602,
@@ -363,6 +383,7 @@ def _registration_data(
 ) -> dict[str, Any]:
     return {
         "request_id": request_id,
+        "producer_request_id": producer_request_id or request_id,
         "decode_engine_id": decode_engine_id,
         "decode_host": decode_host,
         "decode_port": decode_port,
@@ -408,25 +429,18 @@ class TestPushWriterMatching:
         assert len(w.start_push_calls) == 0
         assert "req-B" in w._pending_d_registrations
 
-    def test_handle_push_reg_matches_after_stripping_random_suffix(self):
-        """P and D assign the same logical request the same
-        ``cmpl-<uuid>-<index>`` but different per-engine random suffixes;
-        the writer should still match P's finished blocks via the
-        suffix-stripping fallback in ``_pop_matching_finished_blocks``.
-        """
+    def test_handle_push_reg_uses_explicit_producer_request_id(self):
+        """Different P and D IDs match through the protocol identity."""
         w = _StubWriterWorker.fresh()
-        # Same base id + completion index; differ only in the trailing
-        # ``-<8 hex>`` randomization suffix.
         p_id = "cmpl-12345678-aaaa-bbbb-cccc-1234567890ab-0-aaaaaaaa"
         d_id = "cmpl-12345678-aaaa-bbbb-cccc-1234567890ab-0-bbbbbbbb"
-        # Sanity: same base id under the helper used by the connector.
-        assert get_base_request_id(p_id) == get_base_request_id(d_id)
 
         w._push_finished_blocks[p_id] = ([1, 2, 3],)
-        notif = PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(_registration_data(d_id))
+        notif = PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(
+            _registration_data(d_id, producer_request_id=p_id)
+        )
         w._handle_push_reg_notif(notif)
 
-        # Suffix-stripped fallback matched and fired.
         assert len(w.start_push_calls) == 1
         assert w.start_push_calls[0][0] == p_id
         assert p_id not in w._push_finished_blocks
@@ -512,9 +526,9 @@ class TestPushWriterNotifs:
         # Pretend the writer thread already forwarded a completion notif
         # for a request whose KV is being received.
         request_id = "req-recv-1"
-        w._recving_metadata[request_id] = MagicMock()
+        w._recving_metadata[request_id] = SimpleNamespace(tp_size=1)
         # Compose the standard completion notif: req_id:tp_size.
-        notif_msg = f"{request_id}:1".encode()
+        notif_msg = f"{request_id}:1:0".encode()
         w._pending_completion_notifs.put(notif_msg)
 
         # transfer_topo is consulted only for the producer-side path; we
@@ -526,6 +540,43 @@ class TestPushWriterNotifs:
         # Notif consumed; D-side just touches _recving_transfers.
         assert notified == set()
         assert request_id in w._recving_transfers
+
+    def test_completion_requires_every_distinct_prefill_rank(self):
+        w = _StubWriterWorker.fresh()
+        request_id = "req-recv-fan-in"
+        w._recving_metadata[request_id] = SimpleNamespace(tp_size=2)
+        w.transfer_topo = SimpleNamespace(tp_ratio=lambda remote_size: -2)
+
+        w._pending_completion_notifs.put(f"{request_id}:1:0".encode())
+        assert w._get_new_notifs() == set()
+        assert request_id not in w._recving_transfers
+
+        w._pending_completion_notifs.put(f"{request_id}:2:0".encode())
+        w._pending_completion_notifs.put(f"{request_id}:2:0".encode())
+        assert w._get_new_notifs() == set()
+        assert request_id not in w._recving_transfers
+        assert w._push_recv_producer_ranks[request_id] == {0}
+
+        w._pending_completion_notifs.put(f"{request_id}:2:1".encode())
+        assert w._get_new_notifs() == set()
+        assert w._recving_transfers[request_id] == []
+        assert request_id not in w._push_recv_producer_ranks
+
+    def test_completion_ignores_unrelated_prefill_rank(self):
+        w = _StubWriterWorker.fresh()
+        w.world_size = 4
+        w.tp_rank = 1
+        request_id = "req-recv-fan-out"
+        w._recving_metadata[request_id] = SimpleNamespace(tp_size=2)
+        w.transfer_topo = SimpleNamespace(tp_ratio=lambda remote_size: 2)
+
+        w._pending_completion_notifs.put(f"{request_id}:2:1".encode())
+        assert w._get_new_notifs() == set()
+        assert request_id not in w._recving_transfers
+
+        w._pending_completion_notifs.put(f"{request_id}:2:0".encode())
+        assert w._get_new_notifs() == set()
+        assert w._recving_transfers[request_id] == []
 
     def test_get_finished_evicts_completed_state(self):
         """``get_finished`` should enqueue evictions and wake the writer."""
@@ -578,8 +629,8 @@ class TestPushSchedulerNegative:
         assert sched._push_registration_deadlines == {}
         assert sched._reqs_need_recv == {}
 
-    def test_update_state_after_alloc_zero_external_tokens_does_not_register(self):
-        """num_external_tokens=0 should not stage a D registration."""
+    def test_full_prefix_completion_stages_zero_byte_registration(self):
+        """A healthy full-prefix hit explicitly releases P without a WRITE."""
         sched = make_nixl_push_scheduler()
         _stub_sw_clipping(sched)
 
@@ -588,8 +639,46 @@ class TestPushSchedulerNegative:
             request, _BlocksMock(([1, 2, 3],)), num_external_tokens=0
         )
 
-        assert sched._push_pending_registrations == {}
+        registration = sched._push_pending_registrations[request.request_id]
+        assert registration["producer_request_id"] == "prefill-req-zero-ext"
+        assert registration["local_block_ids"] == ()
+        assert sched._reqs_need_recv == {}
         assert sched._push_registration_deadlines == {}
+        assert request.kv_transfer_params["do_remote_prefill"] is False
+
+        delay, params = sched.request_finished(request, ())
+
+        assert delay is False
+        assert params is None
+        assert len(sched._push_pending_registrations) == 1
+
+    def test_preallocation_abort_stages_fire_and_forget_completion(self):
+        sched = make_nixl_push_scheduler()
+        request = _make_request(request_id="req-prealloc-abort")
+
+        delay, params = sched.request_finished(request, ())
+
+        assert delay is False
+        assert params is None
+        registration = sched._push_pending_registrations[request.request_id]
+        assert registration["local_block_ids"] == ()
+        assert sched._reqs_need_recv == {}
+        assert sched._push_registration_deadlines == {}
+
+    def test_abort_with_destination_keeps_safety_deadline(self):
+        sched = make_nixl_push_scheduler()
+        _stub_sw_clipping(sched)
+        request = _make_request(request_id="req-transfer-abort")
+        sched.update_state_after_alloc(
+            request, _BlocksMock(([1, 2],)), num_external_tokens=32
+        )
+
+        delay, params = sched.request_finished(request, ([1, 2],))
+
+        assert delay is False
+        assert params is None
+        assert request.request_id in sched._push_registration_deadlines
+        assert request.request_id in sched._reqs_need_recv
 
     def test_request_finished_unfinished_status_does_not_stage(self):
         """If a request is still RUNNING, request_finished must not stash
@@ -656,15 +745,11 @@ class TestPushWriterNegative:
         w = _StubWriterWorker.fresh()
         assert w._pop_matching_finished_blocks("nope") is None
 
-    def test_pop_matching_registration_no_match_when_base_ids_differ(self):
-        """A registration whose base id (after stripping the random suffix)
-        does NOT match the lookup request_id must not be popped."""
+    def test_pop_matching_registration_requires_exact_producer_id(self):
+        """Registration matching never aliases different producer IDs."""
         w = _StubWriterWorker.fresh()
-        # Two unrelated requests: different base UUIDs, so stripping the
-        # trailing ``-<8 hex>`` suffix still yields different base ids.
         unrelated_d = "cmpl-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa-0-11111111"
         lookup = "cmpl-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb-0-22222222"
-        assert get_base_request_id(unrelated_d) != get_base_request_id(lookup)
 
         w._pending_d_registrations[unrelated_d] = _registration_data(unrelated_d)
         result = w._pop_matching_registration(lookup)
@@ -813,3 +898,178 @@ class TestPushWriterNegative:
             assert w._reqs_to_send[rid] >= now
         # Unknown request must not be inserted by the heartbeat path.
         assert "req-unknown" not in w._reqs_to_send
+
+    def test_zero_byte_registration_completes_source_without_write(self):
+        w = _StubWriterWorker.fresh()
+        w._ensure_d_handshake = MagicMock()
+        registration = _registration_data(
+            "decode-zero",
+            producer_request_id="prefill-zero",
+            local_block_ids=(),
+        )
+
+        NixlPushConnectorWorker._do_start_push_kv(
+            w,
+            "prefill-zero",
+            ([1, 2],),
+            registration,
+        )
+
+        assert w._sending_transfers["prefill-zero"] == []
+        assert "prefill-zero" not in w._fenced_push_sources
+        w._ensure_d_handshake.assert_not_called()
+
+    def test_failed_handshake_completes_source_without_write(self):
+        w = _StubWriterWorker.fresh()
+        w._ensure_d_handshake = MagicMock(return_value=False)
+        registration = _registration_data(
+            "decode-handshake-failed",
+            producer_request_id="prefill-handshake-failed",
+        )
+
+        NixlPushConnectorWorker._do_start_push_kv(
+            w,
+            "prefill-handshake-failed",
+            ([1, 2],),
+            registration,
+        )
+
+        assert w._sending_transfers["prefill-handshake-failed"] == []
+        assert "prefill-handshake-failed" in w._fenced_push_sources
+
+    def test_expiry_fences_unposted_push_and_ignores_late_registration(self):
+        w = _StubWriterWorker.fresh()
+        w._push_finished_blocks["prefill-expired"] = ([1, 2],)
+        w._pending_d_registrations["prefill-expired"] = _registration_data(
+            "decode-expired", producer_request_id="prefill-expired"
+        )
+
+        w._fence_push_source("prefill-expired")
+
+        assert w._sending_transfers["prefill-expired"] == []
+        assert "prefill-expired" in w._fenced_push_sources
+        assert w._push_finished_blocks == {}
+        assert w._pending_d_registrations == {}
+        late = PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(
+            _registration_data("decode-expired", producer_request_id="prefill-expired")
+        )
+        w._handle_push_reg_notif(late)
+        assert w.start_push_calls == []
+        assert w._pop_done_transfers(w._sending_transfers) == {"prefill-expired"}
+
+    def test_write_post_exception_retains_handle_and_faults_writer(self):
+        w = _StubWriterWorker.fresh()
+        remote_info = SimpleNamespace(
+            remote_block_size=16,
+            remote_physical_blocks_per_logical=1,
+        )
+        w.transfer_topo = SimpleNamespace(
+            get_engine_info=lambda engine_id: remote_info,
+            block_size_ratio=lambda remote_block_size: 1,
+        )
+        w.dst_num_blocks = {"decode-engine": 32, w.engine_id: 32}
+        w._physical_blocks_per_logical_kv_block = 1
+        w._compute_desc_ids = MagicMock(return_value=[0])
+        w.nixl_wrapper = MagicMock()
+        w.nixl_wrapper.make_prepped_xfer.return_value = 404
+        w.nixl_wrapper.transfer.side_effect = RuntimeError("post outcome lost")
+        w._log_failure = MagicMock()
+        w.xfer_stats = MagicMock()
+        read_spec = SimpleNamespace(
+            remote_rank=0,
+            local_block_ids=[[1]],
+            remote_block_ids=[[2]],
+        )
+
+        with pytest.raises(TransferQuiescenceError, match="ambiguous"):
+            w._xfer_blocks(
+                read_spec=read_spec,
+                dst_engine_id="decode-engine",
+                request_id="prefill-ambiguous",
+                remote_request_id="decode-ambiguous",
+                local_xfer_side_handle=11,
+                remote_xfer_side_handle=22,
+            )
+
+        assert w._sending_transfers["prefill-ambiguous"] == [404]
+        assert isinstance(w._push_writer_fault, TransferQuiescenceError)
+        w.nixl_wrapper.release_xfer_handle.assert_not_called()
+        w._sending_transfers.clear()
+        w._push_writer_fault = None
+
+    def test_write_prepare_failure_cannot_publish_partial_request(self):
+        w = _StubWriterWorker.fresh()
+        remote_info = SimpleNamespace(
+            remote_block_size=16,
+            remote_physical_blocks_per_logical=1,
+        )
+        w.transfer_topo = SimpleNamespace(
+            get_engine_info=lambda engine_id: remote_info,
+            block_size_ratio=lambda remote_block_size: 1,
+        )
+        w.dst_num_blocks = {"decode-engine": 32, w.engine_id: 32}
+        w._physical_blocks_per_logical_kv_block = 1
+        w._compute_desc_ids = MagicMock(return_value=[0])
+        w.nixl_wrapper = MagicMock()
+        w.nixl_wrapper.make_prepped_xfer.side_effect = RuntimeError("prepare lost")
+        w._log_failure = MagicMock()
+        w.xfer_stats = MagicMock()
+        w._sending_transfers["prefill-partial"] = [403]
+        read_spec = SimpleNamespace(
+            remote_rank=1,
+            local_block_ids=[[1]],
+            remote_block_ids=[[2]],
+        )
+
+        with pytest.raises(TransferQuiescenceError, match="already posted"):
+            w._xfer_blocks(
+                read_spec=read_spec,
+                dst_engine_id="decode-engine",
+                request_id="prefill-partial",
+                remote_request_id="decode-partial",
+                local_xfer_side_handle=11,
+                remote_xfer_side_handle=22,
+            )
+
+        assert w._sending_transfers["prefill-partial"] == [403]
+        assert isinstance(w._push_writer_fault, TransferQuiescenceError)
+        w.nixl_wrapper.release_xfer_handle.assert_not_called()
+        w._sending_transfers.clear()
+        w._push_writer_fault = None
+
+    def test_first_write_prepare_failure_completes_without_write(self):
+        w = _StubWriterWorker.fresh()
+        remote_info = SimpleNamespace(
+            remote_block_size=16,
+            remote_physical_blocks_per_logical=1,
+        )
+        w.transfer_topo = SimpleNamespace(
+            get_engine_info=lambda engine_id: remote_info,
+            block_size_ratio=lambda remote_block_size: 1,
+        )
+        w.dst_num_blocks = {"decode-engine": 32, w.engine_id: 32}
+        w._physical_blocks_per_logical_kv_block = 1
+        w._compute_desc_ids = MagicMock(return_value=[0])
+        w.nixl_wrapper = MagicMock()
+        w.nixl_wrapper.make_prepped_xfer.side_effect = RuntimeError("prepare lost")
+        w._log_failure = MagicMock()
+        w.xfer_stats = MagicMock()
+        read_spec = SimpleNamespace(
+            remote_rank=0,
+            local_block_ids=[[1]],
+            remote_block_ids=[[2]],
+        )
+
+        posted = w._xfer_blocks(
+            read_spec=read_spec,
+            dst_engine_id="decode-engine",
+            request_id="prefill-unposted",
+            remote_request_id="decode-unposted",
+            local_xfer_side_handle=11,
+            remote_xfer_side_handle=22,
+        )
+
+        assert posted is False
+        assert w._sending_transfers["prefill-unposted"] == []
+        assert "prefill-unposted" in w._fenced_push_sources
+        w.nixl_wrapper.release_xfer_handle.assert_not_called()

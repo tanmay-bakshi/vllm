@@ -1,6 +1,7 @@
 """Source-bound tests for production coalesced-staging ownership."""
 
 import ast
+import heapq
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from vllm.distributed.kv_transfer.staging_ownership import (
     StagingOwnershipSnapshot,
     StagingRangeAllocator,
     StagingSafetyError,
+    TransferQuiescenceError,
 )
 
 BASE_WORKER_PATH = (
@@ -71,6 +73,7 @@ def _production_worker_methods(
         "CoalescedStagingPlan": CoalescedStagingPlan,
         "EngineId": str,
         "HandleState": HandleState,
+        "heapq": heapq,
         "IntegrityStage": SimpleNamespace(
             STAGING_RAW="staging_raw",
             STAGING_FENCED_CONTROL="staging_fenced_control",
@@ -79,6 +82,7 @@ def _production_worker_methods(
         "Never": Never,
         "ReqId": str,
         "StagingSafetyError": StagingSafetyError,
+        "TransferQuiescenceError": TransferQuiescenceError,
         "logger": MagicMock(),
         "time": SimpleNamespace(monotonic=lambda: monotonic_time),
         "torch": MagicMock() if torch_module is None else torch_module,
@@ -117,8 +121,12 @@ def _production_pull_worker_methods(*method_names: str) -> type:
     )
     module = ast.fix_missing_locations(ast.Module(body=[test_class], type_ignores=[]))
     namespace: dict[str, object] = {
+        "ReadSpec": object,
         "ReqId": str,
+        "TransferQuiescenceError": TransferQuiescenceError,
         "logger": MagicMock(),
+        "np": MagicMock(),
+        "traceback": traceback,
     }
     exec(compile(module, str(PULL_WORKER_PATH), "exec"), namespace)
     return namespace["ProductionPullWorkerMethods"]  # type: ignore[return-value]
@@ -356,14 +364,18 @@ def test_failed_publication_cannot_retire_live_native_handle() -> None:
 
 
 def test_source_lease_expiry_never_authorizes_reuse() -> None:
-    worker_type = _production_worker_methods("_expire_source_leases")
+    worker_type = _production_worker_methods(
+        "_expire_source_leases", "_on_source_lease_expired"
+    )
     worker = worker_type()
     worker._reqs_to_send = {"producer-request": 10.0}
+    worker._source_lease_heap = [(10.0, "producer-request")]
     worker._reqs_to_process = {"producer-request"}
     worker.consumer_notification_counts_by_req = {"producer-request": 1}
     worker.xfer_stats = MagicMock()
 
-    worker._expire_source_leases(12.0)
+    with pytest.raises(TransferQuiescenceError, match="process teardown"):
+        worker._expire_source_leases(12.0)
 
     assert worker._reqs_to_send == {}
     assert worker._reqs_to_process == {"producer-request"}
@@ -371,7 +383,27 @@ def test_source_lease_expiry_never_authorizes_reuse() -> None:
     worker.xfer_stats.record_kv_expired_req.assert_called_once_with()
 
 
-def test_late_completion_releases_expired_pull_source() -> None:
+def test_renewed_lease_cannot_hide_a_later_expired_request() -> None:
+    worker_type = _production_worker_methods("_expire_source_leases")
+    worker = worker_type()
+    worker._reqs_to_send = {"renewed": 30.0, "expired": 20.0}
+    worker._source_lease_heap = [
+        (10.0, "renewed"),
+        (20.0, "expired"),
+        (30.0, "renewed"),
+    ]
+    heapq.heapify(worker._source_lease_heap)
+    worker.consumer_notification_counts_by_req = {}
+    worker.xfer_stats = MagicMock()
+    worker._on_source_lease_expired = MagicMock()
+
+    worker._expire_source_leases(25.0)
+
+    assert worker._reqs_to_send == {"renewed": 30.0}
+    worker._on_source_lease_expired.assert_called_once_with("expired", 0)
+
+
+def test_completion_releases_pull_source_without_a_live_deadline() -> None:
     worker_type = _production_pull_worker_methods("_get_new_notifs")
     worker = worker_type()
     worker.transfer_topo = SimpleNamespace(tp_ratio=lambda remote_size: 1)
@@ -387,6 +419,127 @@ def test_late_completion_releases_expired_pull_source() -> None:
     assert worker._get_new_notifs() == {"producer-request"}
     assert worker._reqs_to_process == set()
     worker._localization_capture_source_post.assert_called_once_with("producer-request")
+
+
+def test_stock_status_exception_retains_every_unproven_handle() -> None:
+    worker_type = _production_worker_methods("_pop_done_transfers")
+    worker = worker_type()
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.check_xfer_state.side_effect = ["PROC", RuntimeError("lost")]
+    worker._log_failure = MagicMock()
+    worker.xfer_stats = MagicMock()
+    transfers = {"request": [101, 102, 103]}
+
+    with pytest.raises(TransferQuiescenceError, match="status query failed"):
+        worker._pop_done_transfers(transfers)
+
+    assert transfers == {"request": [101, 102, 103]}
+    worker.nixl_wrapper.release_xfer_handle.assert_not_called()
+
+
+def test_stock_error_state_retains_native_ownership() -> None:
+    worker_type = _production_worker_methods("_pop_done_transfers")
+    worker = worker_type()
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.check_xfer_state.return_value = "ERR"
+    worker._log_failure = MagicMock()
+    worker.xfer_stats = MagicMock()
+    transfers = {"request": [201]}
+
+    with pytest.raises(TransferQuiescenceError, match="only DONE"):
+        worker._pop_done_transfers(transfers)
+
+    assert transfers == {"request": [201]}
+    worker.nixl_wrapper.release_xfer_handle.assert_not_called()
+
+
+def test_stock_read_post_exception_retains_native_handle() -> None:
+    worker_type = _production_pull_worker_methods("_read_blocks")
+    worker = worker_type()
+    remote_info = SimpleNamespace(
+        remote_block_size=16,
+        remote_physical_blocks_per_logical=1,
+    )
+    worker.transfer_topo = SimpleNamespace(
+        get_engine_info=lambda engine_id: remote_info,
+        block_size_ratio=lambda remote_block_size: 1,
+    )
+    worker.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    worker.dst_num_blocks = {"producer": 32, "decoder": 32}
+    worker.engine_id = "decoder"
+    worker.world_size = 1
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker._apply_prefix_caching = lambda local, remote, ratio: (local, remote)
+    worker._compute_desc_ids = MagicMock(return_value=[0])
+    worker._assert_transfer_post_allowed = MagicMock()
+    worker._recving_transfers = {"request": []}
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.make_prepped_xfer.return_value = 301
+    worker.nixl_wrapper.transfer.side_effect = RuntimeError("post outcome lost")
+    worker._log_failure = MagicMock()
+    read_spec = SimpleNamespace(
+        remote_rank=0,
+        local_block_ids=[[1]],
+        remote_block_ids=[[2]],
+    )
+
+    with pytest.raises(TransferQuiescenceError, match="ambiguous"):
+        worker._read_blocks(
+            expected_consumers=1,
+            read_spec=read_spec,
+            dst_engine_id="producer",
+            request_id="request",
+            remote_request_id="source-request",
+            local_xfer_side_handle=11,
+            remote_xfer_side_handle=22,
+        )
+
+    assert worker._recving_transfers == {"request": [301]}
+    worker.nixl_wrapper.release_xfer_handle.assert_not_called()
+
+
+def test_stock_prepare_failure_cannot_publish_partial_request() -> None:
+    worker_type = _production_pull_worker_methods("_read_blocks")
+    worker = worker_type()
+    remote_info = SimpleNamespace(
+        remote_block_size=16,
+        remote_physical_blocks_per_logical=1,
+    )
+    worker.transfer_topo = SimpleNamespace(
+        get_engine_info=lambda engine_id: remote_info,
+        block_size_ratio=lambda remote_block_size: 1,
+    )
+    worker.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    worker.dst_num_blocks = {"producer": 32, "decoder": 32}
+    worker.engine_id = "decoder"
+    worker.world_size = 1
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker._apply_prefix_caching = lambda local, remote, ratio: (local, remote)
+    worker._compute_desc_ids = MagicMock(return_value=[0])
+    worker._assert_transfer_post_allowed = MagicMock()
+    worker._recving_transfers = {"request": [300]}
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.make_prepped_xfer.side_effect = RuntimeError("prepare lost")
+    worker._log_failure = MagicMock()
+    read_spec = SimpleNamespace(
+        remote_rank=1,
+        local_block_ids=[[1]],
+        remote_block_ids=[[2]],
+    )
+
+    with pytest.raises(TransferQuiescenceError, match="already posted"):
+        worker._read_blocks(
+            expected_consumers=1,
+            read_spec=read_spec,
+            dst_engine_id="producer",
+            request_id="request",
+            remote_request_id="source-request",
+            local_xfer_side_handle=11,
+            remote_xfer_side_handle=22,
+        )
+
+    assert worker._recving_transfers == {"request": [300]}
+    worker.nixl_wrapper.release_xfer_handle.assert_not_called()
 
 
 def test_production_sync_failure_keeps_owned_generation() -> None:

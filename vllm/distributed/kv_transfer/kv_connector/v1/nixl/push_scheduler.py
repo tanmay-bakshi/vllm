@@ -18,8 +18,8 @@ In push mode, scheduler-side responsibilities are:
   while pushes are in flight. ``update_connector_output`` cleans up
   ``_finished_request_blocks`` once the WRITE completes.
 
-A soft per-registration watchdog on the D scheduler fails requests that have
-been registered but not fulfilled within a configurable timeout.
+A per-registration watchdog terminates the connector if D cannot prove whether
+an unfulfilled remote WRITE may still touch its destination allocation.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
     ReqId,
 )
+from vllm.distributed.kv_transfer.staging_ownership import TransferQuiescenceError
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -87,9 +88,8 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # P-side: newly finished blocks to ship to P workers on next step.
         self._newly_finished_push_blocks: dict[ReqId, BlockIds] = {}
 
-        # Soft watchdog timeout (seconds) for D-side registrations that
-        # never receive a push completion. Defaults to the existing
-        # decoder KV blocks TTL so behaviour matches the lease.
+        # Safety deadline for D-side registrations that never receive a push
+        # completion. D fails closed because it cannot observe P's WRITE.
         assert vllm_config.kv_transfer_config is not None
         self._push_registration_timeout: float = float(
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -159,8 +159,9 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             return
 
         if num_external_tokens <= 0:
-            # Nothing to receive: full prefix-cache hit on D, no
-            # registration to stage.
+            # D needs no bytes, but P still needs an explicit no-WRITE
+            # completion so it can release the source immediately.
+            self._stage_zero_byte_completion(request)
             return
 
         # First-pass D path: stash registration data the worker will
@@ -171,22 +172,21 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         )
         local_block_ids: BlockIds = blocks.get_unhashed_block_ids_all_groups()
         local_block_ids = self.get_sw_clipped_blocks(local_block_ids)
+        self._stage_push_registration(request, local_block_ids)
 
-        # ``remote_*`` fields are P's coordinates (from D's perspective).
-        # ``decode_*`` fields are D's own info that P needs for the
-        # reverse handshake before WRITE-ing.
-        self._push_pending_registrations[request.request_id] = {
-            "request_id": request.request_id,
-            "decode_engine_id": self.engine_id,
-            "decode_host": self.side_channel_host,
-            "decode_port": self.side_channel_port,
-            "decode_tp_size": (self.vllm_config.parallel_config.tensor_parallel_size),
-            "local_block_ids": local_block_ids,
-            "remote_engine_id": params["remote_engine_id"],
-            "remote_host": params["remote_host"],
-            "remote_port": params["remote_port"],
-            "remote_tp_size": params["tp_size"],
-        }
+    def _stage_push_registration(
+        self, request: Request, local_block_ids: BlockIds
+    ) -> None:
+        """Stage one D-to-P registration and its local receive owner.
+
+        :param request: Decode request carrying the producer coordinates.
+        :param local_block_ids: Decode blocks that P must populate.
+        """
+        params = request.kv_transfer_params
+        assert params is not None
+        self._push_pending_registrations[request.request_id] = (
+            self._build_push_registration(request, local_block_ids)
+        )
         self._push_registration_deadlines[request.request_id] = (
             time.perf_counter() + self._push_registration_timeout
         )
@@ -203,6 +203,44 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # Mark as processed so a re-entry (e.g. preemption + reschedule)
         # doesn't re-stage the registration.
         params["do_remote_prefill"] = False
+
+    def _stage_zero_byte_completion(self, request: Request) -> None:
+        """Stage a fire-and-forget completion when D owns no destination.
+
+        :param request: Decode request carrying the producer coordinates.
+        """
+        params = request.kv_transfer_params
+        assert params is not None
+        self._push_pending_registrations[request.request_id] = (
+            self._build_push_registration(request, ())
+        )
+        self._stop_heartbeat(request.request_id)
+        params["do_remote_prefill"] = False
+
+    def _build_push_registration(
+        self, request: Request, local_block_ids: BlockIds
+    ) -> dict[str, Any]:
+        """Build the D-to-P registration payload.
+
+        :param request: Decode request carrying the producer coordinates.
+        :param local_block_ids: Decode destination blocks.
+        :returns: Serializable registration payload.
+        """
+        params = request.kv_transfer_params
+        assert params is not None
+        return {
+            "request_id": request.request_id,
+            "producer_request_id": params["remote_request_id"],
+            "decode_engine_id": self.engine_id,
+            "decode_host": self.side_channel_host,
+            "decode_port": self.side_channel_port,
+            "decode_tp_size": (self.vllm_config.parallel_config.tensor_parallel_size),
+            "local_block_ids": local_block_ids,
+            "remote_engine_id": params["remote_engine_id"],
+            "remote_host": params["remote_host"],
+            "remote_port": params["remote_port"],
+            "remote_tp_size": params["tp_size"],
+        }
 
     def request_finished(
         self,
@@ -226,20 +264,12 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         is_p_node = bool(params.get("do_remote_decode"))
 
         self._stop_heartbeat(request.request_id)
-        # Drop any pending registration deadline; the request either
-        # completed or was cancelled.
-        self._push_registration_deadlines.pop(request.request_id, None)
 
         if params.get("do_remote_prefill"):
-            # ``do_remote_prefill`` is still set, which means
-            # ``update_state_after_alloc`` never ran (it would have
-            # flipped this flag to False). The request was aborted
-            # before it could be scheduled — e.g. rejected at the D
-            # serving layer via abort_immediately. To keep P from
-            # stranding the prefill blocks, we still register an empty
-            # recv so the worker emits a notif that lets P free them.
-            self._reqs_need_recv[request.request_id] = (request, [])
-            params["do_remote_prefill"] = False
+            # A locally satisfied or pre-allocation-aborted decode request has
+            # no WRITE destination. Its empty registration is the explicit
+            # protocol completion that releases the producer without DMA.
+            self._stage_zero_byte_completion(request)
             return False, None
 
         # Push connector only acts on the P-side terminal path; D-side
@@ -295,11 +325,8 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, NixlConnectorMetadata)
 
-        # Watchdog: any D-side registration whose deadline has passed without
-        # a corresponding push completion is treated as failed and cleaned up.
-        # The corresponding request is already tracked via _reqs_need_recv;
-        # the engine layer will eventually time it out via the lease, but we
-        # at least drop the stale registration so we don't keep retrying.
+        # D does not own P's WRITE handle. A missing completion therefore
+        # cannot safely become request retry or destination reuse.
         now = time.perf_counter()
         # Deadlines are inserted in non-decreasing order (monotonic clock +
         # constant timeout, armed once per request), and dict insertion order
@@ -310,15 +337,13 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             if deadline > now:
                 break
             expired.append(rid)
-        for rid in expired:
-            self._push_registration_deadlines.pop(rid, None)
-            # Avoid resending a registration that already timed out.
-            self._push_pending_registrations.pop(rid, None)
-            logger.warning(
-                "NixlPushConnector: registration for request %s timed out "
-                "after %.1fs without a push completion",
-                rid,
-                self._push_registration_timeout,
+        if len(expired) > 0:
+            rid = expired[0]
+            raise TransferQuiescenceError(
+                f"push registration for {rid} exceeded "
+                f"{self._push_registration_timeout:.1f}s without completion; "
+                "process teardown is required because D cannot observe or "
+                "revoke P's WRITE handle"
             )
 
         # D side: package pending registrations for D workers to send out.
@@ -338,8 +363,12 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # Keep the engine main loop alive while we have:
         # - finished P blocks awaiting WRITE completion, or
         # - pending D registrations the worker has not yet shipped, or
-        # - newly finished blocks not yet shipped to P workers.
-        return bool(self._finished_request_blocks or self._push_pending_registrations)
+        # - D destinations whose safety deadline remains armed.
+        return (
+            len(self._finished_request_blocks) > 0
+            or len(self._push_pending_registrations) > 0
+            or len(self._push_registration_deadlines) > 0
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Clean up finished request blocks after push completes."""

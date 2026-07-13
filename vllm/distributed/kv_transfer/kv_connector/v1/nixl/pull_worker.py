@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     locate_subsequence,
     validate_source_contract_structure,
 )
+from vllm.distributed.kv_transfer.staging_ownership import TransferQuiescenceError
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -130,7 +131,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Add to requests that are waiting to be read and track expiration.
         for req_id, expiration_time in metadata.reqs_to_send.items():
             if req_id in self._reqs_to_process:
-                self._reqs_to_send[req_id] = expiration_time
+                self._set_source_lease(req_id, expiration_time)
 
         # Send heartbeats to P-side engines to keep KV blocks alive while
         # requests sit in the D scheduler WAITING queue.
@@ -198,7 +199,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 req_id,
                 meta.remote.request_id,
             )
-            self._handle_failed_transfer(req_id, None)
+            self._handle_failed_transfer(req_id)
             return
 
         meta.remote.block_ids = self._logical_to_remote_kernel_block_ids(
@@ -301,7 +302,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 any(self._sp_group_flags()),
                 self._no_stock_dma(),
             )
-            self._handle_failed_transfer(req_id, None)
+            self._handle_failed_transfer(req_id)
             return
 
         self._stock_read_specs(req_id, meta, read_specs)
@@ -591,7 +592,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 spec.remote_rank
             ]
 
-            self._read_blocks(
+            posted = self._read_blocks(
                 read_spec=spec,
                 request_id=req_id,
                 dst_engine_id=meta.remote.engine_id,
@@ -600,6 +601,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_xfer_side_handle=remote_xfer_side_handle,
                 expected_consumers=meta.remote.expected_consumers,
             )
+            if posted is False:
+                return
 
         if self.use_mla and tp_ratio < 0 and read_specs:
             # ..but we still need to notify the other remote ranks that we
@@ -689,7 +692,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         "instead of the stock path.",
                         req_id,
                     )
-                    self._handle_failed_transfer(req_id, None)
+                    self._handle_failed_transfer(req_id)
                     continue
                 self._stock_read_specs(req_id, meta, read_specs)
 
@@ -1031,10 +1034,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         remote_request_id: str,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
-    ):
-        """
-        Post a READ point-to-point xfer request from a single local worker to
-        a single remote worker.
+    ) -> bool:
+        """Post one stock READ while preserving request-level ownership.
+
+        :param expected_consumers: Number of consumer requests sharing source.
+        :param read_spec: Source-rank block mapping.
+        :param dst_engine_id: Producer engine identifier.
+        :param request_id: Local decoder request identifier.
+        :param remote_request_id: Producer request identifier.
+        :param local_xfer_side_handle: Prepared local descriptor list.
+        :param remote_xfer_side_handle: Prepared remote descriptor list.
+        :returns: Whether later rank specifications may be posted.
         """
         assert self.transfer_topo is not None
         remote_rank = read_spec.remote_rank
@@ -1095,8 +1105,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             except Exception as e:
                 self._log_failure(
                     failure_type="notification_failed",
-                    msg="P worker blocks will be freed after timeout. "
-                    "This may indicate network issues.",
+                    msg="P cannot observe the zero-byte completion and will "
+                    "fail closed when its source lease expires.",
                     req_id=request_id,
                     error=e,
                     dst_engine_id=dst_engine_id,
@@ -1104,7 +1114,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     remote_agent_name=agent_name,
                 )
                 self.xfer_stats.record_failed_notification()
-            return
+            return True
 
         assert (
             len(remote_block_ids)
@@ -1138,8 +1148,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
         self._assert_transfer_post_allowed(coalesced=False)
 
-        # Prepare transfer with Nixl.
-        handle = None
         try:
             handle = self.nixl_wrapper.make_prepped_xfer(
                 "READ",
@@ -1149,23 +1157,69 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_block_descs_ids,
                 notif_msg=notif_id,
             )
-
-            # Begin async xfer.
-            self.nixl_wrapper.transfer(handle)
-
-            # Use handle to check completion in future step().
-            self._recving_transfers[request_id].append(handle)
-        except Exception as e:
-            # mark all (logical) blocks for this request as invalid
+        except Exception as error:
+            stacktrace = traceback.format_exc()
+            if len(self._recving_transfers.get(request_id, ())) > 0:
+                self._log_failure(
+                    failure_type="transfer_prepare_partial_request",
+                    req_id=request_id,
+                    msg="Retaining prior native handles and terminating",
+                    error=error,
+                    dst_engine_id=dst_engine_id,
+                    remote_rank=remote_rank,
+                    stacktrace=stacktrace,
+                )
+                raise TransferQuiescenceError(
+                    f"READ preparation failed after request {request_id} "
+                    "already posted another native handle"
+                ) from error
             self._log_failure(
-                failure_type="transfer_setup_failed",
+                failure_type="transfer_prepare_failed",
                 req_id=request_id,
-                msg="Marking blocks as invalid",
-                error=e,
+                msg="Marking blocks as invalid before native posting",
+                error=error,
                 dst_engine_id=dst_engine_id,
                 remote_rank=remote_rank,
+                stacktrace=stacktrace,
             )
-            self._handle_failed_transfer(request_id, handle)
+            self._handle_failed_transfer(request_id)
+            return False
+
+        self._recving_transfers[request_id].append(handle)
+        try:
+            post_state = self.nixl_wrapper.transfer(handle)
+        except Exception as error:
+            stacktrace = traceback.format_exc()
+            self._log_failure(
+                failure_type="transfer_post_ambiguous",
+                req_id=request_id,
+                msg="Retaining native ownership and terminating",
+                error=error,
+                dst_engine_id=dst_engine_id,
+                remote_rank=remote_rank,
+                native_handle=repr(handle),
+                stacktrace=stacktrace,
+            )
+            raise TransferQuiescenceError(
+                f"READ post outcome is ambiguous for request {request_id}; "
+                "destination ownership is retained until process teardown"
+            ) from error
+
+        if post_state not in {"DONE", "PROC"}:
+            self._log_failure(
+                failure_type="transfer_post_ambiguous",
+                req_id=request_id,
+                msg="Retaining native ownership and terminating",
+                dst_engine_id=dst_engine_id,
+                remote_rank=remote_rank,
+                xfer_state=post_state,
+                native_handle=repr(handle),
+            )
+            raise TransferQuiescenceError(
+                f"READ post for request {request_id} returned {post_state!r}; "
+                "only DONE or PROC preserves a valid ownership path"
+            )
+        return True
 
     def _get_new_notifs(self) -> set[str]:
         """

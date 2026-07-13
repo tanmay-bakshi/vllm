@@ -517,6 +517,10 @@ def make_nixl_scheduler(
         sched._reqs_in_batch = set()
         sched._reqs_not_processed = set()
         sched._reqs_need_save = {}
+        sched._source_rosters = {}
+        sched._audit_finished_reqs = set()
+        sched._pull_single_flight = False
+        sched._pull_leaders = {}
         sched.use_host_buffer = False
         sched.engine_id = "test-engine"
         sched.side_channel_host = "localhost"

@@ -47,6 +47,7 @@ from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown,
     has_kv_transfer_group,
 )
+from vllm.distributed.kv_transfer.staging_ownership import TransferQuiescenceError
 from vllm.forward_context import ForwardContext
 from vllm.outputs import RequestOutput
 from vllm.platforms import current_platform
@@ -2340,7 +2341,7 @@ class FailingNixlWrapper(FakeNixlWrapper):
 @pytest.mark.parametrize(
     "failure_type,wrapper_config,needs_get_finished",
     [
-        ("transfer_setup_failed", {"fail_transfer_setup": True}, False),
+        ("transfer_prepare_failed", {"fail_transfer_setup": True}, False),
         ("handshake_failed", {"fail_handshake": True}, False),
         ("notification_failed", {"fail_send_notif": True}, False),
         ("transfer_failed", {"fail_transfer_state": True}, True),
@@ -2361,7 +2362,7 @@ def test_transfer_failure_logging(
     Run with `pytest -sv` to see the log output.
 
     Covers failure types:
-    - transfer_setup_failed: make_prepped_xfer fails
+    - transfer_prepare_failed: make_prepped_xfer fails
     - handshake_failed: add_remote_agent fails during request handshake
     - notification_failed: send_notif fails
     - transfer_failed: check_xfer_state returns bad state (e.g., "ERR")
@@ -2454,7 +2455,8 @@ def test_transfer_failure_logging(
         # For transfer_failed/transfer_exception, the error happens in
         # get_finished() when checking transfer state
         if needs_get_finished:
-            connector.get_finished(finished_req_ids=set())
+            with pytest.raises(TransferQuiescenceError):
+                connector.get_finished(finished_req_ids=set())
     finally:
         nixl_logger.removeHandler(handler)
         pull_logger.removeHandler(handler)
@@ -2488,9 +2490,14 @@ def test_transfer_failure_logging(
     )
     # Check that the expected failure_type appears in at least one log
     # Note: handshake_failed also triggers handshake_setup_failed
-    assert failure_type in combined_logs or (
+    expected_failure_type = (
+        "transfer_status_ambiguous"
+        if failure_type in {"transfer_failed", "transfer_exception"}
+        else failure_type
+    )
+    assert expected_failure_type in combined_logs or (
         failure_type == "handshake_failed" and "handshake_setup_failed" in combined_logs
-    ), f"Expected '{failure_type}' in logs. Got: {all_messages}"
+    ), f"Expected '{expected_failure_type}' in logs. Got: {all_messages}"
 
 
 @patch(
@@ -2614,8 +2621,7 @@ def test_transfer_setup_failure_returns_finished(default_vllm_config, dist_init)
 def test_failed_request_skips_kv_postprocessing(
     default_vllm_config, dist_init, failure_mode
 ):
-    """Test that failed requests skip KV sync and post-processing in
-    get_finished().
+    """Test recoverable setup failures and ambiguous native outcomes.
 
     This is the core safety behavior: when a KV transfer fails at any stage,
     the request must still appear in done_recving (so the scheduler can apply
@@ -2625,10 +2631,8 @@ def test_failed_request_skips_kv_postprocessing(
     Covers all failure paths that involve an actual (attempted) KV transfer:
     - handshake: add_remote_agent raises during async handshake
     - transfer_setup: make_prepped_xfer raises before handle is in transfers
-    - transfer_failed: check_xfer_state returns bad state ("ERR") in
-      _pop_done_transfers — this is the path that previously had the bug
-      where post-processing was NOT skipped
-    - transfer_exception: check_xfer_state raises in _pop_done_transfers
+    - transfer_failed: check_xfer_state returns an ambiguous ``ERR`` state
+    - transfer_exception: check_xfer_state raises with ownership unresolved
 
     Note: notification_failed (send_notif raises on the full-cache-hit path)
     is intentionally excluded. That path is a best-effort D→P courtesy
@@ -2700,7 +2704,20 @@ def test_failed_request_skips_kv_postprocessing(
         patch.object(worker, "sync_recved_kv_to_device") as mock_sync,
         patch.object(worker, "post_process_device_kv_on_receive") as mock_postprocess,
     ):
-        _, done_recving = connector.get_finished(finished_req_ids=set())
+        if failure_mode in {"transfer_failed", "transfer_exception"}:
+            with pytest.raises(TransferQuiescenceError):
+                connector.get_finished(finished_req_ids=set())
+            done_recving = set()
+        else:
+            _, done_recving = connector.get_finished(finished_req_ids=set())
+
+    if failure_mode in {"transfer_failed", "transfer_exception"}:
+        mock_sync.assert_not_called()
+        mock_postprocess.assert_not_called()
+        assert request_id in worker._recving_metadata
+        assert len(worker._recving_transfers[request_id]) > 0
+        assert connector.get_block_ids_with_load_errors() == set()
+        return
 
     # The failed request must appear in done_recving so the scheduler
     # can handle it (e.g., trigger recompute via kv_load_failure_policy).

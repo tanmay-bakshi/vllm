@@ -29,6 +29,7 @@ def _worker_stub():
 
     w = object.__new__(NixlConnectorWorker)
     w._reqs_to_send = {}
+    w._source_lease_heap = []
     w._lease_extension = 20
     return w
 

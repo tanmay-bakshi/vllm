@@ -46,8 +46,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   5: Add gated P-to-D source integrity manifests
 #   6: Replace source gating with post-transfer source references
 #   7: Require authoritative transfer completion before source reuse
+#   8: Carry exact producer identity and rank-distinct push completions
 #
-NIXL_CONNECTOR_VERSION: int = 7
+NIXL_CONNECTOR_VERSION: int = 8
 
 
 @dataclass

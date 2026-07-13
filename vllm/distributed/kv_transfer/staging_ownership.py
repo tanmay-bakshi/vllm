@@ -8,7 +8,11 @@ from enum import StrEnum
 from typing import Any
 
 
-class StagingSafetyError(RuntimeError):
+class TransferQuiescenceError(RuntimeError):
+    """Signal that native transfer quiescence can no longer be proven."""
+
+
+class StagingSafetyError(TransferQuiescenceError):
     """Signal that a coalesced transfer lost its proof of memory safety."""
 
 
