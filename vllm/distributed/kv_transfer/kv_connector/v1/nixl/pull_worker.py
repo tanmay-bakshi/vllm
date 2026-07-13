@@ -53,14 +53,21 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         vllm_config: "VllmConfig",
         engine_id: str,
         kv_cache_config: "KVCacheConfig",
-    ):
+    ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        if self._phase_separate_transfer_decode and not self.coalesce_pull:
+            raise ValueError("phase_separate_transfer_decode requires coalesced pull")
+        if self._phase_separate_transfer_decode and not self._no_stock_dma():
+            raise ValueError(
+                "phase_separate_transfer_decode requires stock DMA to be disabled"
+            )
 
-    def start_load_kv(self, metadata: NixlConnectorMetadata):
+    def start_load_kv(self, metadata: NixlConnectorMetadata) -> None:
+        """Start and account for receive work required by this model step.
+
+        :param metadata: Scheduler metadata for transfers entering this step.
         """
-        Start loading by triggering non-blocking nixl_xfer.
-        We check for these trnxs to complete in each step().
-        """
+        self._begin_transfer_phase()
         self._localization_capture_pre_read(metadata.reqs_in_batch)
         self._audit_retire(metadata)
         self._localization_capture_source_rosters(metadata.source_integrity_rosters)
@@ -138,6 +145,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Send heartbeats to P-side engines to keep KV blocks alive while
         # requests sit in the D scheduler WAITING queue.
         self._send_heartbeats(metadata)
+        self._drain_transfer_phase()
+        self._record_transfer_decode_boundary()
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.transfer_topo is not None
@@ -254,9 +263,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             return
 
         # Coalesced pull fast path (see base_worker state comment): all
-        # gates must hold. A staging-pool miss PARKS the request (FIFO,
-        # serviced from get_finished). Localization forbids the stock
-        # path because it has no staging or destination observation points.
+        # gates must hold. A staging-pool miss parks the request FIFO until
+        # completed plans free staging. Localization forbids the stock path
+        # because it has no staging or destination observation points.
         if self._coalesce_gate(engine_id, tp_ratio, read_specs):
             res = self._coalesced_read_request(req_id, meta, read_specs)
             if res == "posted":
@@ -1163,6 +1172,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+
+        self._assert_transfer_post_allowed(coalesced=False)
 
         # Prepare transfer with Nixl.
         handle = None

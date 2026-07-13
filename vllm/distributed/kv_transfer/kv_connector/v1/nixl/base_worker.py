@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base worker-side logic for the NIXL connector."""
 
+import json
 import logging
 import os
 import queue
@@ -271,12 +272,24 @@ class NixlBaseConnectorWorker:
         """
         return region_idx < len(self._region_is_mla) and self._region_is_mla[region_idx]
 
+    @staticmethod
+    def _parse_phase_separation_config(value: object) -> bool:
+        """Validate the transfer/decode phase-separation switch.
+
+        :param value: Raw connector-extra configuration value.
+        :returns: Validated boolean switch.
+        :raises ValueError: If the value is not exactly a boolean.
+        """
+        if type(value) is not bool:
+            raise ValueError("phase_separate_transfer_decode must be a boolean")
+        return value
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
         engine_id: str,
         kv_cache_config: "KVCacheConfig",
-    ):
+    ) -> None:
         nixl_wrapper_cls = NixlWrapper
         if nixl_wrapper_cls is None:
             logger.error("NIXL is not available")
@@ -292,6 +305,46 @@ class NixlBaseConnectorWorker:
         if vllm_config.kv_transfer_config is None:
             raise ValueError("kv_transfer_config must be set for NixlConnector")
         self.kv_transfer_config = vllm_config.kv_transfer_config
+        phase_separation_key = "phase_separate_transfer_decode"
+        self._phase_separation_instrumented = (
+            phase_separation_key in self.kv_transfer_config.kv_connector_extra_config
+        )
+        self._phase_separate_transfer_decode = self._parse_phase_separation_config(
+            self.kv_transfer_config.get_from_extra_config(
+                phase_separation_key,
+                False,
+            )
+        )
+        if (
+            self._phase_separate_transfer_decode
+            and self.kv_transfer_config.kv_role != "kv_consumer"
+        ):
+            raise ValueError(
+                "phase_separate_transfer_decode requires kv_role='kv_consumer'"
+            )
+        self._transfer_phase_active = False
+        self._transfer_phase_epoch = 0
+        self._deferred_phase_sending: set[ReqId] = set()
+        self._deferred_phase_recving: set[ReqId] = set()
+        self._transfer_phase_plan_count = 0
+        self._transfer_phase_handle_count = 0
+        self._transfer_phase_byte_count = 0
+        self._transfer_phase_violation_count = 0
+        self._transfer_phase_started_ns = 0
+        self._transfer_phase_entry_sync_ns = 0
+        self._transfer_phase_records: list[tuple[str, dict[str, object]]] = []
+        if self._phase_separate_transfer_decode:
+            logger.info(
+                "[transfer-decode-phase] %s",
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "engine_id": engine_id,
+                        "event": "configured",
+                    },
+                    sort_keys=True,
+                ),
+            )
 
         self.nixl_backends = vllm_config.kv_transfer_config.get_from_extra_config(
             "backends", ["UCX"]
@@ -442,8 +495,8 @@ class NixlBaseConnectorWorker:
             )
         self._staging_buf: torch.Tensor | None = None
         self._staging_allocator: StagingRangeAllocator | None = None
-        # requests waiting for a staging range (FIFO; serviced every
-        # get_finished as completions free ranges). Parking is safe:
+        # Requests waiting for a staging range are serviced FIFO as completed
+        # plans free ranges. Parking is safe:
         # to the rest of the engine a parked request is
         # indistinguishable from an in-flight transfer (blocks stay
         # held until we report done_recving), and it beats the
@@ -3053,6 +3106,11 @@ class NixlBaseConnectorWorker:
             raise StagingSafetyError(f"request {req_id} already owns staging")
         if len(remote_engine_id) == 0:
             raise StagingSafetyError("coalesced staging requires a remote engine")
+        if self._phase_separate_transfer_decode and not self._transfer_phase_active:
+            self._transfer_phase_violation_count += 1
+            raise StagingSafetyError(
+                "coalesced staging allocation is forbidden outside the transfer phase"
+            )
         owner_id = f"{self.engine_id}:{self.tp_rank}:{self._coalesce_owner_sequence}"
         self._coalesce_owner_sequence += 1
         plan = self._staging_allocator.create_plan(
@@ -3067,6 +3125,9 @@ class NixlBaseConnectorWorker:
         )
         if plan is not None:
             self._coalesce_plans[req_id] = plan
+            if self._phase_separate_transfer_decode:
+                self._transfer_phase_plan_count += 1
+                self._transfer_phase_byte_count += plan.lease.size
         return plan
 
     def _release_coalesced_plan(self, plan: CoalescedStagingPlan) -> None:
@@ -3127,6 +3188,7 @@ class NixlBaseConnectorWorker:
 
         try:
             plan.begin_post(source_rank)
+            self._assert_transfer_post_allowed(coalesced=True)
             status = self.nixl_wrapper.transfer(handle)
             plan.record_post_result(source_rank, status)
         except Exception as error:
@@ -3436,11 +3498,266 @@ class NixlBaseConnectorWorker:
 
         self._release_coalesced_plan(plan)
 
+    def _begin_transfer_phase(self) -> None:
+        """Close prior device work and authorize one transfer-only phase.
+
+        :raises StagingSafetyError: If the preceding phase was not fully consumed
+            or device quiescence cannot be established.
+        """
+        if not self._phase_separate_transfer_decode:
+            return
+
+        stock_handle_count = sum(
+            len(handles) for handles in self._recving_transfers.values()
+        )
+        if (
+            self._transfer_phase_active
+            or len(self._deferred_phase_sending) > 0
+            or len(self._deferred_phase_recving) > 0
+            or len(self._coalesce_plans) > 0
+            or len(self._coalesce_pending) > 0
+            or stock_handle_count > 0
+        ):
+            self._transfer_phase_violation_count += 1
+            raise StagingSafetyError(
+                "transfer phase began before the preceding phase was consumed"
+            )
+
+        sync_started_ns = time.monotonic_ns()
+        try:
+            torch.accelerator.synchronize()
+        except Exception as error:
+            self._transfer_phase_violation_count += 1
+            raise StagingSafetyError(
+                "device synchronization failed before the transfer phase\n"
+                + traceback.format_exc()
+            ) from error
+
+        self._transfer_phase_entry_sync_ns = time.monotonic_ns() - sync_started_ns
+        self._transfer_phase_epoch += 1
+        self._transfer_phase_plan_count = 0
+        self._transfer_phase_handle_count = 0
+        self._transfer_phase_byte_count = 0
+        self._transfer_phase_violation_count = 0
+        self._transfer_phase_started_ns = time.monotonic_ns()
+        self._transfer_phase_active = True
+
+    def _assert_transfer_post_allowed(self, *, coalesced: bool) -> None:
+        """Authorize one native post at the transfer/compute boundary.
+
+        :param coalesced: Whether the post is owned by a coalesced staging plan.
+        :raises StagingSafetyError: If a post could overlap model execution or
+            escape generation-scoped staging ownership.
+        """
+        if not self._phase_separate_transfer_decode:
+            return
+        if not self._transfer_phase_active or not coalesced:
+            self._transfer_phase_violation_count += 1
+            raise StagingSafetyError(
+                "native transfer post is forbidden outside the owned transfer phase"
+            )
+        self._transfer_phase_handle_count += 1
+
+    def _drain_transfer_phase(self) -> None:
+        """Drain native receives, scatter, and device work before model execution.
+
+        :raises StagingSafetyError: If work escapes the owned coalesced path or
+            the phase cannot establish complete quiescence.
+        """
+        if not self._phase_separate_transfer_decode:
+            return
+        if not self._transfer_phase_active:
+            self._transfer_phase_violation_count += 1
+            raise StagingSafetyError("transfer phase drain has no active phase")
+
+        while True:
+            stock_handle_count = sum(
+                len(handles) for handles in self._recving_transfers.values()
+            )
+            if stock_handle_count > 0:
+                self._transfer_phase_violation_count += 1
+                raise StagingSafetyError(
+                    "stock receive handle escaped the coalesced transfer phase"
+                )
+
+            done_sending, done_recving = self._get_finished(service_pending=True)
+            self._deferred_phase_sending.update(done_sending)
+            self._deferred_phase_recving.update(done_recving)
+
+            stock_handle_count = sum(
+                len(handles) for handles in self._recving_transfers.values()
+            )
+            active_plan_count = len(self._coalesce_plans)
+            pending_request_count = len(self._coalesce_pending)
+            if stock_handle_count > 0:
+                self._transfer_phase_violation_count += 1
+                raise StagingSafetyError(
+                    "stock receive handle appeared while draining the transfer phase"
+                )
+            if active_plan_count == 0 and pending_request_count == 0:
+                break
+            if active_plan_count == 0:
+                self._transfer_phase_violation_count += 1
+                raise StagingSafetyError(
+                    "parked receive work has no active staging owner"
+                )
+            time.sleep(0.001)
+
+        exit_sync_started_ns = time.monotonic_ns()
+        try:
+            torch.accelerator.synchronize()
+        except Exception as error:
+            self._transfer_phase_violation_count += 1
+            raise StagingSafetyError(
+                "device synchronization failed after the transfer phase\n"
+                + traceback.format_exc()
+            ) from error
+        exit_sync_ns = time.monotonic_ns() - exit_sync_started_ns
+
+        stock_handle_count = sum(
+            len(handles) for handles in self._recving_transfers.values()
+        )
+        if (
+            len(self._coalesce_plans) > 0
+            or len(self._coalesce_pending) > 0
+            or stock_handle_count > 0
+        ):
+            self._transfer_phase_violation_count += 1
+            raise StagingSafetyError(
+                "transfer work appeared after the compute-boundary synchronization"
+            )
+
+        finished_ns = time.monotonic_ns()
+        self._transfer_phase_active = False
+        self._transfer_phase_records.append(
+            (
+                "transfer-decode-phase",
+                {
+                    "active_plan_count": 0,
+                    "byte_count": self._transfer_phase_byte_count,
+                    "deferred_recving_count": len(self._deferred_phase_recving),
+                    "deferred_sending_count": len(self._deferred_phase_sending),
+                    "engine_id": self.engine_id,
+                    "entry_sync_ns": self._transfer_phase_entry_sync_ns,
+                    "epoch": self._transfer_phase_epoch,
+                    "event": "compute_boundary",
+                    "exit_sync_ns": exit_sync_ns,
+                    "handle_count": self._transfer_phase_handle_count,
+                    "pending_request_count": 0,
+                    "plan_count": self._transfer_phase_plan_count,
+                    "rank": self.tp_rank,
+                    "stock_handle_count": 0,
+                    "transfer_phase_ns": (
+                        finished_ns - self._transfer_phase_started_ns
+                    ),
+                    "violations": self._transfer_phase_violation_count,
+                },
+            )
+        )
+
+    def _record_transfer_decode_boundary(self) -> None:
+        """Record a non-mutating control-arm snapshot before model execution."""
+        if (
+            not self._phase_separation_instrumented
+            or self._phase_separate_transfer_decode
+        ):
+            return
+
+        possible_writer_states = {
+            HandleState.POSTING,
+            HandleState.PROC,
+            HandleState.UNKNOWN,
+            HandleState.ERR,
+        }
+        potential_plan_count = 0
+        potential_byte_count = 0
+        potential_handle_count = 0
+        resident_byte_count = 0
+        for plan in self._coalesce_plans.values():
+            resident_byte_count += plan.lease.size
+            plan_handle_count = sum(
+                slot.state in possible_writer_states for slot in plan.slots.values()
+            )
+            potential_handle_count += plan_handle_count
+            if plan_handle_count == 0:
+                continue
+            potential_plan_count += 1
+            potential_byte_count += plan.lease.size
+        stock_handle_count = sum(
+            len(handles) for handles in self._recving_transfers.values()
+        )
+        self._transfer_phase_records.append(
+            (
+                "transfer-decode-boundary",
+                {
+                    "engine_id": self.engine_id,
+                    "event": "compute_boundary_snapshot",
+                    "pending_request_count": len(self._coalesce_pending),
+                    "potential_active_handle_count": potential_handle_count,
+                    "potential_byte_count": potential_byte_count,
+                    "potential_overlap": (
+                        potential_handle_count > 0 or stock_handle_count > 0
+                    ),
+                    "potential_plan_count": potential_plan_count,
+                    "rank": self.tp_rank,
+                    "resident_byte_count": resident_byte_count,
+                    "resident_plan_count": len(self._coalesce_plans),
+                    "stock_handle_count": stock_handle_count,
+                },
+            )
+        )
+
+    def _flush_transfer_phase_records(self) -> None:
+        """Emit compute-boundary evidence after model execution has completed."""
+        if len(self._transfer_phase_records) == 0:
+            return
+        records = tuple(self._transfer_phase_records)
+        for marker, record in records:
+            logger.info("[%s] %s", marker, json.dumps(record, sort_keys=True))
+        del self._transfer_phase_records[: len(records)]
+
     def get_finished(self) -> tuple[set[str], set[str]]:
+        """Publish transfer completions at the post-forward boundary.
+
+        :returns: Requests done sending and receiving on this worker.
+        """
+        if not self._phase_separate_transfer_decode:
+            result = self._get_finished(service_pending=True)
+            if self._phase_separation_instrumented:
+                self._flush_transfer_phase_records()
+            return result
+        if (
+            self._transfer_phase_active
+            or len(self._coalesce_plans) > 0
+            or len(self._coalesce_pending) > 0
+            or sum(len(handles) for handles in self._recving_transfers.values()) > 0
+        ):
+            self._transfer_phase_violation_count += 1
+            raise StagingSafetyError(
+                "post-forward completion observed undrained transfer work"
+            )
+
+        done_sending, done_recving = self._get_finished(service_pending=False)
+        done_sending.update(self._deferred_phase_sending)
+        done_recving.update(self._deferred_phase_recving)
+        self._deferred_phase_sending.clear()
+        self._deferred_phase_recving.clear()
+        if self._phase_separation_instrumented:
+            self._flush_transfer_phase_records()
+        return done_sending, done_recving
+
+    def _get_finished(
+        self,
+        *,
+        service_pending: bool,
+    ) -> tuple[set[str], set[str]]:
         """
         Get requests that are done sending or recving on this specific worker.
         The scheduler process (via the MultiprocExecutor) will use this output
         to track which workers are done.
+
+        :param service_pending: Whether freed staging may launch parked pulls.
+        :returns: Requests done sending and receiving on this worker.
         """
         assert self.transfer_topo is not None
         done_sending = self._get_new_notifs()
@@ -3593,7 +3910,7 @@ class NixlBaseConnectorWorker:
 
         # coalesced pull: completed scatters freed staging; start
         # transfers for requests parked on the staging pool
-        if self._coalesce_pending:
+        if service_pending and self._coalesce_pending:
             self._coalesce_service_pending()
 
         self._audit_tick(failed_recv_reqs)
