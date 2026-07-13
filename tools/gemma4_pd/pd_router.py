@@ -22,12 +22,11 @@ import re
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import aiohttp
 from aiohttp import web
 from multidict import CIMultiDictProxy
-
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -103,6 +102,7 @@ class PDRouter:
     _prefill_timeout_s: float
     _health_interval_s: float
     _min_prefill_chars: int
+    _decode_attempts: int
     _health_task: asyncio.Task | None
 
     def __init__(
@@ -113,6 +113,7 @@ class PDRouter:
         health_interval_s: float,
         min_prefill_chars: int,
         max_decode_inflight: int,
+        decode_attempts: int,
         trace: bool = False,
         require_prefill: bool = False,
     ) -> None:
@@ -124,11 +125,15 @@ class PDRouter:
             prefill stage (0 disables the gate).
         :param max_decode_inflight: Admission cap on concurrently
             dispatched decode requests across the pool (0 = uncapped).
+        :param decode_attempts: Maximum decode dispatch attempts.
         :param trace: Emit one JSON line per completions request with
             stage timestamps (request-in, prefill send/done, decode
             send/headers/first-chunk, done) for pipeline profiling.
+        :raises ValueError: If decode_attempts is less than one.
         """
 
+        if decode_attempts < 1:
+            raise ValueError("decode_attempts must be at least 1")
         self._trace = trace
         # Recent per-request traces for GET /trace/{rid} (bounded; the
         # end-of-stream facts -- decode duration, completion tokens --
@@ -143,6 +148,7 @@ class PDRouter:
         self._prefill_timeout_s = prefill_timeout_s
         self._health_interval_s = health_interval_s
         self._min_prefill_chars = min_prefill_chars
+        self._decode_attempts = decode_attempts
         self._require_prefill = require_prefill
         self._decode_gate = (
             asyncio.Semaphore(max_decode_inflight)
@@ -332,9 +338,11 @@ class PDRouter:
 
         if self._session is None:
             return None
-        if self._min_prefill_chars > 0:
-            if self._prompt_chars(body) < self._min_prefill_chars:
-                return None
+        if (
+            self._min_prefill_chars > 0
+            and self._prompt_chars(body) < self._min_prefill_chars
+        ):
+            return None
         backend = await self._select(self._prefill)
         if backend is None:
             return None
@@ -388,7 +396,14 @@ class PDRouter:
                         params["expected_consumers"] = 1
                     return params
                 return None
-        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            json.JSONDecodeError,
+        ) as exc:
+            if tr is not None:
+                tr["p_error_type"] = type(exc).__name__
+                tr["p_error_message"] = str(exc)
             return None
         finally:
             self._release(backend, failed=failed)
@@ -574,6 +589,25 @@ class PDRouter:
     # Handlers
     # ------------------------------------------------------------------
 
+    def _finalize_trace(self, tr: dict) -> None:
+        """Finalize, retain, and emit one request trace.
+
+        :param tr: Trace record accumulated while serving the request.
+        """
+
+        tr["t_done"] = time.time()
+        # Decode has already completed, so parsing the retained response
+        # tail cannot increase time to first byte or stream latency.
+        tail = b"".join(tr.pop("d_tail", ()))[-16384:]
+        hits = re.findall(rb'"completion_tokens":\s*(\d+)', tail)
+        if len(hits) > 0:
+            tr["completion_tokens"] = int(hits[-1])
+        self._recent[tr["rid"]] = tr
+        self._recent.move_to_end(tr["rid"])
+        while len(self._recent) > 4096:
+            self._recent.popitem(last=False)
+        print(json.dumps(tr), flush=True)
+
     async def handle_completions(self, request: web.Request) -> web.StreamResponse:
         """Serve one completions request through the PD pipeline.
 
@@ -598,45 +632,37 @@ class PDRouter:
                 "chars": self._prompt_chars(body),
                 "t_in": time.time(),
             }
-        params = await self._run_prefill(request.path, body, request_id, tr)
-        d_body = dict(body)
-        if params is not None:
-            d_body["kv_transfer_params"] = params
-            self._stats.pd_success += 1
-        elif self._require_prefill:
-            self._stats.prefill_unavailable += 1
-            if tr is not None:
-                tr["pd_path"] = False
-                tr["rejected"] = "prefill_unavailable"
-                print(json.dumps(tr), flush=True)
-            return web.json_response(
-                {"error": "prefill stage unavailable; retry later"},
-                status=503,
-                headers={"Retry-After": "5"},
-            )
-        else:
-            self._stats.monolithic_fallback += 1
-        if tr is not None:
-            tr["pd_path"] = params is not None
         try:
+            params = await self._run_prefill(request.path, body, request_id, tr)
+            d_body = dict(body)
+            if params is not None:
+                d_body["kv_transfer_params"] = params
+                self._stats.pd_success += 1
+            elif self._require_prefill:
+                self._stats.prefill_unavailable += 1
+                if tr is not None:
+                    tr["pd_path"] = False
+                    tr["rejected"] = "prefill_unavailable"
+                return web.json_response(
+                    {"error": "prefill stage unavailable; retry later"},
+                    status=503,
+                    headers={"Retry-After": "5"},
+                )
+            else:
+                self._stats.monolithic_fallback += 1
+            if tr is not None:
+                tr["pd_path"] = params is not None
             return await self._stream_decode(
-                request, request.path, d_body, request_id, attempts=3, tr=tr
+                request,
+                request.path,
+                d_body,
+                request_id,
+                attempts=self._decode_attempts,
+                tr=tr,
             )
         finally:
             if tr is not None:
-                tr["t_done"] = time.time()
-                # post-eof: the client already has the full response;
-                # recover completion_tokens from the response tail
-                # (final SSE usage chunk, or the non-streaming JSON)
-                tail = b"".join(tr.pop("d_tail", ()))[-16384:]
-                hits = re.findall(rb'"completion_tokens":\s*(\d+)', tail)
-                if hits:
-                    tr["completion_tokens"] = int(hits[-1])
-                self._recent[tr["rid"]] = tr
-                self._recent.move_to_end(tr["rid"])
-                while len(self._recent) > 4096:
-                    self._recent.popitem(last=False)
-                print(json.dumps(tr), flush=True)
+                self._finalize_trace(tr)
 
     async def handle_passthrough(self, request: web.Request) -> web.StreamResponse:
         """Proxy a non-completions request to a healthy decode backend.
@@ -816,6 +842,12 @@ def parse_args() -> argparse.Namespace:
         help="Admission cap on concurrent decode dispatches (0 = off).",
     )
     parser.add_argument(
+        "--decode-attempts",
+        type=int,
+        default=3,
+        help="Maximum decode dispatch attempts.",
+    )
+    parser.add_argument(
         "--trace",
         action="store_true",
         help="Emit one JSON line per completions request with stage "
@@ -842,6 +874,7 @@ def main() -> None:
         health_interval_s=args.health_interval_s,
         min_prefill_chars=args.min_prefill_chars,
         max_decode_inflight=args.max_decode_inflight,
+        decode_attempts=args.decode_attempts,
         trace=args.trace,
         require_prefill=args.require_prefill,
     )
