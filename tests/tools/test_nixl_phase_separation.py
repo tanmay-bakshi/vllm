@@ -176,6 +176,23 @@ def test_native_posts_are_guarded_before_entering_nixl() -> None:
         assert guard_lines[0] < transfer_lines[0]
 
 
+def test_staging_allocation_has_no_initialization_writer() -> None:
+    """Registered staging must have no asynchronous writer before NIXL."""
+    method = _production_method_node(
+        BASE_WORKER_PATH,
+        "NixlBaseConnectorWorker",
+        "_staging_init",
+    )
+    empty_lines = _attribute_call_lines(method, "empty")
+    zero_lines = _attribute_call_lines(method, "zeros")
+    register_lines = _attribute_call_lines(method, "register_memory")
+
+    assert len(empty_lines) == 1
+    assert zero_lines == []
+    assert len(register_lines) == 1
+    assert empty_lines[0] < register_lines[0]
+
+
 @pytest.mark.parametrize("value", [False, True])
 def test_phase_separation_config_accepts_exact_booleans(value: bool) -> None:
     """Boolean connector configuration must round-trip unchanged."""

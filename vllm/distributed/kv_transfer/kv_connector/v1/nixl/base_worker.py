@@ -3066,7 +3066,9 @@ class NixlBaseConnectorWorker:
         size = self.coalesce_staging_mb * 1024 * 1024
         try:
             dev = next(iter(self.device_kv_caches.values())).device
-            self._staging_buf = torch.zeros(size, dtype=torch.uint8, device=dev)
+            # Successful plans overwrite the complete lease before scatter.
+            # The allocation therefore has no initialization writer to order.
+            self._staging_buf = torch.empty(size, dtype=torch.uint8, device=dev)
             self.nixl_wrapper.register_memory(
                 [(self._staging_buf.data_ptr(), size, self.device_id, "")],
                 self.nixl_memory_type,
