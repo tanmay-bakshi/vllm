@@ -297,6 +297,7 @@ class NixlBaseConnectorWorker:
 
         # Config.
         self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
         # mypy will complain on re-assignment otherwise.
         self.block_size: int = cast(int, vllm_config.cache_config.block_size)
 
@@ -689,9 +690,6 @@ class NixlBaseConnectorWorker:
         self._engine_ttl: float = vllm_config.kv_transfer_config.get_from_extra_config(
             "engine_ttl", 3600.0
         )
-
-        self.block_size = vllm_config.cache_config.block_size
-        self.model_config = vllm_config.model_config
 
         self.use_mla = self.model_config.use_mla
 

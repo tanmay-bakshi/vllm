@@ -4,11 +4,13 @@
 
 import time
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgspec
 import pytest
+import torch
 
+from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.integrity import (
     IntegrityIdentity,
     IntegrityPayloadKind,
@@ -53,9 +55,118 @@ from vllm.distributed.kv_transfer.nixl_localization_validator import (
     validate_localization_artifacts,
     validate_localization_plan,
 )
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 
 HTTP_TARGET_REQUEST_ID = "p2d-phase2db-separated-score2-20260713-p000-s000637"
 TARGET_REQUEST_ID_BASE = f"chatcmpl-{HTTP_TARGET_REQUEST_ID}"
+
+
+@pytest.mark.cpu_test
+def test_worker_construction_initializes_localization_model_topology(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Construct an enabled worker with model topology available to its writer."""
+    monkeypatch.setenv("VLLM_NIXL_P2D_LOCALIZATION", "trace")
+    monkeypatch.setenv("VLLM_NIXL_P2D_RUN_ID", "constructor-regression")
+    monkeypatch.setenv("VLLM_NIXL_P2D_TRANSPORT_ARM", "unit-test")
+    monkeypatch.setenv(
+        "VLLM_NIXL_P2D_TARGET_REQUEST_ID",
+        TARGET_REQUEST_ID_BASE,
+    )
+    monkeypatch.setenv("VLLM_NIXL_P2D_ARTIFACT_DIR", str(tmp_path))
+
+    model_config = MagicMock()
+    model_config.use_mla = False
+    model_config.get_total_num_kv_heads.return_value = 8
+    kv_transfer_config = KVTransferConfig(
+        kv_connector="NixlConnector",
+        kv_role="kv_consumer",
+        kv_buffer_device="cuda",
+    )
+    vllm_config = MagicMock()
+    vllm_config.model_config = model_config
+    vllm_config.cache_config.block_size = 16
+    vllm_config.kv_transfer_config = kv_transfer_config
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    vllm_config.parallel_config.tensor_parallel_size = 4
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer0"],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=2,
+                    head_size=16,
+                    dtype=torch.float16,
+                ),
+            )
+        ],
+    )
+    platform = MagicMock()
+    platform.device_type = "cuda"
+    platform.get_nixl_memory_type.return_value = "VRAM"
+    backend = MagicMock()
+    backend.get_name.return_value = "TEST_ATTENTION"
+
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+            MagicMock,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.nixl_agent_config",
+            None,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.current_platform",
+            platform,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_rank",
+            return_value=2,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_world_size",
+            return_value=4,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_current_attn_backends",
+            return_value=[backend],
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.select_common_block_size",
+            return_value=16,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_kv_cache_layout",
+            return_value="HND",
+        ),
+    ):
+        worker = NixlPullConnectorWorker(
+            vllm_config,
+            "decoder",
+            kv_cache_config,
+        )
+
+    try:
+        assert worker.model_config is model_config
+        assert worker._localization_writer is not None
+        artifact_path = worker._localization_writer.path
+    finally:
+        worker.shutdown()
+
+    artifact = read_localization_artifact(artifact_path)
+    assert artifact.session.rank == 2
+    assert artifact.session.world_size == 4
+    assert artifact.session.total_num_kv_heads == 8
 
 
 def _config(
