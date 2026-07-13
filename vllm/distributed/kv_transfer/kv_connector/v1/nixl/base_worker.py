@@ -3000,7 +3000,7 @@ class NixlBaseConnectorWorker:
             req_id,
             plan,
             IntegrityStage.PRE_READ,
-            "first_operation_in_start_load_kv_before_new_dma_or_forward",
+            "after_transfer_phase_entry_before_new_dma_or_forward",
         )
         plan_remote_request = str(plan["producer_request_id"])
         is_trace = self._localization_config.mode is LocalizationMode.TRACE

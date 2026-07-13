@@ -72,8 +72,8 @@ def test_delayed_draft_proposal_is_joined_before_every_connector_path() -> None:
 
 
 @pytest.mark.cpu_test
-def test_pre_read_capture_is_first_pull_worker_operation() -> None:
-    """No new DMA, audit, metadata mutation, or forward precedes PRE_READ."""
+def test_pre_read_capture_follows_phase_entry_and_precedes_new_work() -> None:
+    """PRE_READ follows phase entry and precedes transfer-state mutation."""
     repository_root = Path(__file__).resolve().parents[4]
     worker_path = repository_root / (
         "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py"
@@ -84,10 +84,13 @@ def test_pre_read_capture_is_first_pull_worker_operation() -> None:
         for node in ast.walk(module)
         if isinstance(node, ast.FunctionDef) and node.name == "start_load_kv"
     )
-    first_operation = start_load.body[1]
+    phase_entry = start_load.body[1]
+    pre_read_capture = start_load.body[2]
 
-    assert isinstance(first_operation, ast.Expr)
-    assert _contains_call(first_operation, "_localization_capture_pre_read")
+    assert isinstance(phase_entry, ast.Expr)
+    assert _contains_call(phase_entry, "_begin_transfer_phase")
+    assert isinstance(pre_read_capture, ast.Expr)
+    assert _contains_call(pre_read_capture, "_localization_capture_pre_read")
 
 
 @pytest.mark.cpu_test

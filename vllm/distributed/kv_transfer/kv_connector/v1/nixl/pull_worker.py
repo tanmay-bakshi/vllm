@@ -5,6 +5,8 @@
 import os
 import time
 import traceback
+from contextlib import ExitStack
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -45,8 +47,22 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@dataclass(slots=True)
+class _SourceManifestRequest:
+    """One source-manifest exchange awaiting its producer response.
+
+    :ivar stack: Context stack that owns the request socket.
+    :ivar socket: REQ socket retained until its complete response is readable.
+    """
+
+    stack: ExitStack
+    socket: zmq.Socket
+
+
 class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     """Pull-specific (READ) worker logic."""
+
+    _localization_manifest_requests: dict[str, _SourceManifestRequest]
 
     def __init__(
         self,
@@ -54,6 +70,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         engine_id: str,
         kv_cache_config: "KVCacheConfig",
     ) -> None:
+        # ``__del__`` dispatches to this class's shutdown after partial init.
+        self._localization_manifest_requests = {}
         super().__init__(vllm_config, engine_id, kv_cache_config)
         if self._phase_separate_transfer_decode and not self.coalesce_pull:
             raise ValueError("phase_separate_transfer_decode requires coalesced pull")
@@ -61,6 +79,21 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             raise ValueError(
                 "phase_separate_transfer_decode requires stock DMA to be disabled"
             )
+
+    def shutdown(self) -> None:
+        """Close source-manifest exchanges and shut down the connector worker."""
+        for req_id in tuple(self._localization_manifest_requests):
+            self._drop_localization_manifest_request(req_id)
+        super().shutdown()
+
+    def _handle_failed_transfer(self, req_id: str, handle: int | None) -> None:
+        """Drop a manifest exchange before failing its transfer.
+
+        :param req_id: Request whose transfer failed.
+        :param handle: Optional native transfer handle to release.
+        """
+        self._drop_localization_manifest_request(req_id)
+        super()._handle_failed_transfer(req_id, handle)
 
     def start_load_kv(self, metadata: NixlConnectorMetadata) -> None:
         """Start and account for receive work required by this model step.
@@ -129,6 +162,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 ),
                 detail="request aborted before verified pre-read",
             )
+            self._drop_localization_manifest_request(req_id)
             self._localization_waiting.pop(req_id, None)
             self._localization_manifest_deadlines.pop(req_id, None)
             self._localization_expected_by_request.pop(req_id, None)
@@ -314,6 +348,40 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         for req_id, meta in list(self._localization_waiting.items()):
             self._read_blocks_for_req(req_id, meta)
 
+    def _drop_localization_manifest_request(self, req_id: str) -> None:
+        """Close and forget one source-manifest exchange.
+
+        :param req_id: Decoder request that owns the exchange.
+        """
+        request = self._localization_manifest_requests.pop(req_id, None)
+        if request is None:
+            return
+        request.stack.close()
+
+    def _defer_localization_manifest_request(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        deadline: float,
+    ) -> bool:
+        """Park an incomplete manifest exchange within its absolute deadline.
+
+        :param req_id: Decoder request awaiting its producer manifest.
+        :param meta: Transfer metadata retained for a later engine step.
+        :param deadline: Deadline for the gate to remain incomplete.
+        :returns: Always ``False`` while the request remains parked.
+        :raises LocalizationError: When the gate is still incomplete at its deadline.
+        """
+        if time.perf_counter() < deadline:
+            self._localization_waiting[req_id] = meta
+            return False
+        self._drop_localization_manifest_request(req_id)
+        self._localization_waiting.pop(req_id, None)
+        self._localization_manifest_deadlines.pop(req_id, None)
+        raise LocalizationError(
+            f"source-manifest gate timed out for decoder request {req_id}"
+        )
+
     def _localization_source_gate(
         self,
         req_id: str,
@@ -350,10 +418,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             or len(set(required_ranks)) != len(required_ranks)
             or any(type(rank) is not int or rank < 0 for rank in required_ranks)
         ):
+            self._drop_localization_manifest_request(req_id)
             raise LocalizationError(
                 f"request {req_id} has invalid required source ranks"
             )
         if req_id in self._localization_expected_by_request:
+            self._drop_localization_manifest_request(req_id)
             self._localization_waiting.pop(req_id, None)
             return True
         if (
@@ -363,14 +433,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             or remote.p2d_offer_generation is None
             or remote.p2d_iteration is None
         ):
+            self._drop_localization_manifest_request(req_id)
             raise LocalizationError(
                 f"request {req_id} has incomplete or mismatched localization lineage"
             )
 
-        deadline = self._localization_manifest_deadlines.setdefault(
-            req_id,
-            time.perf_counter() + self._localization_config.manifest_timeout_s,
-        )
+        deadline = self._localization_manifest_deadlines.get(req_id)
+        if deadline is None:
+            deadline = (
+                time.perf_counter() + self._localization_config.manifest_timeout_s
+            )
+            self._localization_manifest_deadlines[req_id] = deadline
         path = make_zmq_path("tcp", remote.host, remote.port)
         request = (
             GET_SOURCE_MANIFEST_MSG,
@@ -382,15 +455,50 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             remote.p2d_iteration,
             required_ranks,
         )
-        with zmq_ctx(zmq.REQ, path) as sock:
-            sock.setsockopt(zmq.RCVTIMEO, 1000)
-            sock.send(msgspec.msgpack.encode(request))
-            try:
-                response_bytes = sock.recv()
-            except zmq.Again as error:
-                raise LocalizationError(
-                    f"source-manifest side channel timed out for {req_id}"
-                ) from error
+        manifest_request = self._localization_manifest_requests.get(req_id)
+        if manifest_request is None:
+            if time.perf_counter() >= deadline:
+                return self._defer_localization_manifest_request(
+                    req_id,
+                    meta,
+                    deadline,
+                )
+            with ExitStack() as opening_stack:
+                try:
+                    socket = opening_stack.enter_context(zmq_ctx(zmq.REQ, path))
+                    socket.send(msgspec.msgpack.encode(request), flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    return self._defer_localization_manifest_request(
+                        req_id,
+                        meta,
+                        deadline,
+                    )
+                except zmq.ZMQError as error:
+                    raise LocalizationError(
+                        f"source-manifest side channel failed for {req_id}"
+                    ) from error
+                stack = opening_stack.pop_all()
+            manifest_request = _SourceManifestRequest(
+                stack=stack,
+                socket=socket,
+            )
+            self._localization_manifest_requests[req_id] = manifest_request
+        # A queued response completed the wait even if this step observes it
+        # after the deadline. Only an exchange that is still unreadable expires.
+        try:
+            response_bytes = manifest_request.socket.recv(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return self._defer_localization_manifest_request(
+                req_id,
+                meta,
+                deadline,
+            )
+        except zmq.ZMQError as error:
+            self._drop_localization_manifest_request(req_id)
+            raise LocalizationError(
+                f"source-manifest side channel failed for {req_id}"
+            ) from error
+        self._drop_localization_manifest_request(req_id)
         try:
             response = msgspec.msgpack.decode(
                 response_bytes,
@@ -401,12 +509,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 f"source-manifest response is malformed for {req_id}"
             ) from error
         if response.status is ManifestStatus.PENDING:
-            if time.perf_counter() >= deadline:
-                raise LocalizationError(
-                    f"source-manifest gate timed out for decoder request {req_id}"
-                )
-            self._localization_waiting[req_id] = meta
-            return False
+            return self._defer_localization_manifest_request(
+                req_id,
+                meta,
+                deadline,
+            )
         if response.status is not ManifestStatus.READY:
             raise LocalizationError(
                 f"source-manifest gate rejected {req_id}: {response.detail}"

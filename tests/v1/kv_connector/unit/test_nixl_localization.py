@@ -3,15 +3,23 @@
 """CPU tests for authoritative P-to-D localization artifacts."""
 
 import time
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
+from queue import Queue
+from unittest.mock import MagicMock
 
 import msgspec
 import pytest
+import zmq
 
 from vllm.distributed.kv_transfer.integrity import (
     IntegrityIdentity,
     IntegrityPayloadKind,
     IntegrityStage,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    pull_worker as pull_worker_module,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     RemoteMeta,
@@ -34,6 +42,7 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlRegionDescriptor,
     NixlSourceManifest,
     NixlSourceManifestRecord,
+    NixlSourceManifestResponse,
     build_integrity_identity,
     build_integrity_leaf,
     compute_semantic_contract_digest,
@@ -49,6 +58,60 @@ from vllm.distributed.kv_transfer.nixl_localization_validator import (
 
 HTTP_TARGET_REQUEST_ID = "p2d-phase2db-separated-score2-20260713-p000-s000637"
 TARGET_REQUEST_ID_BASE = f"chatcmpl-{HTTP_TARGET_REQUEST_ID}"
+
+
+class _ManifestTransport:
+    """Factory supplying one scripted socket per manifest exchange."""
+
+    scripts: list[list[bytes | BaseException]]
+    sockets: list[MagicMock]
+    exit_counts: list[int]
+
+    def __init__(self, scripts: list[list[bytes | BaseException]]) -> None:
+        """
+        :param scripts: Receive scripts for successive exchanges.
+        """
+        self.scripts = [list(script) for script in scripts]
+        self.sockets = []
+        self.exit_counts = []
+
+    def __call__(
+        self,
+        socket_type: int,
+        address: str,
+    ) -> AbstractContextManager[MagicMock]:
+        """
+        :param socket_type: Requested ZMQ socket type.
+        :param address: Producer side-channel address.
+        :returns: A fresh scripted exchange context.
+        """
+        assert socket_type == zmq.REQ
+        assert address == "tcp://127.0.0.1:5601"
+        if len(self.scripts) == 0:
+            raise AssertionError("unexpected source-manifest exchange")
+        socket = MagicMock()
+        socket.recv.side_effect = self.scripts.pop(0)
+        exchange_index = len(self.sockets)
+        self.sockets.append(socket)
+        self.exit_counts.append(0)
+        return self._exchange(exchange_index, socket)
+
+    @contextmanager
+    def _exchange(
+        self,
+        exchange_index: int,
+        socket: MagicMock,
+    ) -> Iterator[MagicMock]:
+        """Track closure of a manually retained exchange.
+
+        :param exchange_index: Index of the exchange being entered.
+        :param socket: Scripted socket yielded to the worker.
+        :yields: Scripted socket for one manifest exchange.
+        """
+        try:
+            yield socket
+        finally:
+            self.exit_counts[exchange_index] += 1
 
 
 def _config(
@@ -174,6 +237,67 @@ def _manifest(
             leaves=tuple(leaves),
         )
     )
+
+
+def _manifest_response(
+    status: ManifestStatus,
+    manifests: tuple[NixlSourceManifest, ...] = (),
+) -> bytes:
+    """Encode one producer response for the decoder gate.
+
+    :param status: Producer-side manifest status.
+    :param manifests: Source manifests carried by a ready response.
+    :returns: Encoded side-channel payload.
+    """
+    return msgspec.msgpack.encode(
+        NixlSourceManifestResponse(
+            schema_version=IntegrityIdentity.SCHEMA_VERSION,
+            status=status,
+            detail=status.value,
+            manifests=manifests,
+        )
+    )
+
+
+def _source_gate_worker(
+    artifact_dir: Path,
+) -> tuple[NixlPullConnectorWorker, str, ReqMeta, NixlSourceManifest]:
+    """Build the target-only worker state needed by the source gate.
+
+    :param artifact_dir: Localization artifact directory.
+    :returns: Worker, decoder request, transfer metadata, and source manifest.
+    """
+    config = _config(artifact_dir)
+    producer_request_id = f"{TARGET_REQUEST_ID_BASE}-11111111"
+    child_request_id = f"{TARGET_REQUEST_ID_BASE}-22222222"
+    manifest = _manifest(config, producer_request_id=producer_request_id)
+    worker = object.__new__(NixlPullConnectorWorker)
+    worker._localization_config = config
+    worker._localization_expected_by_request = {}
+    worker._localization_manifest_deadlines = {}
+    worker._localization_manifest_requests = {}
+    worker._localization_waiting = {}
+    worker._remote_registration_generations = {
+        "prefill": {0: manifest.registration_generation}
+    }
+    worker._remote_regions = {"prefill": {0: manifest.regions}}
+    metadata = ReqMeta(
+        local_block_ids=(),
+        local_physical_block_ids=(),
+        tp_size=4,
+        remote=RemoteMeta(
+            block_ids=manifest.block_ids,
+            host="127.0.0.1",
+            port=5601,
+            engine_id=manifest.producer_engine_id,
+            request_id=manifest.producer_request_id,
+            p2d_run_id=config.run_id,
+            p2d_transport_arm=config.transport_arm,
+            p2d_offer_generation=manifest.offer_generation,
+            p2d_iteration=manifest.iteration,
+        ),
+    )
+    return worker, child_request_id, metadata, manifest
 
 
 def _plan(
@@ -335,7 +459,7 @@ def _capture(
             "post_scatter_device_synchronize_before_publication"
         ),
         IntegrityStage.PRE_READ: (
-            "first_operation_in_start_load_kv_before_new_dma_or_forward"
+            "after_transfer_phase_entry_before_new_dma_or_forward"
         ),
     }
     return NixlCaptureRecord(
@@ -465,9 +589,15 @@ def test_config_requires_and_selects_exact_target(
 
 
 @pytest.mark.cpu_test
-def test_non_target_source_gate_rejects_localization_lineage(tmp_path: Path) -> None:
+def test_non_target_source_gate_rejects_localization_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _ManifestTransport([])
+    monkeypatch.setattr(pull_worker_module, "zmq_ctx", transport)
     worker = object.__new__(NixlPullConnectorWorker)
     worker._localization_config = _config(tmp_path)
+    worker._localization_manifest_requests = {}
     remote = RemoteMeta(
         block_ids=(),
         host="127.0.0.1",
@@ -483,6 +613,8 @@ def test_non_target_source_gate_rejects_localization_lineage(tmp_path: Path) -> 
     )
 
     assert worker._localization_source_gate("chatcmpl-unrelated", metadata, ())
+    assert len(transport.sockets) == 0
+    assert worker._localization_manifest_requests == {}
     remote.request_id = f"{TARGET_REQUEST_ID_BASE}-1234abcd"
     with pytest.raises(LocalizationError, match="outside the decoder target"):
         worker._localization_source_gate("chatcmpl-unrelated", metadata, ())
@@ -490,6 +622,112 @@ def test_non_target_source_gate_rejects_localization_lineage(tmp_path: Path) -> 
     remote.p2d_run_id = "stray-run"
     with pytest.raises(LocalizationError, match="outside the decoder target"):
         worker._localization_source_gate("chatcmpl-unrelated", metadata, ())
+    assert len(transport.sockets) == 0
+    assert worker._localization_manifest_requests == {}
+
+
+@pytest.mark.cpu_test
+def test_source_gate_preserves_slow_retry_and_accepts_queued_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker, req_id, metadata, manifest = _source_gate_worker(tmp_path)
+    transport = _ManifestTransport(
+        [
+            [_manifest_response(ManifestStatus.PENDING)],
+            [
+                zmq.Again(),
+                zmq.Again(),
+                _manifest_response(ManifestStatus.READY, (manifest,)),
+            ],
+        ]
+    )
+    monkeypatch.setattr(pull_worker_module, "zmq_ctx", transport)
+
+    assert worker._localization_source_gate(req_id, metadata, (0,)) is False
+    deadline = worker._localization_manifest_deadlines[req_id]
+    assert transport.exit_counts == [1]
+    assert req_id not in worker._localization_manifest_requests
+
+    assert worker._localization_source_gate(req_id, metadata, (0,)) is False
+    request_state = worker._localization_manifest_requests[req_id]
+    assert worker._localization_source_gate(req_id, metadata, (0,)) is False
+
+    assert worker._localization_manifest_deadlines[req_id] == deadline
+    assert worker._localization_manifest_requests[req_id] is request_state
+    assert worker._localization_waiting[req_id] is metadata
+    assert len(transport.sockets) == 2
+    assert transport.exit_counts == [1, 0]
+    assert transport.sockets[1].send.call_count == 1
+    worker._localization_manifest_deadlines[req_id] = time.perf_counter() - 1.0
+    assert worker._localization_source_gate(req_id, metadata, (0,))
+
+    assert worker._localization_expected_by_request[req_id] == {0: manifest}
+    assert req_id not in worker._localization_manifest_requests
+    assert req_id not in worker._localization_manifest_deadlines
+    assert req_id not in worker._localization_waiting
+    assert len(transport.sockets) == 2
+    assert transport.exit_counts == [1, 1]
+    socket = transport.sockets[1]
+    assert socket.send.call_count == 1
+    assert socket.recv.call_count == 3
+
+
+@pytest.mark.cpu_test
+def test_source_gate_deadline_closes_exchange_and_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker, req_id, metadata, _ = _source_gate_worker(tmp_path)
+    transport = _ManifestTransport([[zmq.Again(), zmq.Again()]])
+    monkeypatch.setattr(pull_worker_module, "zmq_ctx", transport)
+
+    assert worker._localization_source_gate(req_id, metadata, (0,)) is False
+    worker._localization_manifest_deadlines[req_id] = time.perf_counter() - 1.0
+
+    with pytest.raises(LocalizationError, match="source-manifest gate timed out"):
+        worker._localization_source_gate(req_id, metadata, (0,))
+
+    assert req_id not in worker._localization_manifest_requests
+    assert req_id not in worker._localization_manifest_deadlines
+    assert req_id not in worker._localization_waiting
+    assert transport.exit_counts == [1]
+
+
+@pytest.mark.cpu_test
+def test_aborted_source_gate_closes_exchange(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker, req_id, metadata, _ = _source_gate_worker(tmp_path)
+    transport = _ManifestTransport([[zmq.Again()]])
+    monkeypatch.setattr(pull_worker_module, "zmq_ctx", transport)
+    assert worker._localization_source_gate(req_id, metadata, (0,)) is False
+
+    worker._ready_requests = Queue()
+    worker._reqs_to_process = set()
+    worker._reqs_to_send = {}
+    monkeypatch.setattr(worker, "_begin_transfer_phase", lambda: None)
+    monkeypatch.setattr(worker, "_localization_capture_pre_read", lambda _: None)
+    monkeypatch.setattr(worker, "_audit_retire", lambda _: None)
+    monkeypatch.setattr(
+        worker,
+        "_localization_capture_source_rosters",
+        lambda _: None,
+    )
+    monkeypatch.setattr(worker, "_localization_record_event", lambda **_: None)
+    monkeypatch.setattr(worker, "_send_heartbeats", lambda _: None)
+    monkeypatch.setattr(worker, "_drain_transfer_phase", lambda: None)
+    monkeypatch.setattr(worker, "_record_transfer_decode_boundary", lambda: None)
+    connector_metadata = pull_worker_module.NixlConnectorMetadata()
+    connector_metadata.reqs_not_processed.add(req_id)
+
+    worker.start_load_kv(connector_metadata)
+
+    assert req_id not in worker._localization_manifest_requests
+    assert req_id not in worker._localization_manifest_deadlines
+    assert req_id not in worker._localization_waiting
+    assert transport.exit_counts == [1]
 
 
 @pytest.mark.cpu_test
