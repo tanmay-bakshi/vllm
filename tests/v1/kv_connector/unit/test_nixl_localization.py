@@ -25,6 +25,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     RemoteMeta,
     ReqMeta,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
+    NixlPullConnectorScheduler,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
     NixlPullConnectorWorker,
 )
@@ -459,7 +462,7 @@ def _capture(
             "post_scatter_device_synchronize_before_publication"
         ),
         IntegrityStage.PRE_READ: (
-            "after_transfer_phase_entry_before_new_dma_or_forward"
+            "after_transfer_phase_drain_before_model_forward"
         ),
     }
     return NixlCaptureRecord(
@@ -589,6 +592,102 @@ def test_config_requires_and_selects_exact_target(
 
 
 @pytest.mark.cpu_test
+def test_normal_consumer_metadata_names_only_the_actual_forward() -> None:
+    """Transfer admission and model-forward membership remain distinct."""
+    child_request_id = f"{TARGET_REQUEST_ID_BASE}-22222222"
+    scheduler = object.__new__(NixlPullConnectorScheduler)
+    scheduler._is_hma_required = False
+    scheduler.is_bidirectional_kv_xfer_enabled = False
+    scheduler.use_host_buffer = False
+    scheduler._reqs_need_recv = {}
+    scheduler._reqs_need_save = {}
+    scheduler._reqs_need_send = {}
+    scheduler._source_integrity_rosters = {}
+    scheduler._reqs_in_batch = set()
+    scheduler._reqs_not_processed = set()
+    scheduler._audit_finished_reqs = set()
+    scheduler._heartbeat_by_engine = {}
+
+    request = MagicMock()
+    request.request_id = child_request_id
+    request.kv_transfer_params = {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "remote_block_ids": ((10, 11),),
+        "remote_engine_id": "prefill",
+        "remote_request_id": f"{TARGET_REQUEST_ID_BASE}-11111111",
+        "remote_host": "127.0.0.1",
+        "remote_port": 5601,
+        "tp_size": 4,
+    }
+    blocks = MagicMock()
+    blocks.get_unhashed_block_ids_all_groups.return_value = ((100, 101),)
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=128)
+
+    admission_output = MagicMock()
+    admission_output.num_scheduled_tokens = {}
+    admission = scheduler.build_connector_meta(admission_output)
+
+    assert child_request_id in admission.reqs_to_recv
+    assert admission.scheduled_request_ids == set()
+    assert admission.reqs_in_batch == set()
+
+    forward_output = MagicMock()
+    forward_output.num_scheduled_tokens = {child_request_id: 1}
+    forward = scheduler.build_connector_meta(forward_output)
+
+    assert forward.reqs_to_recv == {}
+    assert forward.scheduled_request_ids == {child_request_id}
+    assert forward.reqs_in_batch == set()
+
+
+@pytest.mark.cpu_test
+def test_pre_read_waits_for_the_target_forward(tmp_path: Path) -> None:
+    """Unrelated forwards preserve a plan; its target consumes it exactly once."""
+    child_request_id = f"{TARGET_REQUEST_ID_BASE}-22222222"
+    producer_request_id = f"{TARGET_REQUEST_ID_BASE}-11111111"
+    plan: dict[str, object] = {
+        "producer_engine_id": "prefill",
+        "producer_request_id": producer_request_id,
+    }
+    worker = object.__new__(NixlPullConnectorWorker)
+    worker._localization_config = _config(tmp_path)
+    worker._localization_pre_read_plans = {child_request_id: plan}
+    worker._localization_expected_by_request = {child_request_id: {}}
+    capture = MagicMock()
+    record = MagicMock()
+    worker.shutdown = MagicMock()
+    worker._localization_capture_destination = capture
+    worker._localization_record_event = record
+
+    worker._localization_capture_pre_read({"chatcmpl-unrelated"})
+
+    assert worker._localization_pre_read_plans == {child_request_id: plan}
+    assert child_request_id in worker._localization_expected_by_request
+    capture.assert_not_called()
+    record.assert_not_called()
+
+    worker._localization_capture_pre_read({child_request_id})
+
+    capture.assert_called_once_with(
+        child_request_id,
+        plan,
+        IntegrityStage.PRE_READ,
+        "after_transfer_phase_drain_before_model_forward",
+    )
+    record.assert_called_once_with(
+        code="VERIFIED_PRE_READ",
+        evidentiary=True,
+        child_request_id=child_request_id,
+        producer_engine_id="prefill",
+        producer_request_id=producer_request_id,
+        detail="all required ranks and stages matched before first read",
+    )
+    assert worker._localization_pre_read_plans == {}
+    assert child_request_id not in worker._localization_expected_by_request
+
+
+@pytest.mark.cpu_test
 def test_non_target_source_gate_rejects_localization_lineage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -695,7 +794,7 @@ def test_source_gate_deadline_closes_exchange_and_fails(
 
 
 @pytest.mark.cpu_test
-def test_aborted_source_gate_closes_exchange(
+def test_aborted_localization_request_closes_pending_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -707,6 +806,14 @@ def test_aborted_source_gate_closes_exchange(
     worker._ready_requests = Queue()
     worker._reqs_to_process = set()
     worker._reqs_to_send = {}
+    assert metadata.remote is not None
+    worker._localization_pre_read_plans = {
+        req_id: {
+            "producer_engine_id": "prefill",
+            "producer_request_id": metadata.remote.request_id,
+        }
+    }
+    worker._localization_waiting.pop(req_id)
     monkeypatch.setattr(worker, "_begin_transfer_phase", lambda: None)
     monkeypatch.setattr(worker, "_localization_capture_pre_read", lambda _: None)
     monkeypatch.setattr(worker, "_audit_retire", lambda _: None)
@@ -715,7 +822,8 @@ def test_aborted_source_gate_closes_exchange(
         "_localization_capture_source_rosters",
         lambda _: None,
     )
-    monkeypatch.setattr(worker, "_localization_record_event", lambda **_: None)
+    record = MagicMock()
+    monkeypatch.setattr(worker, "_localization_record_event", record)
     monkeypatch.setattr(worker, "_send_heartbeats", lambda _: None)
     monkeypatch.setattr(worker, "_drain_transfer_phase", lambda: None)
     monkeypatch.setattr(worker, "_record_transfer_decode_boundary", lambda: None)
@@ -727,6 +835,15 @@ def test_aborted_source_gate_closes_exchange(
     assert req_id not in worker._localization_manifest_requests
     assert req_id not in worker._localization_manifest_deadlines
     assert req_id not in worker._localization_waiting
+    assert req_id not in worker._localization_pre_read_plans
+    record.assert_called_once_with(
+        code="REQUEST_ABORTED",
+        evidentiary=False,
+        child_request_id=req_id,
+        producer_engine_id="prefill",
+        producer_request_id=metadata.remote.request_id,
+        detail="request aborted before verified pre-read",
+    )
     assert transport.exit_counts == [1]
 
 

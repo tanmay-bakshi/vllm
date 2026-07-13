@@ -101,7 +101,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         :param metadata: Scheduler metadata for transfers entering this step.
         """
         self._begin_transfer_phase()
-        self._localization_capture_pre_read(metadata.reqs_in_batch)
         self._audit_retire(metadata)
         self._localization_capture_source_rosters(metadata.source_integrity_rosters)
         for req_id, meta in metadata.reqs_to_recv.items():
@@ -150,22 +149,28 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             self._reqs_to_process.discard(req_id)
             waiting_meta = self._localization_waiting.get(req_id)
             waiting_remote = waiting_meta.remote if waiting_meta is not None else None
+            pre_read_plan = self._localization_pre_read_plans.get(req_id)
+            producer_engine_id: str | None = None
+            producer_request_id: str | None = None
+            if waiting_remote is not None:
+                producer_engine_id = waiting_remote.engine_id
+                producer_request_id = waiting_remote.request_id
+            elif pre_read_plan is not None:
+                producer_engine_id = str(pre_read_plan["producer_engine_id"])
+                producer_request_id = str(pre_read_plan["producer_request_id"])
             self._localization_record_event(
                 code="REQUEST_ABORTED",
                 evidentiary=False,
                 child_request_id=req_id,
-                producer_engine_id=(
-                    waiting_remote.engine_id if waiting_remote is not None else None
-                ),
-                producer_request_id=(
-                    waiting_remote.request_id if waiting_remote is not None else None
-                ),
+                producer_engine_id=producer_engine_id,
+                producer_request_id=producer_request_id,
                 detail="request aborted before verified pre-read",
             )
             self._drop_localization_manifest_request(req_id)
             self._localization_waiting.pop(req_id, None)
             self._localization_manifest_deadlines.pop(req_id, None)
             self._localization_expected_by_request.pop(req_id, None)
+            self._localization_pre_read_plans.pop(req_id, None)
             # We should never get an abort after setting an expiry timer
             assert req_id not in self._reqs_to_send
 
@@ -180,6 +185,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # requests sit in the D scheduler WAITING queue.
         self._send_heartbeats(metadata)
         self._drain_transfer_phase()
+        self._localization_capture_pre_read(metadata.scheduled_request_ids)
         self._record_transfer_decode_boundary()
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):

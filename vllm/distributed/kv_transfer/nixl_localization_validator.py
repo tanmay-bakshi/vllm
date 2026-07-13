@@ -745,7 +745,7 @@ def _capture_errors(
             "post_scatter_device_synchronize_before_publication"
         ),
         IntegrityStage.PRE_READ: (
-            "after_transfer_phase_entry_before_new_dma_or_forward"
+            "after_transfer_phase_drain_before_model_forward"
         ),
     }
     if capture.barrier != expected_barriers[capture.stage]:

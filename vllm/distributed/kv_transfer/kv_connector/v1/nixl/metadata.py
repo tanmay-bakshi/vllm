@@ -192,6 +192,9 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # P-side physical block rosters that must be snapshotted before a D
         # localization observer is allowed to post one-sided reads.
         self.source_integrity_rosters: dict[ReqId, NixlSourceRoster] = {}
+        # Requests that will execute a model forward with this metadata. This
+        # is distinct from producer-side lease tracking in reqs_in_batch.
+        self.scheduled_request_ids: set[ReqId] = set()
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
         # Heartbeat data grouped by remote engine, sent by D worker to P.

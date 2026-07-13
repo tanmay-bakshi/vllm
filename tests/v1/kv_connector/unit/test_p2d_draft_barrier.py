@@ -72,8 +72,8 @@ def test_delayed_draft_proposal_is_joined_before_every_connector_path() -> None:
 
 
 @pytest.mark.cpu_test
-def test_pre_read_capture_follows_phase_entry_and_precedes_new_work() -> None:
-    """PRE_READ follows phase entry and precedes transfer-state mutation."""
+def test_pre_read_capture_follows_transfer_drain_and_precedes_model_return() -> None:
+    """PRE_READ observes the final destination state before model execution."""
     repository_root = Path(__file__).resolve().parents[4]
     worker_path = repository_root / (
         "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py"
@@ -84,13 +84,29 @@ def test_pre_read_capture_follows_phase_entry_and_precedes_new_work() -> None:
         for node in ast.walk(module)
         if isinstance(node, ast.FunctionDef) and node.name == "start_load_kv"
     )
-    phase_entry = start_load.body[1]
-    pre_read_capture = start_load.body[2]
+    drain_index = next(
+        index
+        for index, statement in enumerate(start_load.body)
+        if _contains_call(statement, "_drain_transfer_phase")
+    )
+    pre_read_index = next(
+        index
+        for index, statement in enumerate(start_load.body)
+        if _contains_call(statement, "_localization_capture_pre_read")
+    )
+    boundary_index = next(
+        index
+        for index, statement in enumerate(start_load.body)
+        if _contains_call(statement, "_record_transfer_decode_boundary")
+    )
+    pre_read = start_load.body[pre_read_index]
 
-    assert isinstance(phase_entry, ast.Expr)
-    assert _contains_call(phase_entry, "_begin_transfer_phase")
-    assert isinstance(pre_read_capture, ast.Expr)
-    assert _contains_call(pre_read_capture, "_localization_capture_pre_read")
+    assert drain_index < pre_read_index < boundary_index
+    assert any(
+        isinstance(child, ast.Attribute)
+        and child.attr == "scheduled_request_ids"
+        for child in ast.walk(pre_read)
+    )
 
 
 @pytest.mark.cpu_test

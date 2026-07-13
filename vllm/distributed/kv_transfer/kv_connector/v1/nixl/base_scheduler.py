@@ -514,6 +514,7 @@ class NixlBaseConnectorScheduler:
 
         meta.reqs_to_send = self._reqs_need_send
         meta.source_integrity_rosters = self._source_integrity_rosters
+        meta.scheduled_request_ids = set(scheduler_output.num_scheduled_tokens)
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
         meta.audit_finished = self._audit_finished_reqs

@@ -2978,7 +2978,7 @@ class NixlBaseConnectorWorker:
             )
 
     def _localization_capture_pre_read(self, req_ids: set[ReqId]) -> None:
-        """Capture destination rows before any new transfer or model forward.
+        """Capture destination rows after transfer drain and before model forward.
 
         :param req_ids: Requests admitted to the current model batch.
         """
@@ -3000,7 +3000,7 @@ class NixlBaseConnectorWorker:
             req_id,
             plan,
             IntegrityStage.PRE_READ,
-            "after_transfer_phase_entry_before_new_dma_or_forward",
+            "after_transfer_phase_drain_before_model_forward",
         )
         plan_remote_request = str(plan["producer_request_id"])
         is_trace = self._localization_config.mode is LocalizationMode.TRACE
