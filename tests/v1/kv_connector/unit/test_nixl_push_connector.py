@@ -40,6 +40,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import make_nixl_push_scheduler
@@ -159,6 +160,25 @@ class TestPushScheduler:
         assert request.request_id in sched._finished_request_blocks
         assert request.request_id in sched._newly_finished_push_blocks
         assert request.request_id in sched._reqs_need_send  # lease armed
+
+    def test_p_side_request_finished_excludes_speculative_tail(self) -> None:
+        """Push metadata and worker staging use the normalized source roster."""
+        sched = make_nixl_push_scheduler()
+
+        request = _make_request(request_id="req-p-tail", is_d_side=False)
+        block_ids = ([20, 21, 22, 23, 24],)
+
+        delay, transfer_params = sched.request_finished(request, block_ids)
+
+        expected_block_ids = [[20, 21, 22, 23]]
+        assert delay is True
+        assert transfer_params is not None
+        assert transfer_params["remote_block_ids"] == expected_block_ids
+        assert transfer_params["remote_num_tokens"] == 64
+        assert sched._finished_request_blocks[request.request_id] == expected_block_ids
+        assert (
+            sched._newly_finished_push_blocks[request.request_id] == expected_block_ids
+        )
 
     def test_build_connector_meta_drains_both_sides(self):
         """meta.push_registrations and meta.push_finished_blocks are filled
@@ -373,6 +393,63 @@ def _registration_data(
         "remote_port": remote_port,
         "remote_tp_size": remote_tp_size,
     }
+
+
+class TestPushBlockAlignment:
+    def test_sliding_window_source_drops_leading_overlap_page(self) -> None:
+        """Push pairs all valid SW source pages with decoder destinations."""
+        worker = MagicMock(spec=NixlPushConnectorWorker)
+        worker._has_mamba = False
+        valid_source_blocks = list(range(20_000, 20_064))
+        destination_blocks = list(range(30_000, 30_064))
+
+        aligned_source, aligned_destination = (
+            NixlPushConnectorWorker._align_push_block_ids(
+                worker,
+                ([10_000, 10_001], [0, *valid_source_blocks]),
+                ([40_000, 40_001], destination_blocks),
+                destination_physical_per_logical=1,
+            )
+        )
+
+        assert aligned_source == [[10_000, 10_001], valid_source_blocks]
+        assert aligned_destination == [[40_000, 40_001], destination_blocks]
+
+    def test_destination_padding_remains_front_aligned(self) -> None:
+        """Push discards trailing destination layout padding."""
+        worker = MagicMock(spec=NixlPushConnectorWorker)
+        worker._has_mamba = False
+
+        aligned_source, aligned_destination = (
+            NixlPushConnectorWorker._align_push_block_ids(
+                worker,
+                ([100, 101],),
+                ([200, 201, 202],),
+                destination_physical_per_logical=1,
+            )
+        )
+
+        assert aligned_source == [[100, 101]]
+        assert aligned_destination == [[200, 201]]
+
+    def test_mamba_hybrid_source_padding_remains_front_aligned(self) -> None:
+        """Push preserves heterogeneous Mamba attention padding semantics."""
+        worker = MagicMock(spec=NixlPushConnectorWorker)
+        worker._has_mamba = True
+        worker._group_spec_types = (FullAttentionSpec, MambaSpec)
+        worker._physical_blocks_per_logical_kv_block = 6
+
+        aligned_source, aligned_destination = (
+            NixlPushConnectorWorker._align_push_block_ids(
+                worker,
+                (list(range(12)), [900, 901]),
+                (list(range(100, 110)), [902]),
+                destination_physical_per_logical=10,
+            )
+        )
+
+        assert aligned_source == [list(range(10)), [901]]
+        assert aligned_destination == [list(range(100, 110)), [902]]
 
 
 class TestPushWriterMatching:

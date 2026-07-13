@@ -3,7 +3,7 @@
 """Unit tests for NixlConnectorScheduler with HMA and Mamba N-1 prefill."""
 
 import gc
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -11,10 +11,31 @@ import torch
 from tests.v1.attention.utils import MockMambaBuilder
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
+    NixlBaseConnectorScheduler,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
+    NixlPullConnectorScheduler,
+)
+from vllm.distributed.kv_transfer.nixl_localization import (
+    LocalizationMode,
+    NixlLocalizationConfig,
+)
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     SlidingWindowManager,
 )
+from vllm.v1.kv_cache_interface import (
+    CrossAttentionSpec,
+    EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+)
+from vllm.v1.request import RequestStatus
 
 from .utils import (
     create_request,
@@ -22,6 +43,67 @@ from .utils import (
     make_kv_cache_config,
     make_nixl_scheduler,
 )
+
+
+def _make_transfer_roster_scheduler(
+    kv_cache_config: KVCacheConfig,
+    blocks_per_sw: list[int],
+    *,
+    decode_context_parallel_size: int = 1,
+    prefill_context_parallel_size: int = 1,
+) -> NixlBaseConnectorScheduler:
+    """Build the scheduler state required for roster normalization.
+
+    :param kv_cache_config: Cache groups whose transfer roster is normalized.
+    :param blocks_per_sw: Retained sliding-window blocks for each group.
+    :param decode_context_parallel_size: Decode context-parallel degree.
+    :param prefill_context_parallel_size: Prefill context-parallel degree.
+    :returns: Scheduler configured for direct roster normalization.
+    """
+    scheduler = object.__new__(NixlBaseConnectorScheduler)
+    scheduler.kv_cache_config = kv_cache_config
+    scheduler._is_hma_required = len(kv_cache_config.kv_cache_groups) > 1
+    scheduler.blocks_per_sw = blocks_per_sw
+    scheduler.vllm_config = MagicMock()
+    parallel_config = scheduler.vllm_config.parallel_config
+    parallel_config.decode_context_parallel_size = decode_context_parallel_size
+    parallel_config.prefill_context_parallel_size = prefill_context_parallel_size
+    return scheduler
+
+
+def _make_attention_group(
+    name: str,
+    spec_type: type[
+        FullAttentionSpec
+        | SlidingWindowSpec
+        | CrossAttentionSpec
+        | EncoderOnlyAttentionSpec
+    ],
+    block_size: int,
+    *,
+    sliding_window: int | None = None,
+) -> KVCacheGroupSpec:
+    """Build an attention cache group for transfer-roster tests.
+
+    :param name: Layer name assigned to the cache group.
+    :param spec_type: Attention cache specification type.
+    :param block_size: Logical tokens represented by each block.
+    :param sliding_window: Sliding-window size when required by the spec.
+    :returns: Cache group containing the requested attention specification.
+    """
+    spec_kwargs = {
+        "block_size": block_size,
+        "num_kv_heads": 1,
+        "head_size": 1,
+        "dtype": torch.float16,
+    }
+    if spec_type is SlidingWindowSpec:
+        assert sliding_window is not None
+        return KVCacheGroupSpec(
+            [name],
+            spec_type(sliding_window=sliding_window, **spec_kwargs),
+        )
+    return KVCacheGroupSpec([name], spec_type(**spec_kwargs))
 
 
 @pytest.mark.cpu_test
@@ -61,6 +143,221 @@ def test_sw_sizes(mock_platform, swa_enabled, expected_sw_sizes):
     assert scheduler.blocks_per_sw == expected_sw_sizes, (
         f"Expected sw_sizes={expected_sw_sizes}, got {scheduler.blocks_per_sw}"
     )
+
+
+@pytest.mark.cpu_test
+def test_transferable_blocks_exclude_speculative_hma_tail() -> None:
+    """Only computed self-attention pages enter the source roster."""
+    sw_block_size = 16
+    sw_size = 1023
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4096,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            _make_attention_group("full", FullAttentionSpec, 32),
+            _make_attention_group(
+                "sliding",
+                SlidingWindowSpec,
+                sw_block_size,
+                sliding_window=sw_size,
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=64,
+                    shapes=((16,), (16,)),
+                    dtypes=(torch.float16,),
+                ),
+            ),
+        ],
+    )
+    scheduler = _make_transfer_roster_scheduler(
+        kv_cache_config,
+        blocks_per_sw=[0, cdiv(sw_size, sw_block_size) + 1, 0],
+    )
+    num_computed_tokens = 32_480
+    request = MagicMock()
+    request.num_computed_tokens = num_computed_tokens
+    full_blocks = list(range(10_000, 11_016))
+    valid_sw_blocks = list(range(20_000, 20_064))
+    speculative_sw_block = 20_064
+    num_null_sw_blocks = num_computed_tokens // sw_block_size - len(valid_sw_blocks)
+    sw_blocks = [0] * num_null_sw_blocks + valid_sw_blocks + [speculative_sw_block]
+    mamba_blocks = [30_000, 30_001]
+
+    transferable = scheduler._get_transferable_block_ids(
+        request,
+        (full_blocks, sw_blocks, mamba_blocks),
+    )
+
+    assert transferable == (
+        full_blocks[:1015],
+        [0, *valid_sw_blocks],
+        mamba_blocks,
+    )
+    assert full_blocks[-1] not in transferable[0]
+    assert speculative_sw_block not in transferable[1]
+
+
+@pytest.mark.cpu_test
+def test_prefix_caching_pairs_normalized_sw_roster_with_valid_pages() -> None:
+    """Decode drops the leading SW null page and retains every valid page."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    worker = object.__new__(NixlConnectorWorker)
+    worker._has_mamba = False
+    worker._skip_pull_groups = set()
+    worker._sp_group_flags = MagicMock(return_value=(False,))
+    local_block_ids = (list(range(30_000, 30_064)),)
+    valid_remote_block_ids = list(range(20_000, 20_064))
+
+    aligned_local, aligned_remote = worker._apply_prefix_caching(
+        local_block_ids,
+        ([0, *valid_remote_block_ids],),
+        remote_physical_per_logical=1,
+    )
+
+    assert aligned_local == local_block_ids
+    assert aligned_remote == [valid_remote_block_ids]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "num_computed_tokens,decode_context_parallel_size,"
+    "prefill_context_parallel_size,expected_blocks",
+    [
+        pytest.param(31, 1, 1, 2, id="partial-minus-one"),
+        pytest.param(32, 1, 1, 2, id="exact-boundary"),
+        pytest.param(33, 1, 1, 3, id="partial-plus-one"),
+        pytest.param(32, 2, 1, 1, id="exact-dcp-boundary"),
+        pytest.param(33, 2, 1, 2, id="partial-dcp-boundary"),
+        pytest.param(33, 1, 2, 2, id="partial-pcp-boundary"),
+    ],
+)
+def test_transferable_blocks_follow_effective_block_capacity(
+    num_computed_tokens: int,
+    decode_context_parallel_size: int,
+    prefill_context_parallel_size: int,
+    expected_blocks: int,
+) -> None:
+    """Exact and partial token extents retain the intersecting pages.
+
+    :param num_computed_tokens: Valid token extent published by the producer.
+    :param decode_context_parallel_size: Decode context-parallel degree.
+    :param prefill_context_parallel_size: Prefill context-parallel degree.
+    :param expected_blocks: Number of pages intersecting the valid extent.
+    """
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            _make_attention_group("full", FullAttentionSpec, block_size=16)
+        ],
+    )
+    scheduler = _make_transfer_roster_scheduler(
+        kv_cache_config,
+        blocks_per_sw=[0],
+        decode_context_parallel_size=decode_context_parallel_size,
+        prefill_context_parallel_size=prefill_context_parallel_size,
+    )
+    request = MagicMock()
+    request.num_computed_tokens = num_computed_tokens
+    block_ids = [[0, 1, 2, 3]]
+
+    transferable = scheduler._get_transferable_block_ids(request, block_ids)
+
+    assert transferable == [block_ids[0][:expected_blocks]]
+
+
+@pytest.mark.cpu_test
+def test_transferable_blocks_preserve_non_decoder_cache_groups() -> None:
+    """Decoder token extent does not trim recurrent or encoder state."""
+    kv_cache_config = KVCacheConfig(
+        num_blocks=16,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            _make_attention_group("self", FullAttentionSpec, 16),
+            _make_attention_group("cross", CrossAttentionSpec, 16),
+            _make_attention_group("encoder", EncoderOnlyAttentionSpec, 16),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=16,
+                    shapes=((16,), (16,)),
+                    dtypes=(torch.float16,),
+                ),
+            ),
+        ],
+    )
+    scheduler = _make_transfer_roster_scheduler(
+        kv_cache_config,
+        blocks_per_sw=[0, 0, 0, 0],
+    )
+    request = MagicMock()
+    request.num_computed_tokens = 17
+    block_ids = (
+        [0, 1, 2, 3],
+        [10, 11, 12, 13],
+        [20, 21, 22, 23],
+        [30, 31, 32, 33],
+    )
+
+    transferable = scheduler._get_transferable_block_ids(request, block_ids)
+
+    assert transferable == (
+        [0, 1],
+        block_ids[1],
+        block_ids[2],
+        block_ids[3],
+    )
+
+
+@pytest.mark.cpu_test
+def test_pull_publication_uses_transferable_blocks() -> None:
+    """Pull metadata exposes the normalized roster and arms its lease."""
+    block_size = 16
+    vllm_config = create_vllm_config(block_size=block_size)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[_make_attention_group("full", FullAttentionSpec, block_size)],
+    )
+    scheduler = NixlPullConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-prefill",
+        kv_cache_config=kv_cache_config,
+    )
+    request = create_request(
+        num_tokens=32,
+        max_tokens=1,
+        do_remote_decode=True,
+        block_size=block_size,
+    )
+    request.num_computed_tokens = 32
+    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    scheduler._localization_config = NixlLocalizationConfig(
+        mode=LocalizationMode.TRACE,
+        run_id="test-run",
+        transport_arm="pull",
+        target_request_id=request.request_id,
+        artifact_dir=None,
+        copy_chunk_bytes=1024,
+        strict_zero_byte=False,
+    )
+
+    delay_free_blocks, transfer_params = scheduler.request_finished(
+        request,
+        ([100, 101, 102],),
+    )
+
+    assert delay_free_blocks is True
+    assert transfer_params is not None
+    assert transfer_params["remote_block_ids"] == [[100, 101]]
+    assert transfer_params["remote_num_tokens"] == 32
+    assert scheduler._source_rosters[request.request_id].block_ids == ((100, 101),)
+    assert request.request_id in scheduler._reqs_need_send
 
 
 @pytest.mark.cpu_test
@@ -182,8 +479,6 @@ def test_read_blocks_for_req_expands_remote_ids(
     The hot path always calls _logical_to_remote_kernel_block_ids with
     remote_info.remote_physical_blocks_per_logical (model-agnostic).
     """
-    from unittest.mock import MagicMock
-
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
         NixlConnectorMetadata,
     )
@@ -226,6 +521,13 @@ def test_read_blocks_for_req_expands_remote_ids(
     remote_info.remote_physical_blocks_per_logical = remote_physical_per_logical
     worker.transfer_topo.get_engine_info.return_value = remote_info
     worker.use_mla = False
+    worker._localization_config = MagicMock(spec=NixlLocalizationConfig)
+    worker._localization_config.enabled_for.return_value = False
+    worker._released_rids = set()
+    worker.coalesce_pull = False
+    worker._sp_group_flags = MagicMock(return_value=())
+    worker._no_stock_dma = MagicMock(return_value=False)
+    worker._stock_read_specs = MagicMock()
 
     mock_plan = MagicMock(spec=TPMapping)
     mock_plan.all_source_ranks = ()
@@ -240,6 +542,7 @@ def test_read_blocks_for_req_expands_remote_ids(
             "remote_block_ids": remote_block_ids,
             "remote_engine_id": remote_engine_id,
             "remote_request_id": "prefill-test-req",
+            "remote_num_tokens": 32,
             "remote_host": "localhost",
             "remote_port": 1234,
             "tp_size": 1,
@@ -591,6 +894,7 @@ def test_nixl_metadata_hma_block_ids_structure():
             "remote_block_ids": ([10, 11, 12, 13, 14, 15, 16, 17], [18, 19, 20, 21]),
             "remote_engine_id": "remote-engine",
             "remote_request_id": "prefill-test-req-hma",
+            "remote_num_tokens": 128,
             "remote_host": "localhost",
             "remote_port": 1234,
             "tp_size": 1,
@@ -619,8 +923,6 @@ def _make_mock_worker_for_desc_ids(
     block_len_per_layer: list[int] | None = None,
 ):
     """Build a mock NixlConnectorWorker with attrs needed by _compute_desc_ids."""
-    from unittest.mock import MagicMock
-
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,
     )
@@ -726,6 +1028,7 @@ def test_nixl_metadata_hybrid_ssm_block_ids():
             "remote_block_ids": ([10, 11, 12, 13, 14, 15, 16, 17], [20, 21]),
             "remote_engine_id": "remote-engine",
             "remote_request_id": "prefill-test-req-hybrid",
+            "remote_num_tokens": 128,
             "remote_host": "localhost",
             "remote_port": 1234,
             "tp_size": 1,

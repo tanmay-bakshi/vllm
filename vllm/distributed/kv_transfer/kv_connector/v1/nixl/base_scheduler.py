@@ -37,6 +37,9 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    CrossAttentionSpec,
+    EncoderOnlyAttentionSpec,
     FullAttentionSpec,
     MambaSpec,
     SlidingWindowSpec,
@@ -241,6 +244,49 @@ class NixlBaseConnectorScheduler:
                 if not info.req_ids:
                     # Clean up empty engines so we don't leak a key when remote dies.
                     del self._heartbeat_by_engine[engine_id]
+
+    def _get_transferable_block_ids(
+        self,
+        request: "Request",
+        block_ids: BlockIds,
+    ) -> BlockIds:
+        """Return the initialized logical KV blocks for transfer.
+
+        Producer allocation can include speculative lookahead pages beyond the
+        computed token extent. Decoder self-attention block tables are positional,
+        so pages wholly beyond that extent do not contain request KV. Recurrent and
+        encoder-state groups are indexed by different extents and remain unchanged.
+
+        :param request: The request that produced the KV blocks.
+        :param block_ids: The request's allocated logical block tables.
+        :returns: The canonical logical block tables to publish for transfer.
+        """
+        assert len(block_ids) == len(self.kv_cache_config.kv_cache_groups), (
+            "Number of KV cache groups must match"
+        )
+
+        parallel_config = self.vllm_config.parallel_config
+        context_parallel_size: int = (
+            parallel_config.decode_context_parallel_size
+            * parallel_config.prefill_context_parallel_size
+        )
+        transferable_block_ids: list[list[int]] = []
+        for group, group_block_ids in zip(
+            self.kv_cache_config.kv_cache_groups, block_ids
+        ):
+            spec = group.kv_cache_spec
+            transferable_group_block_ids: list[int] = list(group_block_ids)
+            if isinstance(spec, AttentionSpec) and not isinstance(
+                spec, (CrossAttentionSpec, EncoderOnlyAttentionSpec)
+            ):
+                group_token_capacity: int = spec.block_size * context_parallel_size
+                num_transferable_blocks: int = cdiv(
+                    request.num_computed_tokens, group_token_capacity
+                )
+                del transferable_group_block_ids[num_transferable_blocks:]
+            transferable_block_ids.append(transferable_group_block_ids)
+
+        return self.get_sw_clipped_blocks(transferable_block_ids)
 
     def get_sw_clipped_blocks(self, block_ids: BlockIds) -> BlockIds:
         """

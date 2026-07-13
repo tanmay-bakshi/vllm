@@ -50,7 +50,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqMeta,
     TransferHandle,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpec
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+    ReadSpec,
+    _is_ssm_spec,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import get_base_request_id
 from vllm.logger import init_logger
 
@@ -560,6 +563,85 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 if rank_to_notify != read_specs[0].remote_rank:
                     self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
 
+    def _align_push_block_ids(
+        self,
+        source_block_ids: BlockIds,
+        destination_block_ids: BlockIds,
+        destination_physical_per_logical: int,
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """Align push source and destination groups by cache semantics.
+
+        A destination can omit a prefix that is already cached locally. Sliding
+        window source rosters can also retain one leading overlap page. Source
+        excess is therefore removed from the front. Destination excess comes
+        from layout padding and remains aligned from the front. Mamba hybrids
+        preserve their established padding and latest-state alignment rules.
+
+        :param source_block_ids: Producer block IDs read by the WRITE transfer.
+        :param destination_block_ids: Decoder block IDs written by the transfer.
+        :param destination_physical_per_logical: Decoder physical pages represented
+            by one logical block.
+        :returns: Source and destination groups with equal aligned lengths.
+        """
+        assert len(source_block_ids) == len(destination_block_ids), (
+            "Push source and destination group counts must match"
+        )
+        aligned_source_block_ids: list[list[int]] = []
+        aligned_destination_block_ids: list[list[int]] = []
+        for group_index, (source_group, destination_group) in enumerate(
+            zip(source_block_ids, destination_block_ids)
+        ):
+            num_source_blocks: int = len(source_group)
+            num_destination_blocks: int = len(destination_group)
+            num_common_blocks: int = min(num_source_blocks, num_destination_blocks)
+            if num_common_blocks == 0:
+                aligned_source_block_ids.append([])
+                aligned_destination_block_ids.append([])
+                continue
+
+            if self._has_mamba:
+                if (
+                    _is_ssm_spec(self._group_spec_types[group_index])
+                    and num_destination_blocks < num_source_blocks
+                ):
+                    assert num_destination_blocks == 1, (
+                        "SSM can only have one destination block"
+                    )
+                    aligned_source_block_ids.append(
+                        list(source_group[-num_destination_blocks:])
+                    )
+                    aligned_destination_block_ids.append(list(destination_group))
+                    continue
+                if (
+                    self._physical_blocks_per_logical_kv_block
+                    == destination_physical_per_logical
+                    and num_destination_blocks < num_source_blocks
+                ):
+                    aligned_source_block_ids.append(
+                        list(source_group[-num_destination_blocks:])
+                    )
+                    aligned_destination_block_ids.append(list(destination_group))
+                    continue
+                max_padding: int = max(
+                    self._physical_blocks_per_logical_kv_block,
+                    destination_physical_per_logical,
+                )
+                assert abs(num_source_blocks - num_destination_blocks) < max_padding, (
+                    f"Group {group_index}: |{num_source_blocks} - "
+                    f"{num_destination_blocks}| >= {max_padding}"
+                )
+                aligned_source_block_ids.append(list(source_group[:num_common_blocks]))
+                aligned_destination_block_ids.append(
+                    list(destination_group[:num_common_blocks])
+                )
+                continue
+
+            aligned_source_block_ids.append(list(source_group[-num_common_blocks:]))
+            aligned_destination_block_ids.append(
+                list(destination_group[:num_common_blocks])
+            )
+        return aligned_source_block_ids, aligned_destination_block_ids
+
     def _xfer_blocks(
         self,
         read_spec: ReadSpec,
@@ -586,10 +668,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             local_block_ids_mapped = self.get_mapped_blocks(
                 np.asarray(local_block_ids0), block_size_ratio
             ).tolist()
-            if len(local_block_ids_mapped) > len(remote_block_ids0):
-                local_block_ids_mapped = local_block_ids_mapped[
-                    : len(remote_block_ids0)
-                ]
+            num_mapped_blocks = min(len(local_block_ids_mapped), len(remote_block_ids0))
+            local_block_ids_mapped = local_block_ids_mapped[:num_mapped_blocks]
+            remote_block_ids0 = remote_block_ids0[:num_mapped_blocks]
             local_block_ids = [local_block_ids_mapped] if local_block_ids_mapped else []
             remote_block_ids = [remote_block_ids0]
 
@@ -599,16 +680,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             logger.warning("No blocks to push for request %s", request_id)
             return
 
-        # Align per-group block counts for push.
-        local_block_ids = list(local_block_ids)
-        remote_block_ids = list(remote_block_ids)
-        for i in range(min(len(local_block_ids), len(remote_block_ids))):
-            num_local = len(local_block_ids[i])
-            num_remote = len(remote_block_ids[i])
-            if num_local > num_remote:
-                local_block_ids[i] = local_block_ids[i][:num_remote]
-            elif num_local < num_remote:
-                remote_block_ids[i] = remote_block_ids[i][:num_local]
+        local_block_ids, remote_block_ids = self._align_push_block_ids(
+            local_block_ids,
+            remote_block_ids,
+            remote_info.remote_physical_blocks_per_logical,
+        )
 
         # Get descs ids.
         remote_block_descs_ids = self._compute_desc_ids(

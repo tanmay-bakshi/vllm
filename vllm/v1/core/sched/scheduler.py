@@ -906,14 +906,10 @@ class Scheduler(SchedulerInterface):
                     if num_new_tokens == 0:
                         break
 
-                # Handles an edge case when P/D Disaggregation
-                # is used with Spec Decoding where an
-                # extra block gets allocated which
-                # creates a mismatch between the number
-                # of local and remote blocks.
-                limit_lookahead_tokens = load_kv_async and self.use_eagle
+                # Async receive performs no model work. Speculative lookahead is
+                # allocated when the request is rescheduled after the transfer.
                 effective_lookahead_tokens = (
-                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+                    0 if load_kv_async else self.num_lookahead_tokens
                 )
 
                 # Determine if we need to allocate cross-attention blocks.

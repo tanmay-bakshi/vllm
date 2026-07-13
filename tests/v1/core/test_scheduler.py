@@ -1570,6 +1570,62 @@ def _step_until_kv_transfer_finished(scheduler: Scheduler, req_ids: list[str]):
     return initial_ecos
 
 
+@pytest.mark.parametrize(
+    ("use_eagle", "num_lookahead_tokens"),
+    [
+        pytest.param(False, 3, id="draft-model"),
+        pytest.param(True, 3, id="eagle-family"),
+        pytest.param(True, 4, id="dflash"),
+    ],
+)
+@pytest.mark.parametrize(
+    "load_kv_async",
+    [False, True],
+    ids=["ordinary-scheduling", "async-kv-load"],
+)
+def test_async_kv_load_excludes_speculative_lookahead(
+    monkeypatch: pytest.MonkeyPatch,
+    use_eagle: bool,
+    num_lookahead_tokens: int,
+    load_kv_async: bool,
+) -> None:
+    """Verify async KV loads never reserve speculative lookahead slots.
+
+    :param monkeypatch: Pytest fixture used to observe slot allocation.
+    :param use_eagle: Whether the scheduler uses EAGLE-family semantics.
+    :param num_lookahead_tokens: Configured speculative lookahead extent.
+    :param load_kv_async: Whether the schedule performs an asynchronous KV load.
+    """
+    block_size = 16
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=(
+            mock_kv(matched_tokens=block_size, is_async=True) if load_kv_async else None
+        ),
+        block_size=block_size,
+    )
+    scheduler.use_eagle = use_eagle
+    scheduler.num_lookahead_tokens = num_lookahead_tokens
+
+    allocate_slots = Mock(wraps=scheduler.kv_cache_manager.allocate_slots)
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_slots", allocate_slots)
+
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=block_size,
+        block_size=block_size,
+    )
+    scheduler.add_request(request)
+    scheduler.schedule()
+
+    allocate_slots.assert_called_once()
+    expected_lookahead_tokens = 0 if load_kv_async else num_lookahead_tokens
+    assert (
+        allocate_slots.call_args.kwargs["num_lookahead_tokens"]
+        == expected_lookahead_tokens
+    )
+
+
 @pytest.mark.parametrize("is_async", [False, True])
 def test_kv_connector_basic(is_async: bool):
     """

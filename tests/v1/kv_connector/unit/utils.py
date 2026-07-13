@@ -566,7 +566,11 @@ def make_nixl_push_scheduler(
     # vllm_config is consulted for parallel_config.tensor_parallel_size.
     vllm_config = MagicMock()
     vllm_config.parallel_config.tensor_parallel_size = 1
+    vllm_config.parallel_config.decode_context_parallel_size = 1
+    vllm_config.parallel_config.prefill_context_parallel_size = 1
     sched.vllm_config = vllm_config
+    sched.kv_cache_config = make_kv_cache_config(block_size=16)
+    sched._is_hma_required = False
 
     # Push-specific state.
     sched._push_pending_registrations = {}
@@ -584,6 +588,6 @@ def make_nixl_push_scheduler(
     sched._heartbeat_by_engine = {}
     sched._heartbeat_req_engine = {}
     sched._last_heartbeat_time = 0.0
-    sched.blocks_per_sw = []
+    sched.blocks_per_sw = [0]
 
     return sched

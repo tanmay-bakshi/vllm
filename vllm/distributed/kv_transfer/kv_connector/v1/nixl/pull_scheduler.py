@@ -262,8 +262,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             self._reqs_need_save.pop(request.request_id, None)
             return False, None
 
-        # TODO: check whether block_ids actually ever be 0. If not we could
-        # remove the conditional below
+        block_ids = self._get_transferable_block_ids(request, block_ids)
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
         remote_num_tokens = 0
         localization_params: dict[str, Any] = {}
@@ -283,12 +282,6 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             self._reqs_need_send[request.request_id] = (
                 time.perf_counter() + request_kv_blocks_ttl
             )
-            # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
-            # trimming down after allocating for the whole sequence length. Empty
-            # blocks are always at the start of the list.
-            # Here we "unpad" blocks to send the actual remote blocks to be read.
-            block_ids = self.get_sw_clipped_blocks(block_ids)
-
             if is_p_node and self._localization_config.enabled_for(request.request_id):
                 self._localization_offer_generation += 1
                 offer_generation = self._localization_offer_generation
