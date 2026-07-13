@@ -473,6 +473,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 )
             contract = NixlSourceContract(
                 schema_version=IntegrityIdentity.SCHEMA_VERSION,
+                fingerprint_algorithm=self._localization_config.fingerprint_algorithm,
                 run_id=self._localization_config.run_id,
                 transport_arm=self._localization_config.transport_arm,
                 producer_engine_id=remote.engine_id,

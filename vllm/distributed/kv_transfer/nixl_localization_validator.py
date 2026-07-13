@@ -21,6 +21,7 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     LOCALIZATION_ROOT_PERSON,
     IntegrityLeafKey,
     LocalizationError,
+    LocalizationFingerprintAlgorithm,
     LocalizationMode,
     NixlCaptureRecord,
     NixlEventRecord,
@@ -33,6 +34,7 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlSourceManifestRecord,
     NixlTerminalRecord,
     compute_semantic_contract_digest,
+    localization_fingerprint_size,
     localization_request_id_base,
     select_source_manifest,
     source_contract_from_manifest,
@@ -47,6 +49,26 @@ ArtifactRecord: TypeAlias = (
 SourceLineage: TypeAlias = tuple[str, str, str, str, str, int, int, int]
 ObserverKey: TypeAlias = tuple[str, str, int]
 CaptureKey: TypeAlias = tuple[ObserverKey, SourceLineage, IntegrityStage]
+
+
+def _capture_stages(mode: LocalizationMode) -> tuple[IntegrityStage, ...]:
+    """Return the complete decoder checkpoint sequence for one mode.
+
+    :param mode: Observer mode recorded by every process session.
+    :returns: Ordered decoder capture stages.
+    """
+    if mode is LocalizationMode.FINGERPRINT:
+        return (
+            IntegrityStage.STAGING_POST_SCATTER,
+            IntegrityStage.DESTINATION,
+            IntegrityStage.PRE_READ,
+        )
+    return (
+        IntegrityStage.STAGING_RAW,
+        IntegrityStage.STAGING_FENCED_CONTROL,
+        IntegrityStage.DESTINATION,
+        IntegrityStage.PRE_READ,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,6 +432,7 @@ def _source_request_signature(contract: NixlSourceContract) -> tuple[object, ...
     """
     return (
         contract.schema_version,
+        contract.fingerprint_algorithm,
         contract.run_id,
         contract.transport_arm,
         contract.producer_engine_id,
@@ -651,6 +674,8 @@ def _record_scope_errors(
             errors.append("localization source record is not SOURCE_POST")
         if manifest.run_id != session.run_id:
             errors.append("source manifest run differs from its session")
+        if manifest.fingerprint_algorithm is not session.fingerprint_algorithm:
+            errors.append("source manifest algorithm differs from its session")
         if manifest.transport_arm != session.transport_arm:
             errors.append("source manifest arm differs from its session")
         if manifest.producer_engine_id != session.engine_id:
@@ -675,6 +700,8 @@ def _record_scope_errors(
         ):
             errors.append("plan child differs from its session target")
         for contract in record.source_contracts:
+            if contract.fingerprint_algorithm is not session.fingerprint_algorithm:
+                errors.append("plan source algorithm differs from its session")
             if contract.run_id != session.run_id:
                 errors.append("plan source contract run differs from its session")
             if contract.transport_arm != session.transport_arm:
@@ -688,6 +715,15 @@ def _record_scope_errors(
 
     if record.schema_version != IntegrityIdentity.SCHEMA_VERSION:
         errors.append(f"{record.record_type} schema mismatch")
+    if (
+        isinstance(record, NixlCaptureRecord)
+        and record.fingerprint_algorithm is not session.fingerprint_algorithm
+    ):
+        errors.append("capture algorithm differs from its session")
+    if isinstance(record, NixlCaptureRecord) and record.stage not in _capture_stages(
+        session.mode
+    ):
+        errors.append("capture stage differs from its session mode")
     if record.run_id != session.run_id:
         errors.append(f"{record.record_type} run differs from its session")
     if record.transport_arm != session.transport_arm:
@@ -736,12 +772,7 @@ def _artifact_chronology_errors(
             child_records.setdefault(observer_key, []).append((index, record))
 
     errors: list[str] = []
-    ordered_stages = (
-        IntegrityStage.STAGING_RAW,
-        IntegrityStage.STAGING_FENCED_CONTROL,
-        IntegrityStage.DESTINATION,
-        IntegrityStage.PRE_READ,
-    )
+    ordered_stages = _capture_stages(artifact.session.mode)
     for observer_key, records in child_records.items():
         event_records = [
             (index, record)
@@ -1100,6 +1131,7 @@ def _capture_contract(
             if stage in (
                 IntegrityStage.STAGING_RAW,
                 IntegrityStage.STAGING_FENCED_CONTROL,
+                IntegrityStage.STAGING_POST_SCATTER,
             ):
                 copied_bytes += region.row_bytes
                 contracts = [(-1, IntegrityPayloadKind.WIRE)]
@@ -1145,6 +1177,13 @@ def _capture_contract(
                     if payload_kind is IntegrityPayloadKind.WIRE
                     else region.row_bytes // 2
                 )
+    if (
+        source_contract.fingerprint_algorithm
+        is LocalizationFingerprintAlgorithm.POSITION_WEIGHTED_WORDS_256_V1
+    ):
+        copied_bytes = len(keys) * localization_fingerprint_size(
+            source_contract.fingerprint_algorithm
+        )
     return keys, mapping, copied_bytes, hashed_bytes
 
 
@@ -1173,6 +1212,8 @@ def _capture_errors(
         or capture.source_rank != manifest.source_rank
         or capture.observer_engine_id != plan.observer_engine_id
         or capture.observer_rank != plan.observer_rank
+        or capture.fingerprint_algorithm is not manifest.fingerprint_algorithm
+        or source_contract.fingerprint_algorithm is not manifest.fingerprint_algorithm
     ):
         errors.append("capture lineage differs from plan or SOURCE_POST")
     keys, mapping, copied_bytes, hashed_bytes = _capture_contract(
@@ -1189,8 +1230,11 @@ def _capture_errors(
             compare_digests=compare_digests,
         )
     )
+    fingerprint_size = localization_fingerprint_size(capture.fingerprint_algorithm)
+    if any(len(leaf.digest) != fingerprint_size for leaf in capture.leaves):
+        errors.append("capture fingerprint length differs from its algorithm")
     if compare_digests is False and any(
-        leaf.digest != b"\x00" * 16 for leaf in capture.leaves
+        leaf.digest != b"\x00" * fingerprint_size for leaf in capture.leaves
     ):
         errors.append("sham capture contains a non-redacted digest")
     if capture.copied_bytes != copied_bytes:
@@ -1203,6 +1247,9 @@ def _capture_errors(
         IntegrityStage.STAGING_RAW: "nixl_done_without_added_device_wide_sync",
         IntegrityStage.STAGING_FENCED_CONTROL: (
             "device_synchronize_observer_control_not_gdr_flush"
+        ),
+        IntegrityStage.STAGING_POST_SCATTER: (
+            "post_scatter_device_synchronize_before_staging_release"
         ),
         IntegrityStage.DESTINATION: (
             "post_scatter_device_synchronize_before_publication"
@@ -1231,18 +1278,31 @@ def _first_divergence(
     :param compare_digests: Whether the arm carries content evidence.
     :returns: Earliest divergence, or ``None`` when all present stages match.
     """
-    ordered_edges = (
-        (
-            IntegrityStage.STAGING_RAW,
-            "source_post_reference_vs_staging_raw",
-        ),
-        (
-            IntegrityStage.STAGING_FENCED_CONTROL,
-            "staging_raw->staging_fenced_control",
-        ),
-        (IntegrityStage.DESTINATION, "staging_fenced_control->destination"),
-        (IntegrityStage.PRE_READ, "destination->pre_read"),
-    )
+    if (
+        source_contract.fingerprint_algorithm
+        is LocalizationFingerprintAlgorithm.POSITION_WEIGHTED_WORDS_256_V1
+    ):
+        ordered_edges = (
+            (
+                IntegrityStage.STAGING_POST_SCATTER,
+                "source_post_reference_vs_staging_post_scatter",
+            ),
+            (IntegrityStage.DESTINATION, "staging_post_scatter->destination"),
+            (IntegrityStage.PRE_READ, "destination->pre_read"),
+        )
+    else:
+        ordered_edges = (
+            (
+                IntegrityStage.STAGING_RAW,
+                "source_post_reference_vs_staging_raw",
+            ),
+            (
+                IntegrityStage.STAGING_FENCED_CONTROL,
+                "staging_raw->staging_fenced_control",
+            ),
+            (IntegrityStage.DESTINATION, "staging_fenced_control->destination"),
+            (IntegrityStage.PRE_READ, "destination->pre_read"),
+        )
     observer_key: ObserverKey = (
         plan.child_request_id,
         plan.observer_engine_id,
@@ -1330,10 +1390,22 @@ def validate_localization_artifacts(
             sessions[session_key] = artifact
         if (
             session.schema_version != IntegrityIdentity.SCHEMA_VERSION
+            or session.fingerprint_algorithm
+            is not reference_session.fingerprint_algorithm
             or session.run_id != reference_session.run_id
             or session.transport_arm != reference_session.transport_arm
             or session.mode is not reference_session.mode
             or session.mode is LocalizationMode.OFF
+            or (
+                session.mode is LocalizationMode.FINGERPRINT
+                and session.fingerprint_algorithm
+                is not LocalizationFingerprintAlgorithm.POSITION_WEIGHTED_WORDS_256_V1
+            )
+            or (
+                session.mode is not LocalizationMode.FINGERPRINT
+                and session.fingerprint_algorithm
+                is not LocalizationFingerprintAlgorithm.BLAKE2B_128
+            )
             or session.target_request_id != reference_session.target_request_id
             or len(session.target_request_id) == 0
             or localization_request_id_base(session.target_request_id)
@@ -1398,6 +1470,7 @@ def validate_localization_artifacts(
                 if record.stage not in (
                     IntegrityStage.STAGING_RAW,
                     IntegrityStage.STAGING_FENCED_CONTROL,
+                    IntegrityStage.STAGING_POST_SCATTER,
                     IntegrityStage.DESTINATION,
                     IntegrityStage.PRE_READ,
                 ):
@@ -1446,12 +1519,7 @@ def validate_localization_artifacts(
 
     divergences: list[LocalizationDivergence] = []
     verified_observers: set[ObserverKey] = set()
-    capture_stages = (
-        IntegrityStage.STAGING_RAW,
-        IntegrityStage.STAGING_FENCED_CONTROL,
-        IntegrityStage.DESTINATION,
-        IntegrityStage.PRE_READ,
-    )
+    capture_stages = _capture_stages(reference_session.mode)
     plan_groups: dict[tuple[str, str], dict[int, NixlPlanRecord]] = {}
     for observer_key, plan in plans.items():
         plan_groups.setdefault(observer_key[:2], {})[observer_key[2]] = plan
@@ -1519,7 +1587,7 @@ def validate_localization_artifacts(
                 source_contract,
                 manifest,
                 captures,
-                compare_digests=reference_session.mode is LocalizationMode.TRACE,
+                compare_digests=reference_session.mode is not LocalizationMode.SHAM,
             )
             if divergence is not None:
                 divergences.append(divergence)
@@ -1532,7 +1600,7 @@ def validate_localization_artifacts(
                             f"completed pull is missing capture {capture_key}"
                         )
                         plan_verified = False
-        if plan_verified and reference_session.mode is LocalizationMode.TRACE:
+        if plan_verified and reference_session.mode is not LocalizationMode.SHAM:
             verified_observers.add(observer_key)
 
     for capture_key in captures:

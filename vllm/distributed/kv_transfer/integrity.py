@@ -16,6 +16,7 @@ class IntegrityStage(StrEnum):
     SOURCE_POST = "source_post"
     STAGING_RAW = "staging_raw"
     STAGING_FENCED_CONTROL = "staging_fenced_control"
+    STAGING_POST_SCATTER = "staging_post_scatter"
     DESTINATION = "destination"
     PRE_READ = "pre_read"
 
@@ -58,7 +59,7 @@ class IntegrityIdentity:
     :ivar byte_length: Exact number of bytes covered by the digest.
     """
 
-    SCHEMA_VERSION: ClassVar[int] = 2
+    SCHEMA_VERSION: ClassVar[int] = 3
 
     run_id: str
     transport_arm: str

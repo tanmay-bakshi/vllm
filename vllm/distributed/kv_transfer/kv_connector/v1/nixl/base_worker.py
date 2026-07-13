@@ -13,6 +13,7 @@ import uuid
 from collections import defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Never, cast
 
 import msgspec
@@ -65,6 +66,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
     MambaConvSplitInfo,
     derive_mamba_conv_split,
 )
+from vllm.distributed.kv_transfer.nixl_fingerprint import NixlDeviceFingerprinter
 from vllm.distributed.kv_transfer.nixl_localization import (
     IntegrityLeafKey,
     LocalizationArtifactWriter,
@@ -79,6 +81,7 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlSourceManifest,
     NixlSourceManifestRecord,
     NixlSourceRoster,
+    build_fingerprint_leaf,
     build_integrity_identity,
     build_integrity_leaf,
     compute_semantic_contract_digest,
@@ -116,6 +119,16 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalizationLeafSpec:
+    """Canonical lineage and placement for one pending device fingerprint."""
+
+    identity: IntegrityIdentity
+    local_block_id: int | None
+    destination_half: int | None
+    rank_slot: int | None
 
 
 class NixlBaseConnectorWorker:
@@ -529,6 +542,11 @@ class NixlBaseConnectorWorker:
         self._region_tensors: list[torch.Tensor] = []
         self._region_descriptors: tuple[NixlRegionDescriptor, ...] = ()
         self._localization_config = NixlLocalizationConfig.from_environment()
+        self._localization_fingerprinter = (
+            NixlDeviceFingerprinter()
+            if self._localization_config.mode is LocalizationMode.FINGERPRINT
+            else None
+        )
         self._localization_writer = (
             LocalizationArtifactWriter(
                 self._localization_config,
@@ -2284,6 +2302,71 @@ class NixlBaseConnectorWorker:
             )
             self._localization_source_rosters[req_id] = physical_roster
 
+    def _localization_materialize_fingerprint_leaves(
+        self,
+        batches: list[torch.Tensor],
+        specs: list[_LocalizationLeafSpec],
+    ) -> tuple[NixlIntegrityLeaf, ...]:
+        """Copy compact device fingerprints and attach canonical metadata.
+
+        :param batches: Device fingerprint result inputs in leaf order.
+        :param specs: Canonical identity and placement in the same order.
+        :returns: Materialized localization leaves.
+        """
+        if self._localization_fingerprinter is None:
+            raise LocalizationError("fingerprint mode has no device fingerprinter")
+        fingerprints = self._localization_fingerprinter.fingerprints_to_digests(batches)
+        if len(fingerprints) != len(specs):
+            raise LocalizationError(
+                "device fingerprint cardinality differs from leaf metadata"
+            )
+        return tuple(
+            build_fingerprint_leaf(
+                identity=spec.identity,
+                fingerprint=fingerprint,
+                local_block_id=spec.local_block_id,
+                destination_half=spec.destination_half,
+                rank_slot=spec.rank_slot,
+            )
+            for spec, fingerprint in zip(specs, fingerprints, strict=True)
+        )
+
+    def _localization_fingerprint_rows(self, rows: torch.Tensor) -> torch.Tensor:
+        """Fingerprint one bounded payload batch without retaining its bytes.
+
+        :param rows: Contiguous two-dimensional byte payloads.
+        :returns: Compact device-resident fingerprint rows.
+        """
+        if self._localization_fingerprinter is None:
+            raise LocalizationError("fingerprint mode has no device fingerprinter")
+        return self._localization_fingerprinter.fingerprint_rows(rows)
+
+    @staticmethod
+    def _localization_leaf_mapping(
+        leaves: tuple[NixlIntegrityLeaf, ...],
+    ) -> dict[IntegrityLeafKey, tuple[int, int, int]]:
+        """Build the decoder placement map for materialized capture leaves.
+
+        :param leaves: Capture leaves with complete decoder placement metadata.
+        :returns: Source keys mapped to local block, rank slot, and destination half.
+        """
+        mapping: dict[IntegrityLeafKey, tuple[int, int, int]] = {}
+        for leaf in leaves:
+            if (
+                leaf.local_block_id is None
+                or leaf.rank_slot is None
+                or leaf.destination_half is None
+            ):
+                raise LocalizationError(
+                    "decoder capture leaf lacks complete placement metadata"
+                )
+            mapping[leaf_source_key(leaf)] = (
+                leaf.local_block_id,
+                leaf.rank_slot,
+                leaf.destination_half,
+            )
+        return mapping
+
     def _localization_capture_source_manifest(
         self,
         req_id: ReqId,
@@ -2324,6 +2407,11 @@ class NixlBaseConnectorWorker:
             for source_position, block_id in enumerate(group)
         ]
         leaves: list[NixlIntegrityLeaf] = []
+        fingerprint_batches: list[torch.Tensor] = []
+        fingerprint_specs: list[_LocalizationLeafSpec] = []
+        fingerprint_mode = (
+            self._localization_config.mode is LocalizationMode.FINGERPRINT
+        )
         copied_bytes = 0
         hashed_bytes = 0
         for region_index, rows in enumerate(self._region_rows):
@@ -2367,15 +2455,27 @@ class NixlBaseConnectorWorker:
                     device=rows.device,
                     dtype=torch.long,
                 )
-                host_rows = rows.index_select(0, indices).cpu().contiguous()
-                copied_bytes += len(chunk_positions) * row_bytes
+                selected_rows = rows.index_select(0, indices)
+                host_rows = (
+                    None if fingerprint_mode else selected_rows.cpu().contiguous()
+                )
+                if fingerprint_mode is False:
+                    copied_bytes += len(chunk_positions) * row_bytes
+                wire_specs: list[_LocalizationLeafSpec] = []
+                commit_specs: tuple[
+                    list[_LocalizationLeafSpec], list[_LocalizationLeafSpec]
+                ] = ([], [])
                 for row_index, (
                     group_index,
                     source_position,
                     block_id,
                     group_token_capacity,
                 ) in enumerate(chunk_positions):
-                    payload = memoryview(host_rows[row_index].numpy()).cast("B")
+                    payload = (
+                        None
+                        if host_rows is None
+                        else memoryview(host_rows[row_index].numpy()).cast("B")
+                    )
                     semantic_contract_digest = compute_semantic_contract_digest(
                         region=descriptor,
                         group_index=group_index,
@@ -2401,15 +2501,26 @@ class NixlBaseConnectorWorker:
                         payload_kind=IntegrityPayloadKind.WIRE,
                         byte_length=row_bytes,
                     )
-                    leaves.append(
-                        build_integrity_leaf(
-                            identity=wire_identity,
-                            payload=payload,
-                            local_block_id=None,
-                            destination_half=None,
-                            rank_slot=None,
+                    if fingerprint_mode:
+                        wire_specs.append(
+                            _LocalizationLeafSpec(
+                                identity=wire_identity,
+                                local_block_id=None,
+                                destination_half=None,
+                                rank_slot=None,
+                            )
                         )
-                    )
+                    else:
+                        assert payload is not None
+                        leaves.append(
+                            build_integrity_leaf(
+                                identity=wire_identity,
+                                payload=payload,
+                                local_block_id=None,
+                                destination_half=None,
+                                rank_slot=None,
+                            )
+                        )
                     hashed_bytes += row_bytes
                     commit_bytes = row_bytes // 2
                     for source_plane in (0, 1):
@@ -2432,24 +2543,61 @@ class NixlBaseConnectorWorker:
                             payload_kind=IntegrityPayloadKind.COMMIT,
                             byte_length=commit_bytes,
                         )
-                        plane_start = source_plane * commit_bytes
-                        leaves.append(
-                            build_integrity_leaf(
-                                identity=commit_identity,
-                                payload=payload[
-                                    plane_start : plane_start + commit_bytes
-                                ],
-                                local_block_id=None,
-                                destination_half=None,
-                                rank_slot=None,
+                        if fingerprint_mode:
+                            commit_specs[source_plane].append(
+                                _LocalizationLeafSpec(
+                                    identity=commit_identity,
+                                    local_block_id=None,
+                                    destination_half=None,
+                                    rank_slot=None,
+                                )
+                            )
+                        else:
+                            assert payload is not None
+                            plane_start = source_plane * commit_bytes
+                            leaves.append(
+                                build_integrity_leaf(
+                                    identity=commit_identity,
+                                    payload=payload[
+                                        plane_start : plane_start + commit_bytes
+                                    ],
+                                    local_block_id=None,
+                                    destination_half=None,
+                                    rank_slot=None,
+                                )
+                            )
+                        hashed_bytes += commit_bytes
+
+                if fingerprint_mode:
+                    fingerprint_batches.append(
+                        self._localization_fingerprint_rows(selected_rows)
+                    )
+                    fingerprint_specs.extend(wire_specs)
+                    commit_rows = selected_rows.view(
+                        len(chunk_positions), 2, row_bytes // 2
+                    )
+                    for source_plane in (0, 1):
+                        fingerprint_batches.append(
+                            self._localization_fingerprint_rows(
+                                commit_rows[:, source_plane, :].contiguous()
                             )
                         )
-                        hashed_bytes += commit_bytes
+                        fingerprint_specs.extend(commit_specs[source_plane])
+
+        if fingerprint_mode:
+            leaves.extend(
+                self._localization_materialize_fingerprint_leaves(
+                    fingerprint_batches,
+                    fingerprint_specs,
+                )
+            )
+            copied_bytes = len(leaves) * 32
 
         duration_ns = time.perf_counter_ns() - start_ns
         manifest = seal_source_manifest(
             NixlSourceManifest(
                 schema_version=IntegrityIdentity.SCHEMA_VERSION,
+                fingerprint_algorithm=self._localization_config.fingerprint_algorithm,
                 run_id=self._localization_config.run_id,
                 transport_arm=self._localization_config.transport_arm,
                 producer_engine_id=self.engine_id,
@@ -2550,11 +2698,11 @@ class NixlBaseConnectorWorker:
         stage: IntegrityStage,
         barrier: str,
     ) -> None:
-        """Capture staged source rows before scatter with bounded host copies.
+        """Capture staged source rows at one configured transfer checkpoint.
 
         :param req_id: Decoder child request identifier.
         :param ownership: Sealed coalesced transfer and placement owner.
-        :param stage: Raw or fenced staging checkpoint.
+        :param stage: Staging checkpoint being observed.
         :param barrier: Exact observer ordering applied before the capture.
         """
         if self._localization_config.enabled_for(req_id) is False:
@@ -2568,6 +2716,9 @@ class NixlBaseConnectorWorker:
         n_ranks = int(plan["n_ranks"])
         if len(contracts) != n_ranks:
             raise LocalizationError(f"staging capture lacks contracts for {req_id}")
+        fingerprint_mode = (
+            self._localization_config.mode is LocalizationMode.FINGERPRINT
+        )
         for rank_index, source_rank in enumerate(plan["source_ranks"]):
             start_ns = time.perf_counter_ns()
             contract = contracts[rank_index]
@@ -2575,6 +2726,8 @@ class NixlBaseConnectorWorker:
                 raise LocalizationError("staging contract rank order differs")
             rank_slot = int(plan["slots"][rank_index])
             leaves: list[NixlIntegrityLeaf] = []
+            fingerprint_batches: list[torch.Tensor] = []
+            fingerprint_specs: list[_LocalizationLeafSpec] = []
             mapping: dict[IntegrityLeafKey, tuple[int, int, int]] = {}
             copied_bytes = 0
             hashed_bytes = 0
@@ -2604,18 +2757,25 @@ class NixlBaseConnectorWorker:
                         device=region.device,
                         dtype=torch.long,
                     )
-                    host_rows = (
-                        region.index_select(
-                            0,
-                            selected_tensor,
-                        )
-                        .cpu()
-                        .contiguous()
+                    selected_rows = region.index_select(
+                        0,
+                        selected_tensor,
                     )
-                    copied_bytes += len(selected) * row_bytes
+                    host_rows = (
+                        None if fingerprint_mode else selected_rows.cpu().contiguous()
+                    )
+                    if fingerprint_mode is False:
+                        copied_bytes += len(selected) * row_bytes
+                    wire_specs: list[_LocalizationLeafSpec] = []
+                    commit_specs: list[_LocalizationLeafSpec] = []
+                    commit_row_indices: list[int] = []
                     for row_index, position_index in enumerate(selected):
                         position = positions[position_index]
-                        payload = memoryview(host_rows[row_index].numpy()).cast("B")
+                        payload = (
+                            None
+                            if host_rows is None
+                            else memoryview(host_rows[row_index].numpy()).cast("B")
+                        )
                         semantic_contract_digest = compute_semantic_contract_digest(
                             region=contract.regions[region_index],
                             group_index=int(position.group_index),
@@ -2643,19 +2803,30 @@ class NixlBaseConnectorWorker:
                             payload_kind=IntegrityPayloadKind.WIRE,
                             byte_length=row_bytes,
                         )
-                        wire_leaf = build_integrity_leaf(
-                            identity=wire_identity,
-                            payload=payload,
-                            local_block_id=int(position.local_block_id),
-                            destination_half=int(position.plane_index),
-                            rank_slot=rank_slot,
-                        )
-                        leaves.append(wire_leaf)
-                        mapping[leaf_source_key(wire_leaf)] = (
-                            int(position.local_block_id),
-                            rank_slot,
-                            int(position.plane_index),
-                        )
+                        if fingerprint_mode:
+                            wire_specs.append(
+                                _LocalizationLeafSpec(
+                                    identity=wire_identity,
+                                    local_block_id=int(position.local_block_id),
+                                    destination_half=int(position.plane_index),
+                                    rank_slot=rank_slot,
+                                )
+                            )
+                        else:
+                            assert payload is not None
+                            wire_leaf = build_integrity_leaf(
+                                identity=wire_identity,
+                                payload=payload,
+                                local_block_id=int(position.local_block_id),
+                                destination_half=int(position.plane_index),
+                                rank_slot=rank_slot,
+                            )
+                            leaves.append(wire_leaf)
+                            mapping[leaf_source_key(wire_leaf)] = (
+                                int(position.local_block_id),
+                                rank_slot,
+                                int(position.plane_index),
+                            )
                         hashed_bytes += row_bytes
                         if int(position.plane_index) < 0:
                             continue
@@ -2679,20 +2850,59 @@ class NixlBaseConnectorWorker:
                             payload_kind=IntegrityPayloadKind.COMMIT,
                             byte_length=commit_bytes,
                         )
-                        commit_leaf = build_integrity_leaf(
-                            identity=commit_identity,
-                            payload=payload[:commit_bytes],
-                            local_block_id=int(position.local_block_id),
-                            destination_half=int(position.plane_index),
-                            rank_slot=rank_slot,
-                        )
-                        leaves.append(commit_leaf)
-                        mapping[leaf_source_key(commit_leaf)] = (
-                            int(position.local_block_id),
-                            rank_slot,
-                            int(position.plane_index),
-                        )
+                        if fingerprint_mode:
+                            commit_specs.append(
+                                _LocalizationLeafSpec(
+                                    identity=commit_identity,
+                                    local_block_id=int(position.local_block_id),
+                                    destination_half=int(position.plane_index),
+                                    rank_slot=rank_slot,
+                                )
+                            )
+                            commit_row_indices.append(row_index)
+                        else:
+                            assert payload is not None
+                            commit_leaf = build_integrity_leaf(
+                                identity=commit_identity,
+                                payload=payload[:commit_bytes],
+                                local_block_id=int(position.local_block_id),
+                                destination_half=int(position.plane_index),
+                                rank_slot=rank_slot,
+                            )
+                            leaves.append(commit_leaf)
+                            mapping[leaf_source_key(commit_leaf)] = (
+                                int(position.local_block_id),
+                                rank_slot,
+                                int(position.plane_index),
+                            )
                         hashed_bytes += commit_bytes
+                    if fingerprint_mode:
+                        fingerprint_batches.append(
+                            self._localization_fingerprint_rows(selected_rows)
+                        )
+                        fingerprint_specs.extend(wire_specs)
+                        if len(commit_specs) > 0:
+                            commit_indices = torch.tensor(
+                                commit_row_indices,
+                                device=selected_rows.device,
+                                dtype=torch.long,
+                            )
+                            fingerprint_batches.append(
+                                self._localization_fingerprint_rows(
+                                    selected_rows.index_select(0, commit_indices)[
+                                        :, : row_bytes // 2
+                                    ].contiguous()
+                                )
+                            )
+                            fingerprint_specs.extend(commit_specs)
+            if fingerprint_mode:
+                materialized = self._localization_materialize_fingerprint_leaves(
+                    fingerprint_batches,
+                    fingerprint_specs,
+                )
+                leaves.extend(materialized)
+                copied_bytes = len(leaves) * 32
+                mapping = self._localization_leaf_mapping(materialized)
             self._localization_finish_capture(
                 req_id=req_id,
                 contract=contract,
@@ -2728,6 +2938,9 @@ class NixlBaseConnectorWorker:
         n_ranks = int(plan["n_ranks"])
         if len(contracts) != n_ranks:
             raise LocalizationError(f"destination capture lacks contracts for {req_id}")
+        fingerprint_mode = (
+            self._localization_config.mode is LocalizationMode.FINGERPRINT
+        )
         for rank_index, source_rank in enumerate(plan["source_ranks"]):
             start_ns = time.perf_counter_ns()
             contract = contracts[rank_index]
@@ -2735,6 +2948,8 @@ class NixlBaseConnectorWorker:
                 raise LocalizationError("destination contract rank order differs")
             rank_slot = int(plan["slots"][rank_index])
             leaves: list[NixlIntegrityLeaf] = []
+            fingerprint_batches: list[torch.Tensor] = []
+            fingerprint_specs: list[_LocalizationLeafSpec] = []
             mapping: dict[IntegrityLeafKey, tuple[int, int, int]] = {}
             copied_bytes = 0
             hashed_bytes = 0
@@ -2766,16 +2981,22 @@ class NixlBaseConnectorWorker:
                         device=flat.device,
                         dtype=torch.long,
                     )
-                    host_rows = (
+                    selected_rows = (
                         destination[local_indices, :, rank_slot, :]
                         .contiguous()
                         .view(len(selected), row_bytes)
-                        .cpu()
                     )
-                    copied_bytes += len(selected) * row_bytes
+                    host_rows = None if fingerprint_mode else selected_rows.cpu()
+                    if fingerprint_mode is False:
+                        copied_bytes += len(selected) * row_bytes
+                    batch_specs: list[_LocalizationLeafSpec] = []
                     for row_index, position_index in enumerate(selected):
                         position = positions[position_index]
-                        payload = memoryview(host_rows[row_index].numpy()).cast("B")
+                        payload = (
+                            None
+                            if host_rows is None
+                            else memoryview(host_rows[row_index].numpy()).cast("B")
+                        )
                         semantic_contract_digest = compute_semantic_contract_digest(
                             region=contract.regions[region_index],
                             group_index=int(position.group_index),
@@ -2803,20 +3024,36 @@ class NixlBaseConnectorWorker:
                             payload_kind=IntegrityPayloadKind.WIRE,
                             byte_length=row_bytes,
                         )
-                        leaf = build_integrity_leaf(
-                            identity=identity,
-                            payload=payload,
-                            local_block_id=int(position.local_block_id),
-                            destination_half=-1,
-                            rank_slot=rank_slot,
-                        )
-                        leaves.append(leaf)
-                        mapping[leaf_source_key(leaf)] = (
-                            int(position.local_block_id),
-                            rank_slot,
-                            -1,
-                        )
+                        if fingerprint_mode:
+                            batch_specs.append(
+                                _LocalizationLeafSpec(
+                                    identity=identity,
+                                    local_block_id=int(position.local_block_id),
+                                    destination_half=-1,
+                                    rank_slot=rank_slot,
+                                )
+                            )
+                        else:
+                            assert payload is not None
+                            leaf = build_integrity_leaf(
+                                identity=identity,
+                                payload=payload,
+                                local_block_id=int(position.local_block_id),
+                                destination_half=-1,
+                                rank_slot=rank_slot,
+                            )
+                            leaves.append(leaf)
+                            mapping[leaf_source_key(leaf)] = (
+                                int(position.local_block_id),
+                                rank_slot,
+                                -1,
+                            )
                         hashed_bytes += row_bytes
+                    if fingerprint_mode:
+                        fingerprint_batches.append(
+                            self._localization_fingerprint_rows(selected_rows)
+                        )
+                        fingerprint_specs.extend(batch_specs)
 
                 single_rows_per_chunk = max(
                     1,
@@ -2841,20 +3078,23 @@ class NixlBaseConnectorWorker:
                         device=flat.device,
                         dtype=torch.long,
                     )
-                    host_rows = (
-                        destination_single[
-                            local_indices,
-                            rank_slot,
-                            destination_halves,
-                            :,
-                        ]
-                        .contiguous()
-                        .cpu()
-                    )
-                    copied_bytes += len(selected) * chunk_bytes
+                    selected_rows = destination_single[
+                        local_indices,
+                        rank_slot,
+                        destination_halves,
+                        :,
+                    ].contiguous()
+                    host_rows = None if fingerprint_mode else selected_rows.cpu()
+                    if fingerprint_mode is False:
+                        copied_bytes += len(selected) * chunk_bytes
+                    batch_specs = []
                     for row_index, position_index in enumerate(selected):
                         position = positions[position_index]
-                        payload = memoryview(host_rows[row_index].numpy()).cast("B")
+                        payload = (
+                            None
+                            if host_rows is None
+                            else memoryview(host_rows[row_index].numpy()).cast("B")
+                        )
                         semantic_contract_digest = compute_semantic_contract_digest(
                             region=contract.regions[region_index],
                             group_index=int(position.group_index),
@@ -2882,20 +3122,44 @@ class NixlBaseConnectorWorker:
                             payload_kind=IntegrityPayloadKind.COMMIT,
                             byte_length=chunk_bytes,
                         )
-                        leaf = build_integrity_leaf(
-                            identity=identity,
-                            payload=payload,
-                            local_block_id=int(position.local_block_id),
-                            destination_half=int(position.plane_index),
-                            rank_slot=rank_slot,
-                        )
-                        leaves.append(leaf)
-                        mapping[leaf_source_key(leaf)] = (
-                            int(position.local_block_id),
-                            rank_slot,
-                            int(position.plane_index),
-                        )
+                        if fingerprint_mode:
+                            batch_specs.append(
+                                _LocalizationLeafSpec(
+                                    identity=identity,
+                                    local_block_id=int(position.local_block_id),
+                                    destination_half=int(position.plane_index),
+                                    rank_slot=rank_slot,
+                                )
+                            )
+                        else:
+                            assert payload is not None
+                            leaf = build_integrity_leaf(
+                                identity=identity,
+                                payload=payload,
+                                local_block_id=int(position.local_block_id),
+                                destination_half=int(position.plane_index),
+                                rank_slot=rank_slot,
+                            )
+                            leaves.append(leaf)
+                            mapping[leaf_source_key(leaf)] = (
+                                int(position.local_block_id),
+                                rank_slot,
+                                int(position.plane_index),
+                            )
                         hashed_bytes += chunk_bytes
+                    if fingerprint_mode:
+                        fingerprint_batches.append(
+                            self._localization_fingerprint_rows(selected_rows)
+                        )
+                        fingerprint_specs.extend(batch_specs)
+            if fingerprint_mode:
+                materialized = self._localization_materialize_fingerprint_leaves(
+                    fingerprint_batches,
+                    fingerprint_specs,
+                )
+                leaves.extend(materialized)
+                copied_bytes = len(leaves) * 32
+                mapping = self._localization_leaf_mapping(materialized)
             self._localization_finish_capture(
                 req_id=req_id,
                 contract=contract,
@@ -2934,6 +3198,7 @@ class NixlBaseConnectorWorker:
             NixlCaptureRecord(
                 record_type=NixlCaptureRecord.RECORD_TYPE,
                 schema_version=contract.schema_version,
+                fingerprint_algorithm=contract.fingerprint_algorithm,
                 stage=stage,
                 run_id=contract.run_id,
                 transport_arm=contract.transport_arm,
@@ -3406,10 +3671,15 @@ class NixlBaseConnectorWorker:
         plan.begin_device_read()
         scatter_error: BaseException | None = None
         scatter_traceback: str | None = None
+        observation_error: BaseException | None = None
+        observation_traceback: str | None = None
         try:
             assert self._staging_buf is not None
             assert self._region_rows is not None
-            if self._localization_config.enabled_for(req_id):
+            if (
+                self._localization_config.enabled_for(req_id)
+                and self._localization_config.mode is not LocalizationMode.FINGERPRINT
+            ):
                 self._localization_capture_staging(
                     req_id,
                     plan,
@@ -3486,6 +3756,44 @@ class NixlBaseConnectorWorker:
                 reason,
                 error,
             )
+        if (
+            scatter_error is None
+            and self._localization_config.enabled_for(req_id)
+            and self._localization_config.mode is LocalizationMode.FINGERPRINT
+        ):
+            try:
+                self._localization_capture_staging(
+                    req_id,
+                    plan,
+                    IntegrityStage.STAGING_POST_SCATTER,
+                    "post_scatter_device_synchronize_before_staging_release",
+                )
+                self._localization_capture_destination(
+                    req_id,
+                    geometry,
+                    IntegrityStage.DESTINATION,
+                    "post_scatter_device_synchronize_before_publication",
+                )
+                self._localization_pre_read_plans[req_id] = geometry
+            except Exception as error:
+                observation_error = error
+                observation_traceback = traceback.format_exc()
+
+            try:
+                torch.cuda.synchronize()
+            except Exception as error:
+                stacktrace = traceback.format_exc()
+                reason = (
+                    "device synchronization failed after localization readers "
+                    "began\n" + stacktrace
+                )
+                plan.tombstone(reason)
+                self._fail_coalesced_plan(
+                    plan,
+                    reason,
+                    error,
+                )
+
         plan.mark_device_quiescent()
 
         if scatter_error is not None:
@@ -3500,8 +3808,20 @@ class NixlBaseConnectorWorker:
                 "coalesced staging scatter failed before scheduler publication"
             ) from scatter_error
 
+        if observation_error is not None:
+            assert observation_traceback is not None
+            plan.fail("post-scatter observation failed before publication")
+            self._release_coalesced_plan(plan)
+            raise StagingSafetyError(
+                "post-scatter observation failed before publication\n"
+                + observation_traceback
+            ) from observation_error
+
         try:
-            if self._localization_config.enabled_for(req_id):
+            if (
+                self._localization_config.enabled_for(req_id)
+                and self._localization_config.mode is not LocalizationMode.FINGERPRINT
+            ):
                 self._localization_capture_destination(
                     req_id,
                     geometry,

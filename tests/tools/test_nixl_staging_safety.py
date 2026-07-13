@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from vllm.distributed.kv_transfer.nixl_localization import LocalizationMode
 from vllm.distributed.kv_transfer.staging_ownership import (
     CoalescedStagingPlan,
     HandleState,
@@ -73,8 +74,10 @@ def _production_worker_methods(
         "IntegrityStage": SimpleNamespace(
             STAGING_RAW="staging_raw",
             STAGING_FENCED_CONTROL="staging_fenced_control",
+            STAGING_POST_SCATTER="staging_post_scatter",
             DESTINATION="destination",
         ),
+        "LocalizationMode": LocalizationMode,
         "Never": Never,
         "ReqId": str,
         "StagingSafetyError": StagingSafetyError,
@@ -275,6 +278,58 @@ def test_production_sync_failure_keeps_owned_generation() -> None:
     assert allocator.require_active(plan.lease.generation) is plan
     assert plan.permanently_tombstoned
     assert plan.device_quiescent is False
+
+
+def test_fingerprint_observation_finishes_before_staging_release() -> None:
+    events: list[str] = []
+    torch_module = MagicMock()
+    torch_module.cuda.synchronize.side_effect = lambda: events.append("sync")
+    worker_type = _production_worker_methods(
+        "_coalesced_scatter",
+        torch_module=torch_module,
+    )
+    _, plan = _plan(
+        statuses=("DONE",),
+        scatter={
+            "lpos": (),
+            "n_pos": 0,
+            "n_ranks": 1,
+            "slots": (0,),
+            "blens": (),
+            "region_off": (),
+        },
+    )
+    worker = worker_type()
+    worker._coalesce_plans = {plan.request_id: plan}
+    worker._staging_buf = MagicMock(device="cuda:0")
+    worker._region_rows = []
+    worker._audit_enabled = False
+    worker._localization_pre_read_plans = {}
+    worker._localization_config = MagicMock()
+    worker._localization_config.enabled_for.return_value = True
+    worker._localization_config.mode = LocalizationMode.FINGERPRINT
+
+    def capture_staging(*args: object) -> None:
+        assert plan.device_quiescent is False
+        events.append("staging")
+
+    def capture_destination(*args: object) -> None:
+        assert plan.device_quiescent is False
+        events.append("destination")
+
+    def release(completed: CoalescedStagingPlan) -> None:
+        assert completed is plan
+        assert plan.device_quiescent
+        events.append("release")
+
+    worker._localization_capture_staging = capture_staging
+    worker._localization_capture_destination = capture_destination
+    worker._release_coalesced_plan = release
+
+    worker._coalesced_scatter(plan.request_id)
+
+    assert events == ["sync", "staging", "destination", "sync", "release"]
+    assert worker._localization_pre_read_plans == {plan.request_id: plan.scatter}
 
 
 def test_unresolved_shutdown_and_cleanup_touch_no_native_resources() -> None:

@@ -44,7 +44,30 @@ class LocalizationMode(StrEnum):
 
     OFF = "off"
     TRACE = "trace"
+    FINGERPRINT = "fingerprint"
     SHAM = "sham"
+
+
+class LocalizationFingerprintAlgorithm(StrEnum):
+    """Payload evidence algorithm recorded by localization artifacts."""
+
+    BLAKE2B_128 = "blake2b-128"
+    POSITION_WEIGHTED_WORDS_256_V1 = "position-weighted-words-256-v1"
+
+
+def localization_fingerprint_size(
+    algorithm: LocalizationFingerprintAlgorithm,
+) -> int:
+    """Return the encoded payload evidence size.
+
+    :param algorithm: Payload evidence algorithm.
+    :returns: Encoded fingerprint size in bytes.
+    """
+    if algorithm is LocalizationFingerprintAlgorithm.BLAKE2B_128:
+        return 16
+    if algorithm is LocalizationFingerprintAlgorithm.POSITION_WEIGHTED_WORDS_256_V1:
+        return 32
+    raise ValueError(f"unsupported localization fingerprint algorithm: {algorithm}")
 
 
 class LocalizationError(RuntimeError):
@@ -68,13 +91,13 @@ def localization_request_id_base(request_id: str) -> str:
 class NixlLocalizationConfig:
     """Validated process configuration for localization diagnostics.
 
-    :ivar mode: Trace, sham observer-control, or disabled mode.
+    :ivar mode: Exact diagnostic observation mode.
     :ivar run_id: Identifier shared by producer and decoder processes.
     :ivar transport_arm: Human-readable transport configuration.
     :ivar target_request_id: Exact stable request identifier to observe before
         vLLM appends its per-engine random suffix.
     :ivar artifact_dir: Directory receiving framed MessagePack artifacts.
-    :ivar copy_chunk_bytes: Upper bound for one device-to-host observer copy.
+    :ivar copy_chunk_bytes: Upper bound for one materialized payload chunk.
     :ivar strict_zero_byte: Whether non-evidentiary zero-byte hits fail the request.
     """
 
@@ -115,6 +138,16 @@ class NixlLocalizationConfig:
             self.enabled
             and localization_request_id_base(request_id) == self.target_request_id
         )
+
+    @property
+    def fingerprint_algorithm(self) -> LocalizationFingerprintAlgorithm:
+        """Return the payload evidence algorithm selected by this mode.
+
+        :returns: Exact algorithm recorded in every process artifact.
+        """
+        if self.mode is LocalizationMode.FINGERPRINT:
+            return LocalizationFingerprintAlgorithm.POSITION_WEIGHTED_WORDS_256_V1
+        return LocalizationFingerprintAlgorithm.BLAKE2B_128
 
     @classmethod
     def from_environment(cls) -> "NixlLocalizationConfig":
@@ -229,6 +262,7 @@ class NixlSourceContract(msgspec.Struct, array_like=True, frozen=True):
     """Content-free identity and geometry of one producer-rank transfer."""
 
     schema_version: int
+    fingerprint_algorithm: LocalizationFingerprintAlgorithm
     run_id: str
     transport_arm: str
     producer_engine_id: str
@@ -249,6 +283,7 @@ class NixlSourceManifest(msgspec.Struct, array_like=True, frozen=True):
     """One producer-rank snapshot taken after a completed remote read."""
 
     schema_version: int
+    fingerprint_algorithm: LocalizationFingerprintAlgorithm
     run_id: str
     transport_arm: str
     producer_engine_id: str
@@ -290,6 +325,7 @@ class NixlCaptureRecord(msgspec.Struct, array_like=True, frozen=True):
 
     record_type: str
     schema_version: int
+    fingerprint_algorithm: LocalizationFingerprintAlgorithm
     stage: IntegrityStage
     run_id: str
     transport_arm: str
@@ -343,6 +379,7 @@ class NixlSessionRecord(msgspec.Struct, array_like=True, frozen=True):
 
     record_type: str
     schema_version: int
+    fingerprint_algorithm: LocalizationFingerprintAlgorithm
     run_id: str
     transport_arm: str
     mode: LocalizationMode
@@ -464,6 +501,7 @@ class LocalizationArtifactWriter:
             NixlSessionRecord(
                 record_type=NixlSessionRecord.RECORD_TYPE,
                 schema_version=IntegrityIdentity.SCHEMA_VERSION,
+                fingerprint_algorithm=config.fingerprint_algorithm,
                 run_id=config.run_id,
                 transport_arm=config.transport_arm,
                 mode=config.mode,
@@ -524,13 +562,15 @@ class LocalizationArtifactWriter:
                     rank_slot=leaf.rank_slot,
                     payload_kind=leaf.payload_kind,
                     byte_length=leaf.byte_length,
-                    digest=b"\x00" * 16,
+                    digest=b"\x00"
+                    * localization_fingerprint_size(record.fingerprint_algorithm),
                 )
                 for leaf in record.leaves
             )
             artifact_record = NixlCaptureRecord(
                 record_type=record.record_type,
                 schema_version=record.schema_version,
+                fingerprint_algorithm=record.fingerprint_algorithm,
                 stage=record.stage,
                 run_id=record.run_id,
                 transport_arm=record.transport_arm,
@@ -709,6 +749,7 @@ def compute_source_manifest_digest(manifest: NixlSourceManifest) -> bytes:
     payload = msgspec.msgpack.encode(
         (
             manifest.schema_version,
+            manifest.fingerprint_algorithm.value,
             manifest.run_id,
             manifest.transport_arm,
             manifest.producer_engine_id,
@@ -745,6 +786,7 @@ def seal_source_manifest(manifest: NixlSourceManifest) -> NixlSourceManifest:
     """
     return NixlSourceManifest(
         schema_version=manifest.schema_version,
+        fingerprint_algorithm=manifest.fingerprint_algorithm,
         run_id=manifest.run_id,
         transport_arm=manifest.transport_arm,
         producer_engine_id=manifest.producer_engine_id,
@@ -778,6 +820,7 @@ def source_contract_from_manifest(
     """
     return NixlSourceContract(
         schema_version=manifest.schema_version,
+        fingerprint_algorithm=manifest.fingerprint_algorithm,
         run_id=manifest.run_id,
         transport_arm=manifest.transport_arm,
         producer_engine_id=manifest.producer_engine_id,
@@ -825,6 +868,44 @@ def build_integrity_leaf(
     )
 
 
+def build_fingerprint_leaf(
+    *,
+    identity: IntegrityIdentity,
+    fingerprint: bytes,
+    local_block_id: int | None,
+    destination_half: int | None,
+    rank_slot: int | None,
+) -> NixlIntegrityLeaf:
+    """Attach a device-computed payload fingerprint to canonical lineage.
+
+    :param identity: Stage-independent payload identity.
+    :param fingerprint: Position-sensitive noncryptographic fingerprint.
+    :param local_block_id: Consumer-local destination block, if any.
+    :param destination_half: Consumer-local destination half, if any.
+    :param rank_slot: Consumer-local source-rank slot, if any.
+    :returns: Compact integrity leaf.
+    :raises ValueError: If the fingerprint is not 256 bits.
+    """
+    if len(fingerprint) != 32:
+        raise ValueError("device payload fingerprint must contain exactly 256 bits")
+    return NixlIntegrityLeaf(
+        region_index=identity.region_index,
+        group_index=identity.group_index,
+        source_position=identity.source_position,
+        remote_block_id=identity.remote_block_id,
+        valid_token_extent=identity.valid_token_extent,
+        group_token_capacity=identity.group_token_capacity,
+        semantic_contract_digest=identity.semantic_contract_digest,
+        local_block_id=local_block_id,
+        plane_index=identity.plane_index,
+        destination_half=destination_half,
+        rank_slot=rank_slot,
+        payload_kind=identity.payload_kind,
+        byte_length=identity.byte_length,
+        digest=fingerprint,
+    )
+
+
 def leaf_source_key(leaf: NixlIntegrityLeaf) -> IntegrityLeafKey:
     """Return a stage-independent key for one leaf.
 
@@ -862,6 +943,7 @@ def select_source_manifest(
     return seal_source_manifest(
         NixlSourceManifest(
             schema_version=manifest.schema_version,
+            fingerprint_algorithm=manifest.fingerprint_algorithm,
             run_id=manifest.run_id,
             transport_arm=manifest.transport_arm,
             producer_engine_id=manifest.producer_engine_id,
@@ -897,6 +979,11 @@ def validate_source_contract_structure(
     errors: list[str] = []
     if contract.schema_version != IntegrityIdentity.SCHEMA_VERSION:
         errors.append("source contract schema mismatch")
+    if contract.fingerprint_algorithm not in (
+        LocalizationFingerprintAlgorithm.BLAKE2B_128,
+        LocalizationFingerprintAlgorithm.POSITION_WEIGHTED_WORDS_256_V1,
+    ):
+        errors.append("source contract fingerprint algorithm is unsupported")
     if (
         len(contract.run_id) == 0
         or len(contract.transport_arm) == 0
@@ -1055,7 +1142,15 @@ def validate_source_manifest_structure(
                     )
                     expected_keys.add(key)
                     expected_lengths[key] = byte_length
-                expected_copied_bytes += region.row_bytes
+                if (
+                    manifest.fingerprint_algorithm
+                    is LocalizationFingerprintAlgorithm.BLAKE2B_128
+                ):
+                    expected_copied_bytes += region.row_bytes
+                else:
+                    expected_copied_bytes += 3 * localization_fingerprint_size(
+                        manifest.fingerprint_algorithm
+                    )
                 expected_hashed_bytes += 2 * region.row_bytes
 
     actual = {leaf_source_key(leaf): leaf for leaf in manifest.leaves}
@@ -1065,7 +1160,9 @@ def validate_source_manifest_structure(
         leaf = actual[key]
         if leaf.byte_length != expected_lengths[key]:
             errors.append(f"source leaf length mismatch {key}")
-        if len(leaf.digest) != 16:
+        if len(leaf.digest) != localization_fingerprint_size(
+            manifest.fingerprint_algorithm
+        ):
             errors.append(f"source leaf digest length mismatch {key}")
         if len(leaf.semantic_contract_digest) != 32:
             errors.append(f"source semantic contract digest length mismatch {key}")

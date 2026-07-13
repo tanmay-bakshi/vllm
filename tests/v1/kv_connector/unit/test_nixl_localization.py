@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests for authoritative P-to-D localization artifacts."""
 
+import hashlib
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -30,6 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpe
 from vllm.distributed.kv_transfer.nixl_localization import (
     LocalizationArtifactWriter,
     LocalizationError,
+    LocalizationFingerprintAlgorithm,
     LocalizationMode,
     NixlCaptureRecord,
     NixlEventRecord,
@@ -42,9 +44,11 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlSourceManifest,
     NixlSourceManifestRecord,
     NixlSourceRoster,
+    build_fingerprint_leaf,
     build_integrity_identity,
     build_integrity_leaf,
     compute_semantic_contract_digest,
+    localization_fingerprint_size,
     seal_source_manifest,
     source_contract_from_manifest,
     validate_source_contract_structure,
@@ -236,11 +240,14 @@ def _manifest(
     )
     leaves: list[NixlIntegrityLeaf] = []
     for source_position, block_id in enumerate(blocks):
-        payload = bytes((block_id + offset) % 256 for offset in range(8))
+        payload = bytes(
+            (block_id + offset) % 256 for offset in range(source_region.row_bytes)
+        )
+        commit_bytes = source_region.row_bytes // 2
         for plane_index, payload_kind, plane_payload in (
             (-1, IntegrityPayloadKind.WIRE, payload),
-            (0, IntegrityPayloadKind.COMMIT, payload[:4]),
-            (1, IntegrityPayloadKind.COMMIT, payload[4:]),
+            (0, IntegrityPayloadKind.COMMIT, payload[:commit_bytes]),
+            (1, IntegrityPayloadKind.COMMIT, payload[commit_bytes:]),
         ):
             identity = build_integrity_identity(
                 config=config,
@@ -261,18 +268,35 @@ def _manifest(
                 payload_kind=payload_kind,
                 byte_length=len(plane_payload),
             )
-            leaves.append(
-                build_integrity_leaf(
-                    identity=identity,
-                    payload=plane_payload,
-                    local_block_id=None,
-                    destination_half=None,
-                    rank_slot=None,
+            if config.mode is LocalizationMode.FINGERPRINT:
+                leaves.append(
+                    build_fingerprint_leaf(
+                        identity=identity,
+                        fingerprint=hashlib.sha256(plane_payload).digest(),
+                        local_block_id=None,
+                        destination_half=None,
+                        rank_slot=None,
+                    )
                 )
-            )
+            else:
+                leaves.append(
+                    build_integrity_leaf(
+                        identity=identity,
+                        payload=plane_payload,
+                        local_block_id=None,
+                        destination_half=None,
+                        rank_slot=None,
+                    )
+                )
+    copied_bytes = len(blocks) * source_region.row_bytes
+    if config.mode is LocalizationMode.FINGERPRINT:
+        copied_bytes = len(leaves) * localization_fingerprint_size(
+            config.fingerprint_algorithm
+        )
     return seal_source_manifest(
         NixlSourceManifest(
             schema_version=IntegrityIdentity.SCHEMA_VERSION,
+            fingerprint_algorithm=config.fingerprint_algorithm,
             run_id=config.run_id,
             transport_arm=config.transport_arm,
             producer_engine_id="prefill",
@@ -281,15 +305,15 @@ def _manifest(
             offer_generation=1,
             iteration=0,
             source_rank=source_rank,
-            region_lengths=(8,),
+            region_lengths=(source_region.row_bytes,),
             regions=(source_region,),
             source_group_planes=(source_planes,),
             valid_token_extent=100,
             group_token_capacities=(64,),
             block_ids=(blocks,),
             observer=True,
-            copied_bytes=len(blocks) * 8,
-            hashed_bytes=len(blocks) * 16,
+            copied_bytes=copied_bytes,
+            hashed_bytes=len(blocks) * 2 * source_region.row_bytes,
             duration_ns=1000,
             manifest_digest=b"",
             leaves=tuple(leaves),
@@ -448,14 +472,26 @@ def _capture(
         IntegrityStage.STAGING_FENCED_CONTROL: (
             "device_synchronize_observer_control_not_gdr_flush"
         ),
+        IntegrityStage.STAGING_POST_SCATTER: (
+            "post_scatter_device_synchronize_before_staging_release"
+        ),
         IntegrityStage.DESTINATION: (
             "post_scatter_device_synchronize_before_publication"
         ),
         IntegrityStage.PRE_READ: ("after_transfer_phase_drain_before_model_forward"),
     }
+    copied_bytes = len(plan.transfer_order) * manifest.region_lengths[0]
+    if (
+        manifest.fingerprint_algorithm
+        is LocalizationFingerprintAlgorithm.POSITION_WEIGHTED_WORDS_256_V1
+    ):
+        copied_bytes = len(leaves) * localization_fingerprint_size(
+            manifest.fingerprint_algorithm
+        )
     return NixlCaptureRecord(
         record_type=NixlCaptureRecord.RECORD_TYPE,
         schema_version=IntegrityIdentity.SCHEMA_VERSION,
+        fingerprint_algorithm=manifest.fingerprint_algorithm,
         stage=stage,
         run_id=manifest.run_id,
         transport_arm=manifest.transport_arm,
@@ -469,7 +505,7 @@ def _capture(
         observer_engine_id=plan.observer_engine_id,
         observer_rank=plan.observer_rank,
         observer=True,
-        copied_bytes=len(plan.transfer_order) * manifest.region_lengths[0],
+        copied_bytes=copied_bytes,
         hashed_bytes=len(plan.transfer_order) * manifest.region_lengths[0],
         duration_ns=1000,
         barrier=barriers[stage],
@@ -488,8 +524,9 @@ def _write_trace(
     rank_slots: tuple[int, ...] | None = None,
     complete_decoder_world: bool = False,
     source_block_rosters: dict[int, tuple[int, ...]] | None = None,
+    mode: LocalizationMode = LocalizationMode.TRACE,
 ) -> tuple[tuple[Path, ...], NixlSourceManifest, NixlPlanRecord]:
-    config = _config(artifact_dir)
+    config = _config(artifact_dir, mode=mode)
     source_world_size = decoder_world_size * 2
     manifests = tuple(
         _manifest(
@@ -557,12 +594,21 @@ def _write_trace(
             8,
         )
         decoder_writer.write(plan)
-        for stage in (
-            IntegrityStage.STAGING_RAW,
-            IntegrityStage.STAGING_FENCED_CONTROL,
-            IntegrityStage.DESTINATION,
-            IntegrityStage.PRE_READ,
-        ):
+        capture_stages = (
+            (
+                IntegrityStage.STAGING_POST_SCATTER,
+                IntegrityStage.DESTINATION,
+                IntegrityStage.PRE_READ,
+            )
+            if mode is LocalizationMode.FINGERPRINT
+            else (
+                IntegrityStage.STAGING_RAW,
+                IntegrityStage.STAGING_FENCED_CONTROL,
+                IntegrityStage.DESTINATION,
+                IntegrityStage.PRE_READ,
+            )
+        )
+        for stage in capture_stages:
             for manifest in participating_manifests:
                 decoder_writer.write(
                     _capture(
@@ -913,6 +959,18 @@ def test_complete_trace_validates(tmp_path: Path) -> None:
 
 
 @pytest.mark.cpu_test
+def test_complete_fingerprint_trace_validates(tmp_path: Path) -> None:
+    """A compact post-scatter trace proves the full P-to-D path."""
+    paths, _, _ = _write_trace(tmp_path, mode=LocalizationMode.FINGERPRINT)
+
+    report = validate_localization_artifacts(paths)
+
+    assert report.passed
+    assert report.physical_pull_count == 1
+    assert report.verified_pull_count == 1
+
+
+@pytest.mark.cpu_test
 def test_complete_multi_decoder_rank_trace_validates(tmp_path: Path) -> None:
     """Independent P4 and D2 sessions prove the complete request partition."""
     paths, _, _ = _write_trace(
@@ -1045,6 +1103,26 @@ def test_corruption_localizes_to_first_raw_staging_edge(tmp_path: Path) -> None:
     assert len(report.errors) == 0
     assert len(report.divergences) == 1
     assert report.divergences[0].edge == "source_post_reference_vs_staging_raw"
+    assert any("digest mismatch" in error for error in report.divergences[0].errors)
+
+
+@pytest.mark.cpu_test
+def test_fingerprint_corruption_localizes_to_post_scatter_staging(
+    tmp_path: Path,
+) -> None:
+    """A changed compact fingerprint names the first observable P-to-D edge."""
+    paths, _, _ = _write_trace(
+        tmp_path,
+        corrupt_stage=IntegrityStage.STAGING_POST_SCATTER,
+        mode=LocalizationMode.FINGERPRINT,
+    )
+
+    report = validate_localization_artifacts(paths)
+
+    assert report.passed is False
+    assert len(report.errors) == 0
+    assert len(report.divergences) == 1
+    assert report.divergences[0].edge == "source_post_reference_vs_staging_post_scatter"
     assert any("digest mismatch" in error for error in report.divergences[0].errors)
 
 
