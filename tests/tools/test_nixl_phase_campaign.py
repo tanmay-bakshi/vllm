@@ -3,8 +3,9 @@
 """Host-only tests for the cache-isolated NIXL phase campaign driver."""
 
 import json
+import urllib.error
 import urllib.request
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -18,9 +19,13 @@ def _config(
     *,
     samples: int = 1,
     choices_per_parent: int = 1,
+    capture_dir: Path | None = None,
+    capture_request_id: str | None = None,
 ) -> campaign.CampaignConfig:
     """:param samples: Parent requests in the synthetic campaign.
     :param choices_per_parent: Choices required from each parent.
+    :param capture_dir: Optional response-capture directory.
+    :param capture_request_id: Optional exact response-capture selector.
     :returns: Host-only campaign configuration.
     """
     return campaign.CampaignConfig(
@@ -33,7 +38,8 @@ def _config(
         temperature=None,
         seed_base=100,
         timeout_seconds=1.0,
-        capture_dir=None,
+        capture_dir=capture_dir,
+        capture_request_id=capture_request_id,
     )
 
 
@@ -202,6 +208,101 @@ def test_valid_campaign_salts_every_parent_and_records_exact_identity(
     assert all(row["elapsed_seconds"] >= 0.0 for row in rows)
     assert len({row["parent_id"] for row in rows}) == 4
     assert len({row["cache_salt"] for row in rows}) == 4
+
+
+def test_selected_response_is_captured_even_when_healthy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The selected healthy response is retained in full."""
+    request_id = "p2d-control-a1-p000-s000000"
+    response = {
+        "id": f"chatcmpl-{request_id}",
+        "choices": [_choice(0)],
+        "usage": {"completion_tokens": 7},
+    }
+
+    def post(
+        base_url: str,
+        body: dict[str, Any],
+        observed_request_id: str,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """:returns: Complete synthetic healthy response."""
+        assert len(base_url) > 0
+        assert len(body) > 0
+        assert observed_request_id == request_id
+        assert timeout_seconds == 1.0
+        return response
+
+    capture_dir = tmp_path / "captures"
+    capture_dir.mkdir()
+    monkeypatch.setattr(campaign, "_post_chat_completion", post)
+    output = StringIO()
+    outcome = campaign.run_campaign(
+        _config(
+            capture_dir=capture_dir,
+            capture_request_id=request_id,
+        ),
+        (_payload(),),
+        output,
+    )
+
+    row = json.loads(output.getvalue())
+    capture_path = capture_dir / f"{request_id}-response.json"
+    capture = json.loads(capture_path.read_text(encoding="utf-8"))
+    assert outcome.valid
+    assert row["selected_capture_path"] == str(capture_path)
+    assert capture["http_status"] == 200
+    assert capture["response"] == response
+
+
+def test_selected_http_error_body_is_captured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The selected fail-closed response body survives HTTPError handling."""
+    request_id = "p2d-control-a1-p000-s000000"
+    error_response = {"error": {"type": "localization_mismatch"}}
+
+    def post(
+        base_url: str,
+        body: dict[str, Any],
+        observed_request_id: str,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """:raises urllib.error.HTTPError: Always, with structured evidence."""
+        assert len(body) > 0
+        assert observed_request_id == request_id
+        assert timeout_seconds == 1.0
+        raise urllib.error.HTTPError(
+            url=base_url,
+            code=500,
+            msg="localization failed closed",
+            hdrs=None,
+            fp=BytesIO(json.dumps(error_response).encode()),
+        )
+
+    capture_dir = tmp_path / "captures"
+    capture_dir.mkdir()
+    monkeypatch.setattr(campaign, "_post_chat_completion", post)
+    output = StringIO()
+    outcome = campaign.run_campaign(
+        _config(
+            capture_dir=capture_dir,
+            capture_request_id=request_id,
+        ),
+        (_payload(),),
+        output,
+    )
+
+    row = json.loads(output.getvalue())
+    capture_path = capture_dir / f"{request_id}-response.json"
+    capture = json.loads(capture_path.read_text(encoding="utf-8"))
+    assert outcome.valid is False
+    assert row["selected_capture_path"] == str(capture_path)
+    assert capture["http_status"] == 500
+    assert capture["response"] == error_response
 
 
 def test_request_failure_is_an_invalid_accounted_parent(

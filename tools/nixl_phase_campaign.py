@@ -18,6 +18,7 @@ import statistics
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +50,8 @@ class CampaignConfig:
     :ivar seed_base: Optional first deterministic sampling seed.
     :ivar timeout_seconds: HTTP timeout for one parent request.
     :ivar capture_dir: Optional exclusive directory for pathological responses.
+    :ivar capture_request_id: Optional exact request whose complete response is
+        captured regardless of classification.
     """
 
     base_url: str
@@ -61,6 +64,7 @@ class CampaignConfig:
     seed_base: int | None
     timeout_seconds: float
     capture_dir: Path | None
+    capture_request_id: str | None
 
 
 @dataclass(frozen=True)
@@ -305,6 +309,48 @@ def _write_json_no_replace(path: Path, value: object) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def _capture_selected_response(
+    config: CampaignConfig,
+    *,
+    parent_id: str,
+    request_id: str,
+    cache_salt: str,
+    request_seed: Any,
+    response: object,
+    http_status: int,
+) -> Path | None:
+    """Capture the complete response for the exact selected request.
+
+    :param config: Campaign configuration containing the capture selector.
+    :param parent_id: Stable campaign parent identity.
+    :param request_id: External API request identity.
+    :param cache_salt: Parent-specific prefix-cache salt.
+    :param request_seed: Sampling seed sent for the parent.
+    :param response: Decoded response body, or a lossless raw-body envelope.
+    :param http_status: HTTP response status.
+    :returns: Exclusive capture path when this is the selected request.
+    """
+    if (
+        config.capture_dir is None
+        or config.capture_request_id is None
+        or request_id != config.capture_request_id
+    ):
+        return None
+    capture_path = config.capture_dir / f"{request_id}-response.json"
+    _write_json_no_replace(
+        capture_path,
+        {
+            "parent_id": parent_id,
+            "request_id": request_id,
+            "cache_salt": cache_salt,
+            "request_seed": request_seed,
+            "http_status": http_status,
+            "response": response,
+        },
+    )
+    return capture_path
+
+
 def _error_parent_result(
     *,
     payload: PayloadSpec,
@@ -316,6 +362,7 @@ def _error_parent_result(
     started_at_unix_ns: int,
     elapsed_seconds: float,
     error: str,
+    selected_capture_path: Path | None = None,
 ) -> ParentResult:
     """:param payload: Payload attempted by the failed parent.
     :param sample_index: Parent position within the payload.
@@ -326,6 +373,8 @@ def _error_parent_result(
     :param started_at_unix_ns: Wall-clock start timestamp.
     :param elapsed_seconds: Time spent on the failed request.
     :param error: Failure description.
+    :param selected_capture_path: Complete-response capture for the selected
+        request, when available.
     :returns: A single-row invalid result for the failed parent.
     """
     row = {
@@ -344,6 +393,8 @@ def _error_parent_result(
         "fatal_shape": False,
         "error": error,
     }
+    if selected_capture_path is not None:
+        row["selected_capture_path"] = str(selected_capture_path)
     return ParentResult(rows=(row,), actual_choices=0, errors=(error,))
 
 
@@ -383,6 +434,35 @@ def _sample_parent(
             request_id,
             config.timeout_seconds,
         )
+    except urllib.error.HTTPError as error:
+        response_bytes = error.read()
+        try:
+            error_response: object = json.loads(response_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            error_response = {
+                "raw_body_utf8": response_bytes.decode("utf-8", errors="replace")
+            }
+        selected_capture_path = _capture_selected_response(
+            config,
+            parent_id=parent_id,
+            request_id=request_id,
+            cache_salt=cache_salt,
+            request_seed=body.get("seed"),
+            response=error_response,
+            http_status=error.code,
+        )
+        return _error_parent_result(
+            payload=payload,
+            sample_index=sample_index,
+            parent_id=parent_id,
+            request_id=request_id,
+            cache_salt=cache_salt,
+            seed=body.get("seed"),
+            started_at_unix_ns=started_at_unix_ns,
+            elapsed_seconds=time.monotonic() - started_at_monotonic,
+            error=f"HTTPError {error.code}: {error.reason}",
+            selected_capture_path=selected_capture_path,
+        )
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
         return _error_parent_result(
             payload=payload,
@@ -409,6 +489,16 @@ def _sample_parent(
             elapsed_seconds=elapsed_seconds,
             error="response JSON must be an object",
         )
+
+    selected_capture_path = _capture_selected_response(
+        config,
+        parent_id=parent_id,
+        request_id=request_id,
+        cache_salt=cache_salt,
+        request_seed=body.get("seed"),
+        response=response,
+        http_status=200,
+    )
 
     errors: list[str] = []
     response_id = response.get("id")
@@ -475,6 +565,8 @@ def _sample_parent(
             "elapsed_seconds": round(elapsed_seconds, 6),
             **_classify_choice(choice, usage),
         }
+        if selected_capture_path is not None:
+            row["selected_capture_path"] = str(selected_capture_path)
         if config.capture_dir is not None and (
             row["label"] == "degenerate" or row["fatal_shape"] is True
         ):
@@ -598,6 +690,10 @@ def run_campaign(
         raise ValueError("choices_per_parent must be positive")
     if config.timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
+    if config.capture_request_id is not None and len(config.capture_request_id) == 0:
+        raise ValueError("capture_request_id must not be empty")
+    if config.capture_request_id is not None and config.capture_dir is None:
+        raise ValueError("capture_request_id requires capture_dir")
     if len(payloads) == 0:
         raise ValueError("at least one payload is required")
 
@@ -675,6 +771,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--capture-dir", type=Path, default=None)
+    parser.add_argument("--capture-request-id", default=None)
     return parser
 
 
@@ -703,6 +800,7 @@ def main(argv: list[str] | None = None) -> int:
             seed_base=args.seed_base,
             timeout_seconds=args.timeout_seconds,
             capture_dir=args.capture_dir,
+            capture_request_id=args.capture_request_id,
         )
         descriptor, temporary_name = tempfile.mkstemp(
             dir=args.out.parent,
