@@ -28,6 +28,7 @@ BASE_WORKER_PATH = (
     / "nixl"
     / "base_worker.py"
 )
+PULL_WORKER_PATH = BASE_WORKER_PATH.with_name("pull_worker.py")
 
 
 def _production_worker_methods(
@@ -85,6 +86,42 @@ def _production_worker_methods(
     }
     exec(compile(module, str(BASE_WORKER_PATH), "exec"), namespace)
     return namespace["ProductionWorkerMethods"]  # type: ignore[return-value]
+
+
+def _production_pull_worker_methods(*method_names: str) -> type:
+    """Compile exact pull-worker methods without importing the worker graph.
+
+    :param method_names: Methods to bind to the test class.
+    :returns: Class containing the exact production method bodies.
+    """
+    syntax = ast.parse(PULL_WORKER_PATH.read_text(), filename=str(PULL_WORKER_PATH))
+    worker_node = next(
+        node
+        for node in syntax.body
+        if isinstance(node, ast.ClassDef) and node.name == "NixlPullConnectorWorker"
+    )
+    selected = [
+        node
+        for node in worker_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in method_names
+    ]
+    if {node.name for node in selected} != set(method_names):
+        raise AssertionError("production pull-worker method is missing")
+    test_class = ast.ClassDef(
+        name="ProductionPullWorkerMethods",
+        bases=[],
+        keywords=[],
+        body=selected,
+        decorator_list=[],
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[test_class], type_ignores=[]))
+    namespace: dict[str, object] = {
+        "ReqId": str,
+        "logger": MagicMock(),
+    }
+    exec(compile(module, str(PULL_WORKER_PATH), "exec"), namespace)
+    return namespace["ProductionPullWorkerMethods"]  # type: ignore[return-value]
 
 
 def _plan(
@@ -248,6 +285,108 @@ def test_production_done_release_failure_retains_handle_and_generation() -> None
     assert plan.slots[0].state is HandleState.DONE
     assert plan.slots[0].native_handle is native_handle
     assert plan.slots[0].native_released is False
+
+
+def test_failed_publication_retires_completed_plan_exactly_once() -> None:
+    worker_type = _production_worker_methods(
+        "_discard_quiescent_coalesced_plan",
+        "_fail_coalesced_plan",
+        "_poll_coalesced_plans",
+        "_release_coalesced_plan",
+    )
+    allocator, plan = _plan(statuses=("PROC",))
+    worker = worker_type()
+    worker._coalesce_plans = {plan.request_id: plan}
+    worker._staging_allocator = allocator
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    worker.nixl_wrapper.get_xfer_telemetry.return_value = object()
+    worker.xfer_stats = MagicMock()
+
+    assert worker._poll_coalesced_plans() == {plan.request_id}
+    worker._discard_quiescent_coalesced_plan(plan.request_id)
+
+    assert worker._poll_coalesced_plans() == set()
+    assert plan.request_id not in worker._coalesce_plans
+    assert allocator.free_bytes == allocator.capacity
+    worker.nixl_wrapper.release_xfer_handle.assert_called_once()
+
+
+def test_failed_receive_branch_retires_coalesced_owner_before_continue() -> None:
+    syntax = ast.parse(BASE_WORKER_PATH.read_text(), filename=str(BASE_WORKER_PATH))
+    worker_node = next(
+        node
+        for node in syntax.body
+        if isinstance(node, ast.ClassDef) and node.name == "NixlBaseConnectorWorker"
+    )
+    get_finished = next(
+        node
+        for node in worker_node.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_get_finished"
+    )
+    failed_branch = next(
+        node
+        for node in ast.walk(get_finished)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "_discard_quiescent_coalesced_plan"
+            for child in ast.walk(node)
+        )
+    )
+
+    assert any(isinstance(node, ast.Continue) for node in failed_branch.body)
+
+
+def test_failed_publication_cannot_retire_live_native_handle() -> None:
+    worker_type = _production_worker_methods(
+        "_discard_quiescent_coalesced_plan",
+        "_release_coalesced_plan",
+    )
+    allocator, plan = _plan(statuses=("DONE",))
+    worker = worker_type()
+    worker._coalesce_plans = {plan.request_id: plan}
+    worker._staging_allocator = allocator
+
+    with pytest.raises(StagingSafetyError, match="before native quiescence"):
+        worker._discard_quiescent_coalesced_plan(plan.request_id)
+
+    assert allocator.require_active(plan.lease.generation) is plan
+
+
+def test_source_lease_expiry_never_authorizes_reuse() -> None:
+    worker_type = _production_worker_methods("_expire_source_leases")
+    worker = worker_type()
+    worker._reqs_to_send = {"producer-request": 10.0}
+    worker._reqs_to_process = {"producer-request"}
+    worker.consumer_notification_counts_by_req = {"producer-request": 1}
+    worker.xfer_stats = MagicMock()
+
+    worker._expire_source_leases(12.0)
+
+    assert worker._reqs_to_send == {}
+    assert worker._reqs_to_process == {"producer-request"}
+    assert worker.consumer_notification_counts_by_req == {"producer-request": 1}
+    worker.xfer_stats.record_kv_expired_req.assert_called_once_with()
+
+
+def test_late_completion_releases_expired_pull_source() -> None:
+    worker_type = _production_pull_worker_methods("_get_new_notifs")
+    worker = worker_type()
+    worker.transfer_topo = SimpleNamespace(tp_ratio=lambda remote_size: 1)
+    worker.nixl_wrapper = SimpleNamespace(
+        get_new_notifs=lambda: {"consumer-agent": [b"producer-request:1:2"]}
+    )
+    worker._reqs_to_send = {}
+    worker._reqs_to_process = {"producer-request"}
+    worker.consumer_notification_counts_by_req = {"producer-request": 1}
+    worker.world_size = 1
+    worker._localization_capture_source_post = MagicMock()
+
+    assert worker._get_new_notifs() == {"producer-request"}
+    assert worker._reqs_to_process == set()
+    worker._localization_capture_source_post.assert_called_once_with("producer-request")
 
 
 def test_production_sync_failure_keeps_owned_generation() -> None:

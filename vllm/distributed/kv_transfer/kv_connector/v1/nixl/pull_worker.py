@@ -1187,27 +1187,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     self._handle_heartbeat(msg[3:])
                     continue
 
-                # Producer expired a lease: fence the rid and fail any
-                # parked pull for it (in-flight ones are handled at
-                # completion by the release fence in get_finished).
-                if msg.startswith("EXPIRED:"):
-                    rid = msg[len("EXPIRED:") :]
-                    logger.warning("Producer expired lease for %s; fencing.", rid)
-                    self._mark_rid_released(rid)
-                    still_parked = []
-                    for item in self._coalesce_pending:
-                        p_req_id, p_meta, _, _ = item
-                        if (
-                            p_meta.remote is not None
-                            and p_meta.remote.request_id == rid
-                        ):
-                            self._handle_failed_transfer(p_req_id, None)
-                        else:
-                            still_parked.append(item)
-                    self._coalesce_pending.clear()
-                    self._coalesce_pending.extend(still_parked)
-                    continue
-
                 parts = msg.rsplit(":", 2)
                 if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
                     req_id, tp_size, expected_s = parts

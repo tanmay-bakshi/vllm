@@ -21,11 +21,12 @@ event-driven: the engine main thread sets ``_push_writer_wake`` from
 ``start_load_kv`` (when handing it new work) and from ``get_finished``
 (so each engine step gives the writer a chance to drain NIXL notifs);
 the handshake-completion callback sets the same event after a deferred
-PUSH_REG send has been queued. When a request's lease expires (the base
-worker reports it via ``done_sending``) or the WRITE completes,
-``get_finished`` enqueues an eviction onto ``_evict_finished_inbox`` so
-the writer drops any leftover ``_push_finished_blocks`` /
-``_pending_d_registrations`` and stops self-polling.
+PUSH_REG send has been queued. When a request's lease expires, the base
+worker records lost liveness but retains the source allocation. Once the
+WRITE completes, ``get_finished`` enqueues an eviction onto
+``_evict_finished_inbox`` so the writer drops any leftover
+``_push_finished_blocks`` / ``_pending_d_registrations`` and stops
+self-polling.
 """
 
 import queue
@@ -100,10 +101,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._reg_send_inbox: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
         self._finished_blocks_inbox: queue.Queue[tuple[str, BlockIds]] = queue.Queue()
         self._pending_completion_notifs: queue.Queue[bytes] = queue.Queue()
-        # Main thread → writer: req_ids whose lease has expired or whose
-        # WRITE has completed. Writer drops them from
-        # ``_push_finished_blocks`` so an unmatched entry doesn't keep the
-        # writer busy-polling forever.
+        # Main thread → writer: req_ids whose WRITE has completed. Writer
+        # drops them from ``_push_finished_blocks`` so an unmatched entry
+        # doesn't keep the writer busy-polling forever.
         self._evict_finished_inbox: queue.Queue[str] = queue.Queue()
 
         # Wake signal from engine main thread (start_load_kv / get_finished).
@@ -214,10 +214,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     else:
                         self._push_finished_blocks[rid] = blocks
 
-                # 2b. Evict finished blocks for requests that have either
-                # completed (WRITE acknowledged) or whose lease expired
-                # without a D registration.  Drop pending registrations
-                # for the same reason so we don't leak state.
+                # 2b. Evict state for requests whose WRITE completed. Drop
+                # pending registrations for the same reason.
                 while True:
                     try:
                         rid = self._evict_finished_inbox.get_nowait()
@@ -441,10 +439,12 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     ) -> bool:
         """First-time P→D handshake. Blocking call on the writer thread.
 
-        Returns True iff the handshake succeeded (or had already been
-        completed). Returns False if the handshake raised; the request is
-        skipped in that case (the engine layer will reschedule or fail it
-        via the standard lease/timeout path)."""
+        :returns: Whether the handshake succeeded or was already complete.
+
+        A failed handshake leaves the source pinned. The worker cannot prove
+        that another participant did not receive enough state to initiate an
+        operation, so elapsed lease time is not a release fence.
+        """
         if decode_engine_id in self._remote_agents:
             return True
         try:
@@ -649,10 +649,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 dst_engine_id=dst_engine_id,
                 remote_rank=remote_rank,
             )
-            # On the P side this WRITE failure is purely outbound; we
-            # don't have a ``_recving_metadata`` entry to invalidate, so
-            # we just release the handle and let the engine reschedule
-            # via the lease / watchdog.
+            # P owns this WRITE handle, so releasing an unsuccessfully posted
+            # handle proves that this native operation cannot touch the source.
+            # The request remains pinned because other ranks may have posted.
             if handle is not None:
                 self.nixl_wrapper.release_xfer_handle(handle)
             self.xfer_stats.record_failed_transfer()
@@ -732,8 +731,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             done_sending.add(req_id)
 
         # Tell the writer to drop any state it still holds for any
-        # request that just finished (push completed) or expired
-        # (lease ran out without a D registration ever arriving).
+        # request whose push completed.
         for req_id in done_sending:
             self._evict_finished_inbox.put(req_id)
         if done_sending:

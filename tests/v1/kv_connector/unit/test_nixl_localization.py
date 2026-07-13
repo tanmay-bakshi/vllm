@@ -767,30 +767,6 @@ def test_completed_source_roster_captures_source_post_then_retires(
 
 
 @pytest.mark.cpu_test
-def test_expired_source_roster_retires_without_source_post(tmp_path: Path) -> None:
-    req_id = f"{TARGET_REQUEST_ID_BASE}-11111111"
-    roster = NixlSourceRoster(
-        offer_generation=1,
-        iteration=0,
-        valid_token_extent=100,
-        group_token_capacities=(64,),
-        block_ids=((10, 11),),
-    )
-    worker = object.__new__(NixlPullConnectorWorker)
-    worker._localization_config = _config(tmp_path)
-    worker._localization_source_rosters = {req_id: roster}
-    capture = MagicMock()
-    worker._localization_capture_source_manifest = capture
-
-    worker._localization_discard_source_roster(req_id)
-
-    capture.assert_not_called()
-    assert worker._localization_source_rosters == {}
-    with pytest.raises(LocalizationError, match="no retained source roster"):
-        worker._localization_discard_source_roster(req_id)
-
-
-@pytest.mark.cpu_test
 def test_complete_trace_validates(tmp_path: Path) -> None:
     """A complete source, plan, four-stage, and terminal trace is accepted."""
     paths, _, _ = _write_trace(tmp_path)

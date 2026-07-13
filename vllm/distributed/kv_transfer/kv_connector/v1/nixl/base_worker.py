@@ -612,21 +612,16 @@ class NixlBaseConnectorWorker:
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
-        # Track the expiration time of requests that are waiting to be sent.
+        # Liveness deadlines for source requests waiting to be transferred.
+        # Removing a deadline never releases the source allocation.
         self._reqs_to_send: dict[ReqId, float] = {}
-        # Release fence: remote rids whose producer blocks are known to be
-        # released (own completion, sibling release, or producer EXPIRED
-        # notification). Bounded FIFO. A pull must never be issued for --
-        # nor a completion committed against -- a released rid.
+        # Release fence: remote rids whose expected consumer set completed.
+        # Bounded FIFO. A pull must never be issued for -- nor a completion
+        # committed against -- a released rid.
         self._released_rids: dict[str, float] = {}
         # Consumer side: completed pulls per rid; the rid is released once
         # this reaches the request's expected_consumers.
         self._rid_completion_counts: dict[str, int] = {}
-        # Producer side: expired requests are held here for a grace window
-        # (blocks still pinned) so consumers can process our EXPIRED
-        # notification or finish an in-flight read before the real free.
-        self._grace_frees: dict[ReqId, float] = {}
-
         # ---- resident-KV checksum auditor (VLLM_GEMMA4_KV_AUDIT) ----
         # Snapshot content sums of immutable prompt rows at pull commit;
         # re-verify periodically. Debug instrument, off by default.
@@ -2533,18 +2528,6 @@ class NixlBaseConnectorWorker:
         )
         del self._localization_source_rosters[req_id]
 
-    def _localization_discard_source_roster(self, req_id: ReqId) -> None:
-        """Discard a target roster whose transfer did not complete.
-
-        :param req_id: Producer request released without completion proof.
-        """
-        if self._localization_config.enabled_for(req_id) is False:
-            return
-        if self._localization_source_rosters.pop(req_id, None) is None:
-            raise LocalizationError(
-                f"failed target release has no retained source roster for {req_id}"
-            )
-
     def _localization_capture_staging(
         self,
         req_id: ReqId,
@@ -3523,6 +3506,24 @@ class NixlBaseConnectorWorker:
 
         self._release_coalesced_plan(plan)
 
+    def _discard_quiescent_coalesced_plan(self, req_id: ReqId) -> None:
+        """Retire a completed receive that must not reach the KV cache.
+
+        :param req_id: Failed decoder request whose staging must be reclaimed.
+        :raises StagingSafetyError: If a native actor can still touch staging.
+        """
+        plan = self._coalesce_plans.get(req_id)
+        if plan is None:
+            return
+        if plan.ready_to_scatter is False or any(
+            slot.native_released is False for slot in plan.slots.values()
+        ):
+            raise StagingSafetyError(
+                "failed receive reached retirement before native quiescence: "
+                + plan.describe()
+            )
+        self._release_coalesced_plan(plan)
+
     def _begin_transfer_phase(self) -> None:
         """Close prior device work and authorize one transfer-only phase.
 
@@ -3818,11 +3819,10 @@ class NixlBaseConnectorWorker:
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
 
-            # Release fence: this pull completed for a rid whose producer
-            # blocks were already released (all expected consumers done,
-            # or producer EXPIRED) -- the bytes may come from reused
-            # pages. Fail the request (router retries with a fresh
-            # prefill) instead of committing and publishing them.
+            # Release fence: this pull completed after the rid's expected
+            # consumer set had already completed, so a duplicate or stale
+            # pull may have read reused pages. Fail the request instead of
+            # committing and publishing them.
             # Full-prefix-hit requests (empty local ids) read nothing and
             # are exempt.
             if (
@@ -3856,6 +3856,7 @@ class NixlBaseConnectorWorker:
                     "Skipping KV post-processing for failed request %s",
                     req_id,
                 )
+                self._discard_quiescent_coalesced_plan(req_id)
                 continue
 
             assert meta.remote is not None
@@ -3894,44 +3895,7 @@ class NixlBaseConnectorWorker:
 
         self._sync_device_after_mamba_recv(done_recving, failed_recv_reqs)
 
-        # Handle timeout to avoid stranding blocks on remote.
-        now = time.perf_counter()
-        while self._reqs_to_send:
-            req_id, expires = next(iter(self._reqs_to_send.items()))
-            # Sorted dict, oldest requests are put first so we can exit early.
-            if now < expires:
-                break
-            count = self.consumer_notification_counts_by_req.pop(req_id, 0)
-            self.xfer_stats.record_kv_expired_req()
-            logger.warning(
-                "Releasing expired KV blocks for request %s which were "
-                "retrieved by %d remote worker(s) before lease expired.",
-                req_id,
-                count,
-            )
-            self._reqs_to_process.remove(req_id)
-            del self._reqs_to_send[req_id]
-            # Notify consumers so they fail (and retry) any pull still
-            # planned or in flight for this rid, then hold the blocks
-            # for a grace window before the real free: a read that
-            # already started still lands on intact pages.
-            expired_msg = f"EXPIRED:{req_id}".encode()
-            for agents in self._remote_agents.values():
-                for agent in agents.values():
-                    try:
-                        self.nixl_wrapper.send_notif(agent, notif_msg=expired_msg)
-                    except Exception:
-                        logger.exception(
-                            "Failed to send expiry notification for request %s",
-                            req_id,
-                        )
-            grace = float(os.environ.get("VLLM_GEMMA4_KV_FREE_GRACE_S", "5"))
-            self._grace_frees[req_id] = now + grace
-        # Drain grace-held frees whose window elapsed.
-        for req_id in [r for r, t in self._grace_frees.items() if now >= t]:
-            self._localization_discard_source_roster(req_id)
-            del self._grace_frees[req_id]
-            done_sending.add(req_id)
+        self._expire_source_leases(time.perf_counter())
 
         # coalesced pull: completed scatters freed staging; start
         # transfers for requests parked on the staging pool
@@ -3941,6 +3905,27 @@ class NixlBaseConnectorWorker:
         self._audit_tick(failed_recv_reqs)
 
         return done_sending, done_recving
+
+    def _expire_source_leases(self, now: float) -> None:
+        """Record lost source liveness without weakening memory ownership.
+
+        :param now: Current monotonic time.
+        """
+        while self._reqs_to_send:
+            req_id, expires = next(iter(self._reqs_to_send.items()))
+            # Sorted dict, oldest requests are put first so we can exit early.
+            if now < expires:
+                break
+            count = self.consumer_notification_counts_by_req.get(req_id, 0)
+            self.xfer_stats.record_kv_expired_req()
+            del self._reqs_to_send[req_id]
+            logger.error(
+                "Source lease expired for request %s after %d consumer "
+                "completion(s); retaining its blocks until transfer completion "
+                "proves every remote operation quiescent.",
+                req_id,
+                count,
+            )
 
     # ------------------------------------------------------------------
     # Resident-KV checksum auditor (VLLM_GEMMA4_KV_AUDIT)
