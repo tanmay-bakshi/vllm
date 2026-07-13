@@ -434,6 +434,9 @@ class StopGroupSystem(proxy_normalization.LinuxNormalizationSystem):
 
         :param rosters: Consecutive group snapshots returned to the algorithm.
         """
+        self._launched_processes: dict[
+            proxy_normalization.ProcessIdentity, subprocess.Popen[bytes]
+        ] = {}
         self._rosters = list(rosters)
 
     def _process_group_identities_allow_absent(
@@ -978,6 +981,53 @@ class ProxyNormalizationTest(unittest.TestCase):
             },
         )
 
+    def test_group_cleanup_reaps_launched_leader_before_proc_scan(self) -> None:
+        """Reap an exited child so its procfs zombie disappears."""
+        system = StopGroupSystem([(_CANDIDATE_IDENTITY,), ()])
+        process = mock.Mock(spec=subprocess.Popen)
+        process.poll.side_effect = [None, 0]
+        system._launched_processes[_CANDIDATE_IDENTITY] = process
+
+        with (
+            mock.patch.object(
+                proxy_normalization.os,
+                "pidfd_open",
+                return_value=1700001,
+                create=True,
+            ),
+            mock.patch.object(proxy_normalization.os, "close"),
+            mock.patch.object(
+                proxy_normalization.signal,
+                "pidfd_send_signal",
+                create=True,
+            ),
+            mock.patch.object(proxy_normalization.time, "sleep"),
+        ):
+            system.stop_group((_CANDIDATE_IDENTITY,), 5.0)
+
+        self.assertEqual(process.poll.call_count, 2)
+        self.assertEqual(system._launched_processes, {})
+
+    def test_group_cleanup_rejects_empty_scan_while_launched_leader_lives(
+        self,
+    ) -> None:
+        """Never confuse an empty procfs scan with a live child's exit."""
+        system = StopGroupSystem([()])
+        process = mock.Mock(spec=subprocess.Popen)
+        process.poll.return_value = None
+        system._launched_processes[_CANDIDATE_IDENTITY] = process
+
+        with self.assertRaisesRegex(
+            proxy_normalization.NormalizationError,
+            "remains alive outside its process group scan",
+        ):
+            system.stop_group((_CANDIDATE_IDENTITY,), 5.0)
+
+        self.assertEqual(
+            system._launched_processes,
+            {_CANDIDATE_IDENTITY: process},
+        )
+
     def test_group_cleanup_rejects_leader_pid_reuse(self) -> None:
         """Never signal a new process incarnation that reused the leader PID."""
         reused = proxy_normalization.ProcessIdentity(
@@ -1200,22 +1250,36 @@ class ProxyNormalizationTest(unittest.TestCase):
             ):
                 proxy_normalization.ArtifactStore(artifacts, create=False).load_state()
 
-    def test_stream_parser_requires_one_done_terminated_nonempty_choice(self) -> None:
-        """Assemble strict SSE text and reject missing completion termination."""
+    def test_chat_parsers_require_one_nonempty_choice(self) -> None:
+        """Parse matching chat response shapes and reject incomplete streams."""
+        nonstreaming = proxy_normalization.HttpResponse(
+            status=200,
+            headers=(),
+            body=b'{"choices":[{"message":{"content":"one, two"}}]}',
+        )
         response = proxy_normalization.HttpResponse(
             status=200,
             headers=(),
             body=(
-                b'data: {"choices":[{"text":"one"}]}\n\n'
-                b'data: {"choices":[{"text":", two"}]}\n\n'
+                b'data: {"choices":[{"delta":{"content":null,'
+                b'"role":"assistant"}}]}\n\n'
+                b'data: {"choices":[{"delta":{"content":"one"}}]}\n\n'
+                b'data: {"choices":[{"delta":{"content":", two"}}]}\n\n'
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
                 b"data: [DONE]\n\n"
             ),
+        )
+        nonstreaming_text, _ = (
+            proxy_normalization.LinuxNormalizationSystem._chat_completion_text(
+                nonstreaming
+            )
         )
         text, events = proxy_normalization.LinuxNormalizationSystem._stream_text(
             response
         )
+        self.assertEqual(nonstreaming_text, "one, two")
         self.assertEqual(text, "one, two")
-        self.assertEqual(len(events), 2)
+        self.assertEqual(len(events), 4)
         with self.assertRaisesRegex(
             proxy_normalization.NormalizationError,
             "incomplete",
@@ -1224,7 +1288,7 @@ class ProxyNormalizationTest(unittest.TestCase):
                 proxy_normalization.HttpResponse(
                     status=200,
                     headers=(),
-                    body=b'data: {"choices":[{"text":"one"}]}\n\n',
+                    body=(b'data: {"choices":[{"delta":{"content":"one"}}]}\n\n'),
                 )
             )
 

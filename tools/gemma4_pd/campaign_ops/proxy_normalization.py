@@ -1434,6 +1434,7 @@ def _record_stat(file_stat: os.stat_result) -> dict[str, object]:
 class LinuxNormalizationSystem:
     """Perform normalization against one local Linux procfs and network stack."""
 
+    _launched_processes: dict[ProcessIdentity, subprocess.Popen[bytes]]
     _proc_root: Path
 
     def __init__(self, proc_root: Path = Path("/proc")) -> None:
@@ -1443,6 +1444,7 @@ class LinuxNormalizationSystem:
         """
         if sys.platform != "linux":
             raise NormalizationError("proxy normalization requires Linux")
+        self._launched_processes = {}
         self._proc_root = proc_root
 
     def _boot_id(self) -> str:
@@ -2138,6 +2140,7 @@ class LinuxNormalizationSystem:
                 raise NormalizationError(
                     "normalized proxy is not its session and group leader"
                 )
+            self._launched_processes[identity] = process
             return identity
         except (NormalizationError, OSError):
             if process.poll() is None:
@@ -2303,10 +2306,22 @@ class LinuxNormalizationSystem:
         term_deadline = time.monotonic() + timeout_seconds
         kill_deadline = term_deadline + 5.0
         while True:
+            launched_process = self._launched_processes.get(identity)
+            launched_process_alive = False
+            if launched_process is not None:
+                if launched_process.poll() is None:
+                    launched_process_alive = True
+                else:
+                    del self._launched_processes[identity]
             current = self._process_group_identities_allow_absent(
                 identity.process_group_id
             )
             if len(current) == 0:
+                if launched_process_alive:
+                    raise NormalizationError(
+                        "launched proxy remains alive outside its process group scan"
+                    )
+                self._launched_processes.pop(identity, None)
                 return
             for member in current:
                 if (
@@ -2345,8 +2360,10 @@ class LinuxNormalizationSystem:
             time.sleep(0.05)
 
     @staticmethod
-    def _completion_text(response: HttpResponse) -> tuple[str, dict[str, object]]:
-        """Extract one non-streaming completion text under an exact schema subset.
+    def _chat_completion_text(
+        response: HttpResponse,
+    ) -> tuple[str, dict[str, object]]:
+        """Extract one non-streaming chat-completion text.
 
         :param response: Complete completion response.
         :returns: Completion text and parsed response object.
@@ -2354,29 +2371,30 @@ class LinuxNormalizationSystem:
         """
         if response.status != 200:
             raise NormalizationError(
-                f"non-streaming semantic gate returned HTTP {response.status}"
+                f"non-streaming chat gate returned HTTP {response.status}"
             )
         try:
             value = json.loads(response.body)
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise NormalizationError(
-                "non-streaming semantic response is not JSON"
+                "non-streaming chat response is not JSON"
             ) from error
-        record = _require_object(value, label="non-streaming response")
+        record = _require_object(value, label="non-streaming chat response")
         choices = record.get("choices")
         if type(choices) is not list or len(choices) != 1:
-            raise NormalizationError(
-                "non-streaming semantic response choice count differs"
-            )
-        choice = _require_object(choices[0], label="non-streaming response choice")
-        text = choice.get("text")
+            raise NormalizationError("non-streaming chat response choice count differs")
+        choice = _require_object(choices[0], label="non-streaming chat response choice")
+        message = _require_object(
+            choice.get("message"), label="non-streaming chat response message"
+        )
+        text = message.get("content")
         if type(text) is not str or len(text) == 0:
-            raise NormalizationError("non-streaming semantic response text is empty")
+            raise NormalizationError("non-streaming chat response text is empty")
         return text, record
 
     @staticmethod
     def _stream_text(response: HttpResponse) -> tuple[str, list[dict[str, object]]]:
-        """Assemble one OpenAI completion SSE stream.
+        """Assemble one OpenAI chat-completion SSE stream.
 
         :param response: Complete bounded streaming response.
         :returns: Concatenated text and parsed event sequence.
@@ -2419,12 +2437,14 @@ class LinuxNormalizationSystem:
             choice = _require_object(
                 choices[0], label="streaming semantic event choice"
             )
-            text = choice.get("text")
-            if type(text) is not str:
-                raise NormalizationError(
-                    "streaming semantic event text is not a string"
-                )
-            pieces.append(text)
+            delta = _require_object(
+                choice.get("delta"), label="streaming chat event delta"
+            )
+            text = delta.get("content")
+            if text is not None and type(text) is not str:
+                raise NormalizationError("streaming chat event text is not a string")
+            if type(text) is str:
+                pieces.append(text)
             events.append(record)
         if done is False or len(events) == 0:
             raise NormalizationError("streaming semantic response is incomplete")
@@ -2449,22 +2469,25 @@ class LinuxNormalizationSystem:
         """
         prompt = "Write the integers one through five in order, separated by commas."
         common = {
-            "max_tokens": 24,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "max_tokens": 32,
+            "messages": [{"content": prompt, "role": "user"}],
             "model": model,
-            "prompt": prompt,
             "seed": 0,
             "temperature": 0.0,
         }
         nonstreaming_request = {**common, "stream": False}
         streaming_request = {**common, "stream": True}
-        url = f"http://{CANONICAL_HOST}:{port}/v1/completions"
+        url = f"http://{CANONICAL_HOST}:{port}/v1/chat/completions"
         headers = {"Content-Type": "application/json"}
         nonstreaming_payload = _canonical_json(nonstreaming_request)[:-1]
         streaming_payload = _canonical_json(streaming_request)[:-1]
         nonstreaming = self._request(
             "POST", url, nonstreaming_payload, headers, timeout_seconds
         )
-        nonstreaming_text, nonstreaming_record = self._completion_text(nonstreaming)
+        nonstreaming_text, nonstreaming_record = self._chat_completion_text(
+            nonstreaming
+        )
         streaming = self._request(
             "POST", url, streaming_payload, headers, timeout_seconds
         )
