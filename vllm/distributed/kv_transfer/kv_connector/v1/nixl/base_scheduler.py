@@ -119,10 +119,11 @@ class NixlBaseConnectorScheduler:
         if self._localization_config.enabled:
             logger.warning(
                 "P-to-D localization observer enabled: run=%s arm=%s "
-                "mode=%s. Clean results are instrumented-only evidence.",
+                "mode=%s target=%s. Clean results are instrumented-only evidence.",
                 self._localization_config.run_id,
                 self._localization_config.transport_arm,
                 self._localization_config.mode.value,
+                self._localization_config.target_request_id,
             )
 
         # Requests that need to start recv/send.

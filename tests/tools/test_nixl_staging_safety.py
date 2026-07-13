@@ -265,7 +265,8 @@ def test_production_sync_failure_keeps_owned_generation() -> None:
     worker._staging_allocator = allocator
     worker._staging_buf = None
     worker._region_rows = None
-    worker._localization_config = SimpleNamespace(enabled=False)
+    worker._localization_config = MagicMock()
+    worker._localization_config.enabled_for.return_value = False
     worker._audit_enabled = False
 
     with pytest.raises(StagingSafetyError, match="safety proof failed"):

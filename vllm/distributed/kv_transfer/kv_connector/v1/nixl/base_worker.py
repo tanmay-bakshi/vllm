@@ -2236,6 +2236,8 @@ class NixlBaseConnectorWorker:
                 )
             return
         for req_id, logical_roster in rosters.items():
+            if self._localization_config.enabled_for(req_id) is False:
+                continue
             key = (req_id, logical_roster.offer_generation)
             if key in self._localization_source_pre:
                 raise LocalizationError(f"duplicate source roster {key}")
@@ -2512,7 +2514,7 @@ class NixlBaseConnectorWorker:
 
         :param req_id: Producer request whose pages are still pinned.
         """
-        if self._localization_config.enabled is False:
+        if self._localization_config.enabled_for(req_id) is False:
             return
         roster = self._localization_source_rosters.get(req_id)
         if roster is None:
@@ -2564,7 +2566,7 @@ class NixlBaseConnectorWorker:
         :param stage: Raw or fenced staging checkpoint.
         :param barrier: Exact observer ordering applied before the capture.
         """
-        if self._localization_config.enabled is False:
+        if self._localization_config.enabled_for(req_id) is False:
             return
         if self._staging_buf is None:
             raise LocalizationError("staging capture has no staging allocation")
@@ -2724,7 +2726,7 @@ class NixlBaseConnectorWorker:
         :param stage: Post-scatter or pre-first-read checkpoint.
         :param barrier: Exact observer ordering applied before the capture.
         """
-        if self._localization_config.enabled is False:
+        if self._localization_config.enabled_for(req_id) is False:
             return
         if self._region_rows is None:
             raise LocalizationError("destination capture has no canonical rows")
@@ -2982,27 +2984,35 @@ class NixlBaseConnectorWorker:
         """
         if self._localization_config.enabled is False:
             return
-        for req_id in sorted(req_ids):
-            plan = self._localization_pre_read_plans.pop(req_id, None)
-            if plan is None:
-                continue
-            self._localization_capture_destination(
-                req_id,
-                plan,
-                IntegrityStage.PRE_READ,
-                "first_operation_in_start_load_kv_before_new_dma_or_forward",
+        if len(self._localization_pre_read_plans) == 0:
+            return
+        if len(self._localization_pre_read_plans) != 1:
+            raise LocalizationError(
+                "multiple localization targets are pending first-read verification"
             )
-            plan_remote_request = str(plan["producer_request_id"])
-            is_trace = self._localization_config.mode is LocalizationMode.TRACE
-            self._localization_record_event(
-                code=("VERIFIED_PRE_READ" if is_trace else "SHAM_PRE_READ_COMPLETE"),
-                evidentiary=is_trace,
-                child_request_id=req_id,
-                producer_engine_id=str(plan["producer_engine_id"]),
-                producer_request_id=plan_remote_request,
-                detail="all required ranks and stages matched before first read",
-            )
-            self._localization_expected_by_request.pop(req_id, None)
+        req_id, plan = next(iter(self._localization_pre_read_plans.items()))
+        if self._localization_config.enabled_for(req_id) is False:
+            raise LocalizationError("pre-read plan is outside the localization target")
+        if req_id not in req_ids:
+            return
+        self._localization_pre_read_plans.pop(req_id)
+        self._localization_capture_destination(
+            req_id,
+            plan,
+            IntegrityStage.PRE_READ,
+            "first_operation_in_start_load_kv_before_new_dma_or_forward",
+        )
+        plan_remote_request = str(plan["producer_request_id"])
+        is_trace = self._localization_config.mode is LocalizationMode.TRACE
+        self._localization_record_event(
+            code=("VERIFIED_PRE_READ" if is_trace else "SHAM_PRE_READ_COMPLETE"),
+            evidentiary=is_trace,
+            child_request_id=req_id,
+            producer_engine_id=str(plan["producer_engine_id"]),
+            producer_request_id=plan_remote_request,
+            detail="all required ranks and stages matched before first read",
+        )
+        self._localization_expected_by_request.pop(req_id, None)
 
     def _localization_record_event(
         self,
@@ -3023,12 +3033,12 @@ class NixlBaseConnectorWorker:
         :param producer_request_id: Source request lineage.
         :param detail: Human-readable outcome detail.
         """
-        if self._localization_config.enabled is False:
-            return
         if (
-            child_request_id is not None
-            and child_request_id in self._localization_terminal_recorded
+            child_request_id is None
+            or self._localization_config.enabled_for(child_request_id) is False
         ):
+            return
+        if child_request_id in self._localization_terminal_recorded:
             return
         if self._localization_writer is None:
             raise LocalizationError("enabled localization has no artifact writer")
@@ -3049,8 +3059,7 @@ class NixlBaseConnectorWorker:
                 created_ns=time.time_ns(),
             )
         )
-        if child_request_id is not None:
-            self._localization_terminal_recorded.add(child_request_id)
+        self._localization_terminal_recorded.add(child_request_id)
 
     # ------------------------------------------------------------------
     # Coalesced pull: staging buffer + completion scatter
@@ -3388,7 +3397,7 @@ class NixlBaseConnectorWorker:
         try:
             assert self._staging_buf is not None
             assert self._region_rows is not None
-            if self._localization_config.enabled:
+            if self._localization_config.enabled_for(req_id):
                 self._localization_capture_staging(
                     req_id,
                     plan,
@@ -3480,7 +3489,7 @@ class NixlBaseConnectorWorker:
             ) from scatter_error
 
         try:
-            if self._localization_config.enabled:
+            if self._localization_config.enabled_for(req_id):
                 self._localization_capture_destination(
                     req_id,
                     geometry,

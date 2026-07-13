@@ -289,7 +289,9 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # Here we "unpad" blocks to send the actual remote blocks to be read.
             block_ids = self.get_sw_clipped_blocks(block_ids)
 
-            if is_p_node and self._localization_config.enabled:
+            if is_p_node and self._localization_config.enabled_for(
+                request.request_id
+            ):
                 self._localization_offer_generation += 1
                 offer_generation = self._localization_offer_generation
                 self._source_integrity_rosters[request.request_id] = (

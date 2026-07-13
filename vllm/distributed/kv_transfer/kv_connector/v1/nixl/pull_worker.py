@@ -150,6 +150,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.transfer_topo is not None
+        localization_enabled = self._localization_config.enabled_for(req_id)
         engine_id = meta.remote.engine_id
         # Update last activity from this remote. Mind that cleanup is done on main
         # thread (this one), so we don't race on this structure.
@@ -159,7 +160,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
 
         if (
-            self._localization_config.enabled
+            localization_enabled
             and sum(len(group) for group in meta.local_physical_block_ids) == 0
         ):
             if self._localization_writer is None:
@@ -252,7 +253,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             assert len(read_specs) == 1
 
         if (
-            self._localization_config.enabled
+            localization_enabled
             and sum(len(group) for group in local_block_ids) == 0
         ):
             result = self._coalesced_read_request(req_id, meta, read_specs)
@@ -280,7 +281,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 return
 
         if (
-            self._localization_config.enabled
+            localization_enabled
             or any(self._sp_group_flags())
             or self._no_stock_dma()
         ):
@@ -329,10 +330,19 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         """
         assert meta.remote is not None
         remote = meta.remote
-        if self._localization_config.enabled is False:
-            if remote.p2d_run_id is not None:
+        remote_lineage = (
+            remote.p2d_run_id,
+            remote.p2d_transport_arm,
+            remote.p2d_offer_generation,
+            remote.p2d_iteration,
+        )
+        if self._localization_config.enabled_for(req_id) is False:
+            if self._localization_config.enabled_for(remote.request_id) or any(
+                value is not None for value in remote_lineage
+            ):
                 raise LocalizationError(
-                    "producer requires localization but decoder observer is disabled"
+                    f"request {req_id} carries a target producer or localization "
+                    "lineage outside the decoder target"
                 )
             return True
         if (
@@ -347,7 +357,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             self._localization_waiting.pop(req_id, None)
             return True
         if (
-            remote.p2d_run_id != self._localization_config.run_id
+            self._localization_config.enabled_for(remote.request_id) is False
+            or remote.p2d_run_id != self._localization_config.run_id
             or remote.p2d_transport_arm != self._localization_config.transport_arm
             or remote.p2d_offer_generation is None
             or remote.p2d_iteration is None
@@ -707,7 +718,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 break
             self._coalesce_pending.popleft()
             if res == "stock":
-                if self._localization_config.enabled or self._no_stock_dma():
+                if (
+                    self._localization_config.enabled_for(req_id)
+                    or self._no_stock_dma()
+                ):
                     logger.error(
                         "coalesced drain: %s not expressible; failing "
                         "instead of the stock path.",
@@ -732,12 +746,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         :returns: ``posted``, ``defer``, or ``stock`` before native failure.
         """
         assert meta.remote is not None and self.transfer_topo is not None
+        localization_enabled = self._localization_config.enabled_for(req_id)
         engine_id = meta.remote.engine_id
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         spec0 = read_specs[0]
-        raw_remote_groups = tuple(
-            tuple(int(block_id) for block_id in group)
-            for group in spec0.remote_block_ids
+        raw_remote_groups = (
+            tuple(
+                tuple(int(block_id) for block_id in group)
+                for group in spec0.remote_block_ids
+            )
+            if localization_enabled
+            else ()
         )
         local_ids, remote_ids = self._apply_prefix_caching(
             [list(g) for g in spec0.local_block_ids],
@@ -779,10 +798,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         for gi in range(len(local_ids)):
             lg = np.asarray(local_ids[gi], dtype=np.int64)
             rg = np.asarray(remote_ids[gi], dtype=np.int64)
-            source_start = locate_subsequence(
-                list(raw_remote_groups[gi]),
-                [int(block_id) for block_id in rg],
-            )
+            if localization_enabled:
+                source_start = locate_subsequence(
+                    list(raw_remote_groups[gi]),
+                    [int(block_id) for block_id in rg],
+                )
             if sp_flags[gi]:
                 if len(rg) > 2 * len(lg):
                     return "stock"
@@ -796,19 +816,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 lpos_l.append(lg)
                 rpos_l.append(rg)
                 half_l.append(np.full(len(lg), -1, dtype=np.int8))
-            group_l.append(np.full(len(rg), gi, dtype=np.int32))
-            source_position_l.append(
-                np.arange(source_start, source_start + len(rg), dtype=np.int64)
-            )
+            if localization_enabled:
+                group_l.append(np.full(len(rg), gi, dtype=np.int32))
+                source_position_l.append(
+                    np.arange(source_start, source_start + len(rg), dtype=np.int64)
+                )
         lpos = np.concatenate(lpos_l) if lpos_l else np.zeros(0, dtype=np.int64)
         rpos = np.concatenate(rpos_l) if rpos_l else np.zeros(0, dtype=np.int64)
         halves = np.concatenate(half_l) if half_l else np.zeros(0, dtype=np.int8)
-        group_ids = np.concatenate(group_l) if group_l else np.zeros(0, dtype=np.int32)
-        source_positions = (
-            np.concatenate(source_position_l)
-            if source_position_l
-            else np.zeros(0, dtype=np.int64)
-        )
         # Transfer order is free (the (remote, local) pairing is what
         # matters): sort by remote id so run detection harvests all the
         # adjacency the remote pool still has. The scatter index (lpos)
@@ -817,13 +832,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         rpos = rpos[order]
         lpos = lpos[order]
         halves = halves[order]
-        group_ids = group_ids[order]
-        source_positions = source_positions[order]
+        if localization_enabled:
+            group_ids = np.concatenate(group_l)[order]
+            source_positions = np.concatenate(source_position_l)[order]
         n_pos = len(lpos)
         n_ranks = len(read_specs)
         blens = self._remote_layout[engine_id][spec0.remote_rank][0]
         n_regions = len(blens)
-        if self._localization_config.enabled:
+        if localization_enabled:
             self._localization_validate_plan_manifests(
                 req_id,
                 meta,
@@ -846,27 +862,23 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             raise LocalizationError(
                 "coalesced source-rank slots must be a complete bijection"
             )
-        transfer_order = tuple(
-            NixlPlanPosition(
-                group_index=int(group_ids[index]),
-                source_position=int(source_positions[index]),
-                remote_block_id=int(rpos[index]),
-                valid_token_extent=(
-                    semantic_manifest.valid_token_extent
-                    if semantic_manifest is not None
-                    else 0
-                ),
-                group_token_capacity=(
-                    semantic_manifest.group_token_capacities[int(group_ids[index])]
-                    if semantic_manifest is not None
-                    else 0
-                ),
-                local_block_id=int(lpos[index]),
-                plane_index=int(halves[index]),
+        transfer_order: tuple[NixlPlanPosition, ...] = ()
+        if localization_enabled:
+            assert semantic_manifest is not None
+            transfer_order = tuple(
+                NixlPlanPosition(
+                    group_index=int(group_ids[index]),
+                    source_position=int(source_positions[index]),
+                    remote_block_id=int(rpos[index]),
+                    valid_token_extent=semantic_manifest.valid_token_extent,
+                    group_token_capacity=semantic_manifest.group_token_capacities[
+                        int(group_ids[index])
+                    ],
+                    local_block_id=int(lpos[index]),
+                    plane_index=int(halves[index]),
+                )
+                for index in range(n_pos)
             )
-            for index in range(n_pos)
-        )
-        if self._localization_config.enabled:
             for position in transfer_order:
                 if sp_flags[position.group_index]:
                     expected_half = position.source_position % 2
@@ -901,13 +913,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             lpos=lpos.tolist(),
             sp_half=halves.tolist(),
             slots=slots,
-            source_ranks=list(source_ranks),
-            transfer_order=transfer_order,
-            producer_engine_id=engine_id,
-            producer_request_id=meta.remote.request_id,
-            offer_generation=meta.remote.p2d_offer_generation,
-            iteration=meta.remote.p2d_iteration,
         )
+        if localization_enabled:
+            scatter_geometry.update(
+                source_ranks=list(source_ranks),
+                transfer_order=transfer_order,
+                producer_engine_id=engine_id,
+                producer_request_id=meta.remote.request_id,
+                offer_generation=meta.remote.p2d_offer_generation,
+                iteration=meta.remote.p2d_iteration,
+            )
         if self._audit_enabled:
             tail_exclude = self._audit_tail_exclude
             audit_rows: list[int] = []
@@ -937,7 +952,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             return "defer"
         off = ownership.lease.offset
 
-        if self._localization_config.enabled:
+        if localization_enabled:
             try:
                 if self._localization_writer is None:
                     raise LocalizationError(

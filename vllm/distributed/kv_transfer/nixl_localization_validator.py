@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlTerminalRecord,
     compute_semantic_contract_digest,
     leaf_source_key,
+    localization_request_id_base,
     locate_subsequence,
     select_source_manifest,
     validate_capture,
@@ -322,6 +323,11 @@ def _record_scope_errors(
             errors.append("source manifest engine differs from its session")
         if manifest.source_rank != session.rank:
             errors.append("source manifest rank differs from its session")
+        if (
+            localization_request_id_base(manifest.producer_request_id)
+            != session.target_request_id
+        ):
+            errors.append("source manifest request differs from its session target")
         return tuple(errors)
 
     if record.run_id != session.run_id:
@@ -332,6 +338,18 @@ def _record_scope_errors(
         errors.append(f"{record.record_type} engine differs from its session")
     if record.observer_rank != session.rank:
         errors.append(f"{record.record_type} rank differs from its session")
+    if (
+        record.child_request_id is None
+        or localization_request_id_base(record.child_request_id)
+        != session.target_request_id
+    ):
+        errors.append(f"{record.record_type} child differs from its session target")
+    if (
+        record.producer_request_id is not None
+        and localization_request_id_base(record.producer_request_id)
+        != session.target_request_id
+    ):
+        errors.append(f"{record.record_type} source differs from its session target")
     return tuple(errors)
 
 
@@ -844,6 +862,10 @@ def validate_localization_artifacts(
             or session.run_id != reference_session.run_id
             or session.transport_arm != reference_session.transport_arm
             or session.mode is not reference_session.mode
+            or session.target_request_id != reference_session.target_request_id
+            or len(session.target_request_id) == 0
+            or localization_request_id_base(session.target_request_id)
+            != session.target_request_id
             or session.observer is False
             or session.claim_scope != "instrumented_only"
         ):

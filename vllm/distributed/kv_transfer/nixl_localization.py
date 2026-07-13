@@ -28,6 +28,7 @@ GET_SOURCE_MANIFEST_MSG = b"get_source_manifest_v1"
 LOCALIZATION_ARTIFACT_MAGIC = b"P2DLOC01"
 LOCALIZATION_FRAME_PERSON = b"vllm-p2d-frame"
 LOCALIZATION_ROOT_PERSON = b"vllm-p2d-root1"
+_RANDOMIZED_REQUEST_ID_SUFFIX = re.compile(r"-[0-9a-f]{8}$")
 
 IntegrityLeafKey: TypeAlias = tuple[
     int,
@@ -62,6 +63,19 @@ class LocalizationError(RuntimeError):
     """Fail-closed error in the diagnostic localization protocol."""
 
 
+def localization_request_id_base(request_id: str) -> str:
+    """Remove vLLM's per-engine random suffix from a request identifier.
+
+    Prefill and decode independently append ``-<8 hex>`` to the same stable
+    request identifier. Localization selects that stable identity while its
+    artifacts retain each engine's exact internal identifier.
+
+    :param request_id: Stable or engine-internal request identifier.
+    :returns: Stable request identifier shared by prefill and decode.
+    """
+    return _RANDOMIZED_REQUEST_ID_SUFFIX.sub("", request_id)
+
+
 @dataclass(frozen=True, slots=True)
 class NixlLocalizationConfig:
     """Validated process configuration for localization diagnostics.
@@ -69,6 +83,8 @@ class NixlLocalizationConfig:
     :ivar mode: Trace, sham observer-control, or disabled mode.
     :ivar run_id: Identifier shared by producer and decoder processes.
     :ivar transport_arm: Human-readable transport configuration.
+    :ivar target_request_id: Exact stable request identifier to observe before
+        vLLM appends its per-engine random suffix.
     :ivar artifact_dir: Directory receiving framed MessagePack artifacts.
     :ivar manifest_timeout_s: Maximum time D may wait before failing closed.
     :ivar copy_chunk_bytes: Upper bound for one device-to-host observer copy.
@@ -78,15 +94,41 @@ class NixlLocalizationConfig:
     mode: LocalizationMode
     run_id: str
     transport_arm: str
+    target_request_id: str
     artifact_dir: Path | None
     manifest_timeout_s: float
     copy_chunk_bytes: int
     strict_zero_byte: bool
 
+    def __post_init__(self) -> None:
+        """Validate the relationship between mode and request scope."""
+        if self.mode is LocalizationMode.OFF:
+            if len(self.target_request_id) > 0:
+                raise ValueError("disabled localization cannot select a request")
+            return
+        if len(self.target_request_id) == 0:
+            raise ValueError("enabled localization requires a target request")
+        if (
+            localization_request_id_base(self.target_request_id)
+            != self.target_request_id
+        ):
+            raise ValueError("localization target must not include a random suffix")
+
     @property
     def enabled(self) -> bool:
         """Return whether the observer and source gate are active."""
         return self.mode is not LocalizationMode.OFF
+
+    def enabled_for(self, request_id: str) -> bool:
+        """Return whether *request_id* is the configured observation target.
+
+        :param request_id: Internal vLLM request identifier.
+        :returns: Whether localization is enabled for the request.
+        """
+        return (
+            self.enabled
+            and localization_request_id_base(request_id) == self.target_request_id
+        )
 
     @classmethod
     def from_environment(cls) -> "NixlLocalizationConfig":
@@ -109,6 +151,7 @@ class NixlLocalizationConfig:
                 mode=mode,
                 run_id="off",
                 transport_arm="off",
+                target_request_id="",
                 artifact_dir=None,
                 manifest_timeout_s=0.0,
                 copy_chunk_bytes=64 * 1024 * 1024,
@@ -117,11 +160,17 @@ class NixlLocalizationConfig:
 
         run_id = os.environ.get("VLLM_NIXL_P2D_RUN_ID", "")
         transport_arm = os.environ.get("VLLM_NIXL_P2D_TRANSPORT_ARM", "")
+        target_request_id = os.environ.get(
+            "VLLM_NIXL_P2D_TARGET_REQUEST_ID",
+            "",
+        )
         artifact_dir_text = os.environ.get("VLLM_NIXL_P2D_ARTIFACT_DIR", "")
         if len(run_id) == 0:
             raise ValueError("VLLM_NIXL_P2D_RUN_ID is required")
         if len(transport_arm) == 0:
             raise ValueError("VLLM_NIXL_P2D_TRANSPORT_ARM is required")
+        if len(target_request_id) == 0:
+            raise ValueError("VLLM_NIXL_P2D_TARGET_REQUEST_ID is required")
         if len(artifact_dir_text) == 0:
             raise ValueError("VLLM_NIXL_P2D_ARTIFACT_DIR is required")
 
@@ -142,6 +191,7 @@ class NixlLocalizationConfig:
             mode=mode,
             run_id=run_id,
             transport_arm=transport_arm,
+            target_request_id=target_request_id,
             artifact_dir=Path(artifact_dir_text),
             manifest_timeout_s=timeout_s,
             copy_chunk_bytes=chunk_mb * 1024 * 1024,
@@ -350,6 +400,7 @@ class NixlSessionRecord(msgspec.Struct, array_like=True, frozen=True):
     run_id: str
     transport_arm: str
     mode: LocalizationMode
+    target_request_id: str
     engine_id: str
     rank: int
     pid: int
@@ -460,6 +511,7 @@ class LocalizationArtifactWriter:
                 run_id=config.run_id,
                 transport_arm=config.transport_arm,
                 mode=config.mode,
+                target_request_id=config.target_request_id,
                 engine_id=engine_id,
                 rank=rank,
                 pid=pid,
@@ -1073,6 +1125,8 @@ def resolve_source_manifest_request(
         return rejected("required source ranks are outside the producer topology")
     if config.enabled is False:
         return rejected("producer localization observer is disabled")
+    if config.enabled_for(producer_request_id) is False:
+        return rejected("producer request is outside the localization target")
     if run_id != config.run_id or transport_arm != config.transport_arm:
         return rejected("localization run or transport arm mismatch")
 

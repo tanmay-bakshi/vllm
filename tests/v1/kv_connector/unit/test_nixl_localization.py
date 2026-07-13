@@ -13,6 +13,13 @@ from vllm.distributed.kv_transfer.integrity import (
     IntegrityPayloadKind,
     IntegrityStage,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    RemoteMeta,
+    ReqMeta,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
+    NixlPullConnectorWorker,
+)
 from vllm.distributed.kv_transfer.nixl_localization import (
     LocalizationArtifactWriter,
     LocalizationError,
@@ -40,17 +47,22 @@ from vllm.distributed.kv_transfer.nixl_localization_validator import (
     validate_localization_plan,
 )
 
+HTTP_TARGET_REQUEST_ID = "p2d-phase2db-separated-score2-20260713-p000-s000637"
+TARGET_REQUEST_ID_BASE = f"chatcmpl-{HTTP_TARGET_REQUEST_ID}"
+
 
 def _config(
     artifact_dir: Path,
     *,
     run_id: str = "run-localization",
     mode: LocalizationMode = LocalizationMode.TRACE,
+    target_request_id: str = TARGET_REQUEST_ID_BASE,
 ) -> NixlLocalizationConfig:
     return NixlLocalizationConfig(
         mode=mode,
         run_id=run_id,
         transport_arm="tcp-shm-cuda-copy",
+        target_request_id=target_request_id,
         artifact_dir=artifact_dir,
         manifest_timeout_s=30.0,
         copy_chunk_bytes=64 * 1024 * 1024,
@@ -87,8 +99,14 @@ def _manifest(
     blocks: tuple[int, ...] = (10, 11),
     source_rank: int = 0,
     registration_generation: str = "registration-1",
+    producer_request_id: str | None = None,
 ) -> NixlSourceManifest:
     source_region = region if region is not None else _region()
+    request_id = (
+        producer_request_id
+        if producer_request_id is not None
+        else config.target_request_id
+    )
     contract_digest = compute_semantic_contract_digest(
         region=source_region,
         group_index=0,
@@ -106,7 +124,7 @@ def _manifest(
             identity = build_integrity_identity(
                 config=config,
                 producer_engine_id="prefill",
-                producer_request_id="producer-request",
+                producer_request_id=request_id,
                 registration_generation=registration_generation,
                 semantic_contract_digest=contract_digest,
                 offer_generation=1,
@@ -137,7 +155,7 @@ def _manifest(
             run_id=config.run_id,
             transport_arm=config.transport_arm,
             producer_engine_id="prefill",
-            producer_request_id="producer-request",
+            producer_request_id=request_id,
             registration_generation=registration_generation,
             offer_generation=1,
             iteration=0,
@@ -166,6 +184,7 @@ def _plan(
     destination_planes: int = 2,
     positions: tuple[NixlPlanPosition, ...] | None = None,
     local_region: NixlRegionDescriptor | None = None,
+    child_request_id: str | None = None,
 ) -> NixlPlanRecord:
     remote = selected_remote if selected_remote is not None else manifest.block_ids[0]
     if selected_local is None:
@@ -218,7 +237,11 @@ def _plan(
         source_manifest_digests=(manifest.manifest_digest,),
         offer_generation=manifest.offer_generation,
         iteration=manifest.iteration,
-        child_request_id="decoder-child",
+        child_request_id=(
+            child_request_id
+            if child_request_id is not None
+            else manifest.producer_request_id
+        ),
         observer_engine_id="decoder",
         observer_rank=0,
         source_ranks=(0,),
@@ -345,10 +368,12 @@ def _write_trace(
     *,
     corrupt_stage: IntegrityStage | None = None,
     include_event: bool = True,
+    producer_request_id: str | None = None,
+    child_request_id: str | None = None,
 ) -> tuple[tuple[Path, Path], NixlSourceManifest, NixlPlanRecord]:
     config = _config(artifact_dir)
-    manifest = _manifest(config)
-    plan = _plan(manifest)
+    manifest = _manifest(config, producer_request_id=producer_request_id)
+    plan = _plan(manifest, child_request_id=child_request_id)
     source_writer = LocalizationArtifactWriter(config, "prefill", 0)
     source_writer.write(
         NixlSourceManifestRecord(
@@ -405,9 +430,87 @@ def _write_trace(
 
 
 @pytest.mark.cpu_test
+def test_config_requires_and_selects_exact_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_NIXL_P2D_LOCALIZATION", "trace")
+    monkeypatch.setenv("VLLM_NIXL_P2D_RUN_ID", "targeted-run")
+    monkeypatch.setenv("VLLM_NIXL_P2D_TRANSPORT_ARM", "cuda-copy")
+    monkeypatch.setenv("VLLM_NIXL_P2D_ARTIFACT_DIR", str(tmp_path))
+    monkeypatch.delenv("VLLM_NIXL_P2D_TARGET_REQUEST_ID", raising=False)
+
+    with pytest.raises(ValueError, match="TARGET_REQUEST_ID is required"):
+        NixlLocalizationConfig.from_environment()
+
+    monkeypatch.setenv(
+        "VLLM_NIXL_P2D_TARGET_REQUEST_ID",
+        TARGET_REQUEST_ID_BASE,
+    )
+    config = NixlLocalizationConfig.from_environment()
+
+    assert config.enabled
+    assert config.enabled_for(TARGET_REQUEST_ID_BASE)
+    assert config.enabled_for(f"{TARGET_REQUEST_ID_BASE}-deadbeef")
+    assert config.enabled_for(f"{TARGET_REQUEST_ID_BASE}-DEADBEEF") is False
+    assert config.enabled_for(f"{TARGET_REQUEST_ID_BASE}-r1-deadbeef") is False
+    assert config.enabled_for(f"{TARGET_REQUEST_ID_BASE}-deadbee") is False
+    assert config.enabled_for(f"{TARGET_REQUEST_ID_BASE}-deadbeef0") is False
+    assert config.enabled_for(HTTP_TARGET_REQUEST_ID) is False
+    with pytest.raises(ValueError, match="must not include a random suffix"):
+        _config(
+            tmp_path,
+            target_request_id=f"{TARGET_REQUEST_ID_BASE}-deadbeef",
+        )
+
+
+@pytest.mark.cpu_test
+def test_non_target_source_gate_rejects_localization_lineage(tmp_path: Path) -> None:
+    worker = object.__new__(NixlPullConnectorWorker)
+    worker._localization_config = _config(tmp_path)
+    remote = RemoteMeta(
+        block_ids=(),
+        host="127.0.0.1",
+        port=5601,
+        engine_id="prefill",
+        request_id="chatcmpl-unrelated",
+    )
+    metadata = ReqMeta(
+        local_block_ids=(),
+        local_physical_block_ids=(),
+        tp_size=4,
+        remote=remote,
+    )
+
+    assert worker._localization_source_gate("chatcmpl-unrelated", metadata, ())
+    remote.request_id = f"{TARGET_REQUEST_ID_BASE}-1234abcd"
+    with pytest.raises(LocalizationError, match="outside the decoder target"):
+        worker._localization_source_gate("chatcmpl-unrelated", metadata, ())
+    remote.request_id = "chatcmpl-unrelated"
+    remote.p2d_run_id = "stray-run"
+    with pytest.raises(LocalizationError, match="outside the decoder target"):
+        worker._localization_source_gate("chatcmpl-unrelated", metadata, ())
+
+
+@pytest.mark.cpu_test
 def test_complete_trace_validates(tmp_path: Path) -> None:
     """A complete source, plan, four-stage, and terminal trace is accepted."""
     paths, _, _ = _write_trace(tmp_path)
+    report = validate_localization_artifacts(paths)
+
+    assert report.passed
+    assert report.physical_pull_count == 1
+    assert report.verified_pull_count == 1
+
+
+@pytest.mark.cpu_test
+def test_validator_accepts_independent_internal_request_ids(tmp_path: Path) -> None:
+    paths, _, _ = _write_trace(
+        tmp_path,
+        producer_request_id=f"{TARGET_REQUEST_ID_BASE}-11111111",
+        child_request_id=f"{TARGET_REQUEST_ID_BASE}-22222222",
+    )
+
     report = validate_localization_artifacts(paths)
 
     assert report.passed
@@ -446,29 +549,46 @@ def test_validator_rejects_duplicate_and_mixed_artifacts(tmp_path: Path) -> None
     mixed_report = validate_localization_artifacts((*paths, mixed_writer.path))
     assert any("mixed" in error for error in mixed_report.errors)
 
+    mixed_target_config = _config(
+        tmp_path / "mixed-target",
+        target_request_id="chatcmpl-unrelated",
+    )
+    mixed_target_writer = LocalizationArtifactWriter(
+        mixed_target_config,
+        "target-engine",
+        0,
+    )
+    mixed_target_writer.close()
+    mixed_target_report = validate_localization_artifacts(
+        (*paths, mixed_target_writer.path)
+    )
+    assert any("mixed" in error for error in mixed_target_report.errors)
+
 
 @pytest.mark.cpu_test
 def test_source_gate_requires_exact_rank_set_and_lineage(tmp_path: Path) -> None:
     """The producer serves no duplicate, extra, stale, or mixed rank set."""
     config = _config(tmp_path)
-    rank_zero = _manifest(config)
+    producer_request_id = f"{TARGET_REQUEST_ID_BASE}-1234abcd"
+    rank_zero = _manifest(config, producer_request_id=producer_request_id)
     rank_one = _manifest(
         config,
         source_rank=1,
         registration_generation="registration-2",
+        producer_request_id=producer_request_id,
     )
     request = (
         b"get_source_manifest_v1",
         config.run_id,
         config.transport_arm,
         "prefill",
-        "producer-request",
+        producer_request_id,
         1,
         0,
         (0, 1),
     )
     store = {
-        ("producer-request", 1): {
+        (producer_request_id, 1): {
             0: rank_zero,
             1: rank_one,
         }
@@ -482,10 +602,16 @@ def test_source_gate_requires_exact_rank_set_and_lineage(tmp_path: Path) -> None
         store,
     )
     assert duplicate.status is ManifestStatus.REJECTED
+    off_target = resolve_source_manifest_request(
+        (*request[:4], "chatcmpl-unrelated", *request[5:]),
+        config,
+        store,
+    )
+    assert off_target.status is ManifestStatus.REJECTED
     pending = resolve_source_manifest_request(
         request,
         config,
-        {("producer-request", 1): {0: rank_zero}},
+        {(producer_request_id, 1): {0: rank_zero}},
     )
     assert pending.status is ManifestStatus.PENDING
     subset = resolve_source_manifest_request(
@@ -536,14 +662,14 @@ def test_source_gate_rejects_mixed_rank_semantics(tmp_path: Path) -> None:
             config.run_id,
             config.transport_arm,
             "prefill",
-            "producer-request",
+            TARGET_REQUEST_ID_BASE,
             1,
             0,
             (0, 1),
         ),
         config,
         {
-            ("producer-request", 1): {
+            (TARGET_REQUEST_ID_BASE, 1): {
                 0: rank_zero,
                 1: rank_one,
             }
@@ -606,7 +732,7 @@ def test_zero_byte_outcome_is_complete_but_non_evidentiary(tmp_path: Path) -> No
             evidentiary=False,
             producer_engine_id=manifest.producer_engine_id,
             producer_request_id=manifest.producer_request_id,
-            child_request_id="zero-child",
+            child_request_id=f"{TARGET_REQUEST_ID_BASE}-33333333",
             observer_engine_id="decoder",
             observer_rank=0,
             detail="full-prefix hit excluded from physical-pull comparisons",
