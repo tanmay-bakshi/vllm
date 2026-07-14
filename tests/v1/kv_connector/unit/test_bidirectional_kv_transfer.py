@@ -29,12 +29,18 @@ import copy
 import time
 from unittest.mock import patch
 
+import msgspec
 import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlConnector,
     NixlConnectorMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    PULL_READ_COMPLETE_PREFIX,
+    ProducerLease,
+    PullReadComplete,
 )
 from vllm.forward_context import ForwardContext
 from vllm.v1.outputs import (
@@ -463,7 +469,23 @@ def test_p_node_pull_then_send_kv(dist_init):
     assert "req-p2" in done_recving
     worker._reqs_to_send["req-p2"] = time.perf_counter() + 60
     worker._reqs_to_process.add("req-p2")
-    notif = f"req-p2:{worker.world_size}".encode()
+    worker._install_pull_completion_state(
+        "req-p2",
+        ProducerLease(
+            deadline=worker._reqs_to_send["req-p2"],
+            expected_consumers=1,
+            consumer_tp_size=worker.world_size,
+        ),
+    )
+    proof = PullReadComplete(
+        producer_request_id="req-p2",
+        consumer_request_id="decode-request",
+        consumer_index=0,
+        consumer_rank=worker.tp_rank,
+        consumer_tp_size=worker.world_size,
+        expected_consumers=1,
+    )
+    notif = PULL_READ_COMPLETE_PREFIX + msgspec.msgpack.encode(proof)
     orig = worker.nixl_wrapper.get_new_notifs
     worker.nixl_wrapper.get_new_notifs = lambda: {"agent": [notif]}
     done_sending, _ = connector.get_finished(finished_req_ids=set())

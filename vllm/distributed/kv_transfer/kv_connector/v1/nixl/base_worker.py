@@ -40,6 +40,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
+    HeartbeatInfo,
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
@@ -366,6 +367,9 @@ class NixlBaseConnectorWorker:
         )
         # NOTE (NickLucche): For now we use a hardcoded value for a simpler interface.
         self._lease_extension = kv_lease_duration * 2 // 3
+        self._heartbeat_interval = max(kv_lease_duration // 6, 1)
+        self._heartbeat_targets: dict[EngineId, HeartbeatInfo] = {}
+        self._last_heartbeat_time = 0.0
 
         self._is_hma_required = (
             not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
@@ -634,18 +638,12 @@ class NixlBaseConnectorWorker:
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Release fence: remote rids whose producer blocks are known to be
-        # released (own completion, sibling release, or producer EXPIRED
-        # notification). Bounded FIFO. A pull must never be issued for --
-        # nor a completion committed against -- a released rid.
+        # released after all expected consumers completed. Bounded FIFO. A pull
+        # must never be issued for, nor committed against, a released rid.
         self._released_rids: dict[str, float] = {}
         # Consumer side: completed pulls per rid; the rid is released once
         # this reaches the request's expected_consumers.
         self._rid_completion_counts: dict[str, int] = {}
-        # Producer side: expired requests are held here for a grace window
-        # (blocks still pinned) so consumers can process our EXPIRED
-        # notification or finish an in-flight read before the real free.
-        self._grace_frees: dict[ReqId, float] = {}
-
         # ---- resident-KV checksum auditor (VLLM_GEMMA4_KV_AUDIT) ----
         # Snapshot content sums of immutable prompt rows at pull commit;
         # re-verify periodically. Debug instrument, off by default.
@@ -2679,18 +2677,6 @@ class NixlBaseConnectorWorker:
         )
         del self._localization_source_rosters[req_id]
 
-    def _localization_discard_source_roster(self, req_id: ReqId) -> None:
-        """Discard a target roster whose transfer did not complete.
-
-        :param req_id: Producer request released without completion proof.
-        """
-        if self._localization_config.enabled_for(req_id) is False:
-            return
-        if self._localization_source_rosters.pop(req_id, None) is None:
-            raise LocalizationError(
-                f"failed target release has no retained source roster for {req_id}"
-            )
-
     def _localization_capture_staging(
         self,
         req_id: ReqId,
@@ -4102,6 +4088,7 @@ class NixlBaseConnectorWorker:
         :param service_pending: Whether freed staging may launch parked pulls.
         :returns: Requests done sending and receiving on this worker.
         """
+        self._service_heartbeats()
         assert self.transfer_topo is not None
         done_sending = self._get_new_notifs()
         done_recving = self._pop_done_transfers(self._recving_transfers)
@@ -4137,10 +4124,9 @@ class NixlBaseConnectorWorker:
             assert meta is not None, f"{req_id} not found in recving_metadata list"
 
             # Release fence: this pull completed for a rid whose producer
-            # blocks were already released (all expected consumers done,
-            # or producer EXPIRED) -- the bytes may come from reused
-            # pages. Fail the request (router retries with a fresh
-            # prefill) instead of committing and publishing them.
+            # blocks were already released after all expected consumers
+            # completed. The bytes may come from reused pages, so fail the
+            # request instead of committing and publishing them.
             # Full-prefix-hit requests (empty local ids) read nothing and
             # are exempt.
             if (
@@ -4212,44 +4198,7 @@ class NixlBaseConnectorWorker:
 
         self._sync_device_after_mamba_recv(done_recving, failed_recv_reqs)
 
-        # Handle timeout to avoid stranding blocks on remote.
-        now = time.perf_counter()
-        while self._reqs_to_send:
-            req_id, expires = next(iter(self._reqs_to_send.items()))
-            # Sorted dict, oldest requests are put first so we can exit early.
-            if now < expires:
-                break
-            count = self.consumer_notification_counts_by_req.pop(req_id, 0)
-            self.xfer_stats.record_kv_expired_req()
-            logger.warning(
-                "Releasing expired KV blocks for request %s which were "
-                "retrieved by %d remote worker(s) before lease expired.",
-                req_id,
-                count,
-            )
-            self._reqs_to_process.remove(req_id)
-            del self._reqs_to_send[req_id]
-            # Notify consumers so they fail (and retry) any pull still
-            # planned or in flight for this rid, then hold the blocks
-            # for a grace window before the real free: a read that
-            # already started still lands on intact pages.
-            expired_msg = f"EXPIRED:{req_id}".encode()
-            for agents in self._remote_agents.values():
-                for agent in agents.values():
-                    try:
-                        self.nixl_wrapper.send_notif(agent, notif_msg=expired_msg)
-                    except Exception:
-                        logger.exception(
-                            "Failed to send expiry notification for request %s",
-                            req_id,
-                        )
-            grace = float(os.environ.get("VLLM_GEMMA4_KV_FREE_GRACE_S", "5"))
-            self._grace_frees[req_id] = now + grace
-        # Drain grace-held frees whose window elapsed.
-        for req_id in [r for r, t in self._grace_frees.items() if now >= t]:
-            self._localization_discard_source_roster(req_id)
-            del self._grace_frees[req_id]
-            done_sending.add(req_id)
+        self._mark_overdue_leases(time.perf_counter())
 
         # coalesced pull: completed scatters freed staging; start
         # transfers for requests parked on the staging pool
@@ -4259,6 +4208,37 @@ class NixlBaseConnectorWorker:
         self._audit_tick(failed_recv_reqs)
 
         return done_sending, done_recving
+
+    def _mark_overdue_leases(self, now: float) -> None:
+        """Consume elapsed deadlines without releasing producer ownership.
+
+        :param now: Current monotonic timestamp.
+        """
+        for req_id, expires in tuple(self._reqs_to_send.items()):
+            if now < expires:
+                continue
+            if req_id not in self._reqs_to_process:
+                raise RuntimeError(
+                    f"Lease deadline for {req_id} has no producer ownership pin"
+                )
+            count = self._producer_completion_count(req_id)
+            self.xfer_stats.record_kv_expired_req()
+            logger.warning(
+                "KV lease overdue for request %s after %d remote completion "
+                "notification(s); retaining blocks until every expected "
+                "consumer finishes.",
+                req_id,
+                count,
+            )
+            del self._reqs_to_send[req_id]
+
+    def _producer_completion_count(self, req_id: ReqId) -> int:
+        """Return completed remote obligations for one producer request.
+
+        :param req_id: Producer request identifier.
+        :returns: Number of completion proofs observed by this worker.
+        """
+        return self.consumer_notification_counts_by_req.get(req_id, 0)
 
     # ------------------------------------------------------------------
     # Resident-KV checksum auditor (VLLM_GEMMA4_KV_AUDIT)
@@ -4566,11 +4546,44 @@ class NixlBaseConnectorWorker:
             self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
 
-    def _send_heartbeats(self, metadata: NixlConnectorMetadata) -> None:
+    def _update_heartbeat_targets(self, metadata: NixlConnectorMetadata) -> None:
+        """Apply a complete scheduler-side heartbeat ownership snapshot.
+
+        :param metadata: Connector metadata for the current model step.
         """
-        Send heartbeat notifications to remote engines, extending lease on KV blocks.
+        if metadata.heartbeat_snapshot is not None:
+            self._heartbeat_targets = metadata.heartbeat_snapshot
+
+    def _service_heartbeats(self) -> None:
+        """Dispatch retained heartbeat targets when their cadence is due."""
+        if len(self._heartbeat_targets) == 0:
+            return
+        now = time.perf_counter()
+        if now - self._last_heartbeat_time < self._heartbeat_interval:
+            return
+
+        self._last_heartbeat_time = now
+        self._dispatch_heartbeat_targets(dict(self._heartbeat_targets))
+
+    def _dispatch_heartbeat_targets(
+        self,
+        targets: dict[EngineId, HeartbeatInfo],
+    ) -> None:
+        """Dispatch one due heartbeat batch on the current worker thread.
+
+        :param targets: Producer engines and request ownership to renew.
         """
-        for engine_id, hb_info in metadata.heartbeat_by_engine.items():
+        self._send_heartbeat_targets(targets)
+
+    def _send_heartbeat_targets(
+        self,
+        targets: dict[EngineId, HeartbeatInfo],
+    ) -> None:
+        """Send heartbeat notifications for one retained ownership snapshot.
+
+        :param targets: Producer engines and request ownership to renew.
+        """
+        for engine_id, hb_info in targets.items():
             # Proactive handshake (this request may still be in waiting queue) so
             # the **next** heartbeat for this remote can go through.
             if (
@@ -4582,15 +4595,15 @@ class NixlBaseConnectorWorker:
                 continue  # handshake is still pending
 
             # Build the heartbeat message: "HB:req1,req2,..."
-            hb_msg = ("HB:" + ",".join(hb_info.req_ids)).encode()
+            hb_msg = ("HB:" + ",".join(sorted(hb_info.request_refcounts))).encode()
             for agent_name in self._remote_agents[engine_id].values():
                 try:
                     self.nixl_wrapper.send_notif(agent_name, notif_msg=hb_msg)
                 except Exception:
-                    logger.debug(
-                        "Failed to send heartbeat to engine %s",
+                    logger.warning(
+                        "Failed to send heartbeat to engine %s\n%s",
                         engine_id,
-                        exc_info=True,
+                        traceback.format_exc(),
                     )
 
     def get_mapped_blocks(

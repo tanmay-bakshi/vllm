@@ -58,7 +58,7 @@ class NixlKVConnectorStats(KVConnectorStats):
         self.data["num_failed_notifications"].append(1)
 
     def record_kv_expired_req(self):
-        """Record a request that had its KV blocks expire."""
+        """Record a request whose KV liveness deadline elapsed."""
         self.data["num_kv_expired_reqs"].append(1)
 
     def clone_and_reset(self) -> "NixlKVConnectorStats":
@@ -229,8 +229,10 @@ class NixlPromMetrics(KVConnectorPromMetrics):
 
         counter_nixl_num_kv_expired_reqs = self._counter_cls(
             name="vllm:nixl_num_kv_expired_reqs",
-            documentation="Number of requests that had their KV expire. "
-            "NOTE: This metric is tracked on the P instance.",
+            documentation=(
+                "Number of source requests whose KV liveness deadline elapsed "
+                "before authoritative transfer completion."
+            ),
             labelnames=labelnames,
         )
         self.counter_nixl_num_kv_expired_reqs = create_metric_per_engine(

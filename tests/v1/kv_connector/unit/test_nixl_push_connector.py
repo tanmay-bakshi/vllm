@@ -32,6 +32,7 @@ import msgspec
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
+    HeartbeatInfo,
     NixlConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
@@ -337,6 +338,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._reg_send_inbox = queue.Queue()
         w._finished_blocks_inbox = queue.Queue()
         w._pending_completion_notifs = queue.Queue()
+        w._heartbeat_send_inbox = queue.Queue()
         w._evict_finished_inbox = queue.Queue()
         w._push_writer_wake = threading.Event()
         w._push_writer_stop = threading.Event()
@@ -347,6 +349,9 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._recving_transfers = defaultdict(list)
         w._reqs_to_process = set()
         w._reqs_to_send = {}
+        w._heartbeat_targets = {}
+        w._heartbeat_interval = 5
+        w._last_heartbeat_time = 0.0
         w.consumer_notification_counts_by_req = defaultdict(int)
         w.tp_rank = 0
         w.world_size = 1
@@ -558,9 +563,6 @@ class TestPushWriterStartLoadKv:
         """``start_load_kv`` should hand registrations + finished blocks
         to the writer queues without doing matching itself."""
         w = _StubWriterWorker.fresh()
-        # Stub heartbeats to a no-op; tests don't exercise the heartbeat
-        # path here.
-        w._send_heartbeats = lambda metadata: None
         # Stub logical-to-kernel mapping used by reqs_to_recv.
         w._logical_to_kernel_block_ids = lambda x: x
 
@@ -849,7 +851,6 @@ class TestPushWriterNegative:
     def test_start_load_kv_with_empty_metadata_is_noop(self):
         """Empty metadata must not wake the writer or enqueue anything."""
         w = _StubWriterWorker.fresh()
-        w._send_heartbeats = lambda metadata: None
         w._logical_to_kernel_block_ids = lambda x: x
 
         meta = NixlConnectorMetadata()
@@ -859,6 +860,23 @@ class TestPushWriterNegative:
         assert w._finished_blocks_inbox.qsize() == 0
         # Wake should NOT be set if there was nothing to push.
         assert not w._push_writer_wake.is_set()
+
+    def test_start_load_kv_routes_heartbeat_through_writer(self) -> None:
+        worker = _StubWriterWorker.fresh()
+        worker._logical_to_kernel_block_ids = lambda block_ids: block_ids
+        metadata = NixlConnectorMetadata()
+        info = HeartbeatInfo(
+            request_refcounts={"prefill-1": 1},
+            host="10.0.0.1",
+            port=5601,
+            tp_size=1,
+        )
+        metadata.heartbeat_snapshot = {"prefill-engine": info}
+
+        worker.start_load_kv(metadata)
+
+        assert worker._heartbeat_send_inbox.get_nowait() == {"prefill-engine": info}
+        assert worker._push_writer_wake.is_set()
 
     def test_get_new_notifs_extends_lease_on_heartbeat(self):
         """``HB:`` notifs forwarded by the writer thread must extend the

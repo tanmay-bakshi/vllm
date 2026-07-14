@@ -4,14 +4,16 @@
 
 A dedicated ``nixl-push-writer`` thread owns all push-related NIXL ops:
 calls ``get_new_notifs`` (routing PUSH_REG internally; HB / completion
-notifs are forwarded to the engine main thread), sends PUSH_REG via
-``send_notif``, matches D registrations with P finished blocks, and
-issues WRITE transfers via ``make_prepped_xfer`` / ``transfer``.
+notifs are forwarded to the engine main thread), sends PUSH_REG and
+heartbeat notifications via ``send_notif``, matches D registrations
+with P finished blocks, and issues WRITE transfers via
+``make_prepped_xfer`` / ``transfer``.
 
-The engine main thread feeds the writer through three queues:
+The engine main thread feeds the writer through four queues:
 ``_reg_send_inbox`` (D-side regs to send), ``_finished_blocks_inbox``
-(P-side blocks from metadata) and ``_pending_completion_notifs``
-(non-PUSH_REG notifs forwarded back for HB / completion accounting).
+(P-side blocks from metadata), ``_heartbeat_send_inbox`` (due heartbeat
+target snapshots), and ``_pending_completion_notifs`` (non-PUSH_REG
+notifs forwarded back for HB / completion accounting).
 
 Wake model: the writer self-polls every
 ``_PUSH_WRITER_POLL_INTERVAL_MS`` only while it has unmatched
@@ -21,11 +23,10 @@ event-driven: the engine main thread sets ``_push_writer_wake`` from
 ``start_load_kv`` (when handing it new work) and from ``get_finished``
 (so each engine step gives the writer a chance to drain NIXL notifs);
 the handshake-completion callback sets the same event after a deferred
-PUSH_REG send has been queued. When a request's lease expires (the base
-worker reports it via ``done_sending``) or the WRITE completes,
-``get_finished`` enqueues an eviction onto ``_evict_finished_inbox`` so
-the writer drops any leftover ``_push_finished_blocks`` /
-``_pending_d_registrations`` and stops self-polling.
+PUSH_REG send has been queued. When a WRITE completes, ``get_finished``
+enqueues an eviction onto ``_evict_finished_inbox`` so the writer drops
+any leftover ``_push_finished_blocks`` / ``_pending_d_registrations`` and
+stops self-polling.
 """
 
 import queue
@@ -38,12 +39,13 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import numpy as np
 
-from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
+    HeartbeatInfo,
     NixlConnectorMetadata,
     RemoteMeta,
     ReqId,
@@ -103,10 +105,12 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._reg_send_inbox: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
         self._finished_blocks_inbox: queue.Queue[tuple[str, BlockIds]] = queue.Queue()
         self._pending_completion_notifs: queue.Queue[bytes] = queue.Queue()
-        # Main thread → writer: req_ids whose lease has expired or whose
-        # WRITE has completed. Writer drops them from
-        # ``_push_finished_blocks`` so an unmatched entry doesn't keep the
-        # writer busy-polling forever.
+        self._heartbeat_send_inbox: queue.Queue[dict[EngineId, HeartbeatInfo]] = (
+            queue.Queue()
+        )
+        # Main thread → writer: req_ids whose WRITE has completed. Writer drops
+        # them from ``_push_finished_blocks`` so an unmatched entry does not
+        # keep the writer busy-polling forever.
         self._evict_finished_inbox: queue.Queue[str] = queue.Queue()
 
         # Wake signal from engine main thread (start_load_kv / get_finished).
@@ -148,6 +152,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """Pre-process metadata; defer NIXL ops to the writer thread."""
+        self._update_heartbeat_targets(metadata)
+        self._service_heartbeats()
+
         # D-side: track reqs waiting for P to push.
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
@@ -183,20 +190,38 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         for req_id in metadata.reqs_not_processed:
             self._reqs_to_process.discard(req_id)
             assert req_id not in self._reqs_to_send
-        for req_id, expiration_time in metadata.reqs_to_send.items():
+        for req_id, lease in metadata.reqs_to_send.items():
             if req_id in self._reqs_to_process:
-                self._reqs_to_send[req_id] = expiration_time
-
-        # Heartbeats still leave from the main thread (base worker behaviour).
-        self._send_heartbeats(metadata)
+                self._reqs_to_send[req_id] = lease.deadline
 
     # --- Writer thread ------------------------------------------------- #
+
+    def _dispatch_heartbeat_targets(
+        self,
+        targets: dict[EngineId, HeartbeatInfo],
+    ) -> None:
+        """Hand one due heartbeat batch to the NIXL-owning writer thread.
+
+        :param targets: Producer engines and request ownership to renew.
+        """
+        self._heartbeat_send_inbox.put(targets)
+        self._push_writer_wake.set()
 
     def _push_writer_loop(self) -> None:
         sleep_s = _PUSH_WRITER_POLL_INTERVAL_MS / 1000.0
 
         while not self._push_writer_stop.is_set():
+            self._push_writer_wake.clear()
             try:
+                heartbeat_targets: dict[EngineId, HeartbeatInfo] | None = None
+                while True:
+                    try:
+                        heartbeat_targets = self._heartbeat_send_inbox.get_nowait()
+                    except queue.Empty:
+                        break
+                if heartbeat_targets is not None:
+                    super()._send_heartbeat_targets(heartbeat_targets)
+
                 # 1. D registrations to send.
                 while True:
                     try:
@@ -217,10 +242,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     else:
                         self._push_finished_blocks[rid] = blocks
 
-                # 2b. Evict finished blocks for requests that have either
-                # completed (WRITE acknowledged) or whose lease expired
-                # without a D registration.  Drop pending registrations
-                # for the same reason so we don't leak state.
+                # 2b. Evict blocks after WRITE completion and drop any pending
+                # registration for the same request.
                 while True:
                     try:
                         rid = self._evict_finished_inbox.get_nowait()
@@ -246,7 +269,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 self._push_writer_stop.wait(timeout=sleep_s)
             else:
                 self._push_writer_wake.wait()
-                self._push_writer_wake.clear()
 
     def _handle_push_reg_notif(self, notif: bytes) -> None:
         try:
@@ -446,8 +468,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         Returns True iff the handshake succeeded (or had already been
         completed). Returns False if the handshake raised; the request is
-        skipped in that case (the engine layer will reschedule or fail it
-        via the standard lease/timeout path)."""
+        skipped in that case, D's registration watchdog fails the receive,
+        and P retains producer ownership."""
         if decode_engine_id in self._remote_agents:
             return True
         try:
@@ -725,10 +747,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 dst_engine_id=dst_engine_id,
                 remote_rank=remote_rank,
             )
-            # On the P side this WRITE failure is purely outbound; we
-            # don't have a ``_recving_metadata`` entry to invalidate, so
-            # we just release the handle and let the engine reschedule
-            # via the lease / watchdog.
+            # On P this WRITE is purely outbound, so there is no
+            # ``_recving_metadata`` entry to invalidate. The D watchdog
+            # fails the receive while P retains ownership of pages whose
+            # transfer is not proven quiescent.
             if handle is not None:
                 self.nixl_wrapper.release_xfer_handle(handle)
             self.xfer_stats.record_failed_transfer()
@@ -767,10 +789,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     # next ``get_finished``.
                     self._recving_transfers.setdefault(req_id, [])
                 else:
-                    # Not tracked on either side (lease may have expired
-                    # before the notif arrived). Log and skip.
+                    # Not tracked on either side. Log and skip.
                     logger.error(
-                        "Unrecognized request %s notif (may have expired).",
+                        "Unrecognized request %s notification.",
                         req_id,
                     )
                 continue
@@ -807,9 +828,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             self.consumer_notification_counts_by_req.pop(req_id, None)
             done_sending.add(req_id)
 
-        # Tell the writer to drop any state it still holds for any
-        # request that just finished (push completed) or expired
-        # (lease ran out without a D registration ever arriving).
+        # Tell the writer to drop state for completed pushes.
         for req_id in done_sending:
             self._evict_finished_inbox.put(req_id)
         if done_sending:

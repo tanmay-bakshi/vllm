@@ -5,6 +5,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+import msgspec
+
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -28,6 +30,7 @@ GET_META_MSG = b"get_meta_msg"
 # Sent worker-to-worker over NIXL: D worker -> P worker, encoded as
 # PUSH_REG_NOTIF_PREFIX + msgpack(registration_data).
 PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
+PULL_READ_COMPLETE_PREFIX = b"PULL_READ_COMPLETE:"
 #
 # NIXL Connector Version
 #
@@ -45,8 +48,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   4: Add KV block lease renewal through heartbeats
 #   5: Add gated P-to-D source integrity manifests
 #   6: Replace source gating with post-transfer source references
+#   7: Add producer-owned leases and idempotent pull completion proofs
 #
-NIXL_CONNECTOR_VERSION: int = 6
+NIXL_CONNECTOR_VERSION: int = 7
 
 
 @dataclass
@@ -151,12 +155,51 @@ def compute_nixl_compatibility_hash(
 
 @dataclass
 class HeartbeatInfo:
-    """Heartbeat data for a single remote engine, sent from D worker to P."""
+    """Heartbeat ownership for one producer engine.
 
-    req_ids: set[ReqId]
+    :ivar request_refcounts: Active decoder consumers grouped by producer request.
+    :ivar host: Producer side-channel host.
+    :ivar port: Producer side-channel port.
+    :ivar tp_size: Producer tensor-parallel size.
+    """
+
+    request_refcounts: dict[ReqId, int]
     host: str
     port: int
     tp_size: int
+
+
+@dataclass(frozen=True)
+class ProducerLease:
+    """Producer ownership contract for remotely readable KV blocks.
+
+    :ivar deadline: Monotonic liveness deadline for operational reporting.
+    :ivar expected_consumers: Logical decoder children that may read the blocks.
+    :ivar consumer_tp_size: Decoder tensor-parallel size covered by the lease.
+    """
+
+    deadline: float
+    expected_consumers: int
+    consumer_tp_size: int
+
+
+class PullReadComplete(msgspec.Struct, frozen=True, array_like=True):
+    """Idempotent proof that one decoder rank finished one logical read.
+
+    :ivar producer_request_id: Request whose producer pages were read.
+    :ivar consumer_request_id: Concrete decoder request for diagnostics.
+    :ivar consumer_index: Stable parallel-sampling child index.
+    :ivar consumer_rank: Decoder tensor-parallel rank that completed the read.
+    :ivar consumer_tp_size: Decoder tensor-parallel world size.
+    :ivar expected_consumers: Decoder view of the producer's consumer contract.
+    """
+
+    producer_request_id: ReqId
+    consumer_request_id: ReqId
+    consumer_index: int
+    consumer_rank: int
+    consumer_tp_size: int
+    expected_consumers: int
 
 
 @dataclass
@@ -167,10 +210,10 @@ class RemoteMeta:
     engine_id: str
     request_id: str
     remote_num_tokens: int = 0
-    # How many consumer-side requests will pull/notify for this remote
-    # request (n>1 children all pull the same rid). The producer frees
-    # its blocks only after this many completion notifications per rank.
+    # Immutable producer-owned decoder topology. The producer releases
+    # pages only after every exact child/rank obligation is proven complete.
     expected_consumers: int = 1
+    consumer_tp_size: int = 1
     p2d_run_id: str | None = None
     p2d_transport_arm: str | None = None
     p2d_offer_generation: int | None = None
@@ -192,7 +235,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
-        self.reqs_to_send: dict[ReqId, float] = {}
+        self.reqs_to_send: dict[ReqId, ProducerLease] = {}
         # P-side block rosters retained until completed remote reads are observed.
         self.source_rosters: dict[ReqId, NixlSourceRoster] = {}
         # Requests that will execute a model forward with this metadata. This
@@ -200,8 +243,9 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self.scheduled_request_ids: set[ReqId] = set()
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
-        # Heartbeat data grouped by remote engine, sent by D worker to P.
-        self.heartbeat_by_engine: dict[EngineId, HeartbeatInfo] = {}
+        # A complete replacement of the D worker's heartbeat targets. None means
+        # the scheduler-side ownership state has not changed on this step.
+        self.heartbeat_snapshot: dict[EngineId, HeartbeatInfo] | None = None
         # Push mode (D side): registration data the D worker should send to
         # P workers via NIXL notification on this step.
         self.push_registrations: dict[ReqId, dict[str, Any]] = {}
@@ -242,6 +286,12 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         local_block_ids: BlockIds,
         kv_transfer_params: dict[str, Any],
     ):
+        expected_consumers = kv_transfer_params.get("expected_consumers", 1)
+        consumer_tp_size = kv_transfer_params.get("consumer_tp_size", 1)
+        if type(expected_consumers) is not int or expected_consumers < 1:
+            raise ValueError("expected_consumers must be a positive integer")
+        if type(consumer_tp_size) is not int or consumer_tp_size < 1:
+            raise ValueError("consumer_tp_size must be a positive integer")
         req = self._add_new_req(local_block_ids, kv_transfer_params)
         req.remote = RemoteMeta(
             block_ids=kv_transfer_params["remote_block_ids"],
@@ -250,7 +300,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             remote_num_tokens=int(kv_transfer_params["remote_num_tokens"]),
             host=kv_transfer_params["remote_host"],
             port=kv_transfer_params["remote_port"],
-            expected_consumers=int(kv_transfer_params.get("expected_consumers") or 1),
+            expected_consumers=expected_consumers,
+            consumer_tp_size=consumer_tp_size,
             p2d_run_id=kv_transfer_params.get("p2d_run_id"),
             p2d_transport_arm=kv_transfer_params.get("p2d_transport_arm"),
             p2d_offer_generation=kv_transfer_params.get("p2d_offer_generation"),

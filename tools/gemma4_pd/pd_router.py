@@ -103,6 +103,7 @@ class PDRouter:
     _health_interval_s: float
     _min_prefill_chars: int
     _decode_attempts: int
+    _decode_tp_size: int
     _health_task: asyncio.Task | None
 
     def __init__(
@@ -114,6 +115,7 @@ class PDRouter:
         min_prefill_chars: int,
         max_decode_inflight: int,
         decode_attempts: int,
+        decode_tp_size: int,
         trace: bool = False,
         require_prefill: bool = False,
     ) -> None:
@@ -126,14 +128,18 @@ class PDRouter:
         :param max_decode_inflight: Admission cap on concurrently
             dispatched decode requests across the pool (0 = uncapped).
         :param decode_attempts: Maximum decode dispatch attempts.
+        :param decode_tp_size: Tensor-parallel size of each decode backend.
         :param trace: Emit one JSON line per completions request with
             stage timestamps (request-in, prefill send/done, decode
             send/headers/first-chunk, done) for pipeline profiling.
-        :raises ValueError: If decode_attempts is less than one.
+        :raises ValueError: If decode_attempts is less than one or
+            decode_tp_size is not a positive integer.
         """
 
         if decode_attempts < 1:
             raise ValueError("decode_attempts must be at least 1")
+        if type(decode_tp_size) is not int or decode_tp_size < 1:
+            raise ValueError("decode_tp_size must be a positive integer")
         self._trace = trace
         # Recent per-request traces for GET /trace/{rid} (bounded; the
         # end-of-stream facts -- decode duration, completion tokens --
@@ -149,6 +155,7 @@ class PDRouter:
         self._health_interval_s = health_interval_s
         self._min_prefill_chars = min_prefill_chars
         self._decode_attempts = decode_attempts
+        self._decode_tp_size = decode_tp_size
         self._require_prefill = require_prefill
         self._decode_gate = (
             asyncio.Semaphore(max_decode_inflight)
@@ -301,6 +308,21 @@ class PDRouter:
                 total += len(content)
         return total
 
+    def _expected_consumers(self, body: dict) -> int:
+        """Normalize the requested decode fan-out.
+
+        :param body: Original request body.
+        :returns: Number of decode children that will consume the KV offer.
+        """
+
+        requested = body.get("n", 1)
+        if requested is None:
+            return 1
+        try:
+            return max(1, int(requested))
+        except (TypeError, ValueError):
+            return 1
+
     def _build_prefill_body(self, body: dict) -> dict:
         """Create the prefill-stage request body.
 
@@ -309,7 +331,11 @@ class PDRouter:
         """
 
         p_body = dict(body)
-        p_body["kv_transfer_params"] = dict(KV_TRANSFER_SEED)
+        p_body["kv_transfer_params"] = {
+            **KV_TRANSFER_SEED,
+            "expected_consumers": self._expected_consumers(body),
+            "consumer_tp_size": self._decode_tp_size,
+        }
         p_body["stream"] = False
         p_body["max_tokens"] = 1
         # Prefill materializes prompt KV once; n>1 would create n sibling
@@ -365,7 +391,6 @@ class PDRouter:
                 payload = await resp.json()
                 if tr is not None:
                     tr["t_p_done"] = time.time()
-                failed = False
                 if tr is not None:
                     usage = payload.get("usage")
                     if isinstance(usage, dict):
@@ -380,20 +405,31 @@ class PDRouter:
                                        if len(_rb) > 10 else []),
                     }), flush=True)
                 if isinstance(params, dict) and len(params) > 0:
+                    expected_contract = {
+                        "expected_consumers": self._expected_consumers(body),
+                        "consumer_tp_size": self._decode_tp_size,
+                    }
+                    for field, expected_value in expected_contract.items():
+                        returned_value = params.get(field)
+                        if (
+                            type(returned_value) is int
+                            and returned_value == expected_value
+                        ):
+                            continue
+                        if tr is not None:
+                            tr["p_error_type"] = "InvalidKVTransferParams"
+                            tr["p_error_message"] = (
+                                f"prefill {field} contract mismatch: "
+                                f"expected {expected_value}, got "
+                                f"{returned_value!r}"
+                            )
+                        return None
                     if tr is not None:
                         blocks = params.get("remote_block_ids")
                         tr["n_blocks"] = (
                             len(blocks) if isinstance(blocks, list) else 0
                         )
-                    # n>1 fans out into n D-side children that each pull
-                    # this rid; the producer must not free until all have
-                    # read (or the lease expires).
-                    try:
-                        params["expected_consumers"] = max(
-                            1, int(body.get("n") or 1)
-                        )
-                    except (TypeError, ValueError):
-                        params["expected_consumers"] = 1
+                    failed = False
                     return params
                 return None
         except (
@@ -848,6 +884,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum decode dispatch attempts.",
     )
     parser.add_argument(
+        "--decode-tp-size",
+        type=int,
+        default=1,
+        help="Tensor-parallel size of each decode backend.",
+    )
+    parser.add_argument(
         "--trace",
         action="store_true",
         help="Emit one JSON line per completions request with stage "
@@ -875,6 +917,7 @@ def main() -> None:
         min_prefill_chars=args.min_prefill_chars,
         max_decode_inflight=args.max_decode_inflight,
         decode_attempts=args.decode_attempts,
+        decode_tp_size=args.decode_tp_size,
         trace=args.trace,
         require_prefill=args.require_prefill,
     )

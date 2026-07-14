@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,7 +10,7 @@ import aiohttp
 import pytest
 from aiohttp import web
 
-from tools.gemma4_pd.pd_router import PDRouter
+from tools.gemma4_pd.pd_router import PDRouter, parse_args
 
 
 class _CompletionRequest:
@@ -48,10 +49,12 @@ class _TraceRequest:
 def _router(
     *,
     decode_attempts: int = 3,
+    decode_tp_size: int = 1,
     trace: bool = False,
     require_prefill: bool = False,
 ) -> PDRouter:
     """:param decode_attempts: Maximum decode dispatch attempts.
+    :param decode_tp_size: Tensor-parallel size of each decode backend.
     :param trace: Whether request tracing is enabled.
     :param require_prefill: Whether prefill failure rejects the request.
     :returns: Router configured for host-only tests.
@@ -65,6 +68,7 @@ def _router(
         min_prefill_chars=0,
         max_decode_inflight=0,
         decode_attempts=decode_attempts,
+        decode_tp_size=decode_tp_size,
         trace=trace,
         require_prefill=require_prefill,
     )
@@ -145,3 +149,121 @@ def test_decode_attempts_must_be_positive() -> None:
 
     with pytest.raises(ValueError, match="decode_attempts must be at least 1"):
         _router(decode_attempts=0)
+
+
+def test_decode_tp_size_must_be_positive() -> None:
+    """A router cannot advertise an empty decoder topology."""
+
+    with pytest.raises(ValueError, match="decode_tp_size must be a positive integer"):
+        _router(decode_tp_size=0)
+
+
+def test_decode_tp_size_cli_defaults_to_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deployment CLI defaults to a single-rank decoder."""
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["pd_router.py", "--decode", "http://decode"],
+    )
+
+    assert parse_args().decode_tp_size == 1
+
+
+def test_prefill_body_seeds_expected_consumers_before_collapsing_fanout() -> None:
+    """The producer receives fan-out and topology before serving the offer."""
+
+    router = _router(decode_tp_size=4)
+
+    prefill_body = router._build_prefill_body(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "n": 8,
+        }
+    )
+
+    assert prefill_body["n"] == 1
+    assert prefill_body["kv_transfer_params"]["expected_consumers"] == 8
+    assert prefill_body["kv_transfer_params"]["consumer_tp_size"] == 4
+
+
+@pytest.mark.parametrize(
+    ("returned_params", "is_valid"),
+    [
+        ({"remote_engine_id": "producer", "consumer_tp_size": 4}, False),
+        (
+            {
+                "remote_engine_id": "producer",
+                "expected_consumers": 7,
+                "consumer_tp_size": 4,
+            },
+            False,
+        ),
+        ({"remote_engine_id": "producer", "expected_consumers": 8}, False),
+        (
+            {
+                "remote_engine_id": "producer",
+                "expected_consumers": 8,
+                "consumer_tp_size": 2,
+            },
+            False,
+        ),
+        (
+            {
+                "remote_engine_id": "producer",
+                "expected_consumers": 8,
+                "consumer_tp_size": 4,
+            },
+            True,
+        ),
+    ],
+    ids=[
+        "expected-consumers-absent",
+        "expected-consumers-mismatch",
+        "consumer-tp-size-absent",
+        "consumer-tp-size-mismatch",
+        "exact-contract",
+    ],
+)
+def test_prefill_validates_producer_contract(
+    returned_params: dict,
+    is_valid: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A producer response must preserve the complete seeded contract."""
+
+    router = _router(decode_tp_size=4)
+    router._prefill[0].healthy = True
+    response = MagicMock()
+    response.status = 200
+    response.json = AsyncMock(return_value={"kv_transfer_params": returned_params})
+    response_context = MagicMock()
+    response_context.__aenter__ = AsyncMock(return_value=response)
+    response_context.__aexit__ = AsyncMock(return_value=None)
+    session = MagicMock()
+    session.post.return_value = response_context
+    monkeypatch.setattr(router, "_session", session)
+    body = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "n": 8,
+    }
+
+    params = asyncio.run(
+        router._run_prefill(
+            "/v1/chat/completions",
+            body,
+            "request-eight",
+        )
+    )
+
+    sent_body = session.post.call_args.kwargs["json"]
+    assert sent_body["kv_transfer_params"]["expected_consumers"] == 8
+    assert sent_body["kv_transfer_params"]["consumer_tp_size"] == 4
+    if is_valid:
+        assert params == returned_params
+        assert router._prefill[0].failed == 0
+        return
+    assert params is None
+    assert router._prefill[0].failed == 1

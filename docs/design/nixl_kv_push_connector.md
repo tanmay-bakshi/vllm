@@ -73,19 +73,19 @@ thread per worker (i.e. per TP rank), named ``nixl-push-writer``.
 Each owns the new push-specific NIXL operations on its rank:
 
 * ``nixl_wrapper.get_new_notifs()`` — receive notifications.
-* ``nixl_wrapper.send_notif(...)`` for the ``PUSH_REG:<msgpack>`` (D
-  side) and for the per-WRITE completion notif (P side).
+* ``nixl_wrapper.send_notif(...)`` for ``PUSH_REG:<msgpack>``, heartbeat
+  batches, and per-WRITE completion notifications.
 * ``nixl_wrapper.make_prepped_xfer(...) / transfer(...)`` — submit the
   WRITE itself.
 
-Heartbeats continue to go out from the engine main thread via the
-existing base-worker ``_send_heartbeats`` plumbing inside
-``start_load_kv``.
+The engine main thread retains heartbeat ownership and cadence, then
+places due batches on ``_heartbeat_send_inbox``. The writer performs the
+corresponding NIXL notification calls.
 
 ### Wake model
 
 The writer thread blocks on ``_push_writer_wake`` (a
-``threading.Event``) when it has no work. Three callers set the
+``threading.Event``) when it has no work. Four paths set the
 event:
 
 1. **``start_load_kv``** (worker main thread, called once per engine
@@ -109,15 +109,18 @@ event:
    the ``PUSH_REG`` directly. If the handshake *failed*, the callback
    fails the request instead of re-enqueuing, so there is no retry
    loop.
+4. **Heartbeat dispatch** (worker main thread) — places one due target
+   snapshot on ``_heartbeat_send_inbox`` and wakes the writer. Multiple
+   queued snapshots are coalesced to the newest before transmission.
 
 In addition to event-driven wakes, the writer self-polls at
 ``_PUSH_WRITER_POLL_INTERVAL_MS = 1.0`` ms while there are P-side
 finished blocks waiting for an unmatched ``PUSH_REG``.
 
-When a request completes on P (lease expires or the WRITE finishes),
-``get_finished`` enqueues the request id onto ``_evict_finished_inbox``,
-which the writer drains to drop stale ``_push_finished_blocks`` /
-``_pending_d_registrations`` and stop self-polling.
+When a WRITE completes on P, ``get_finished`` enqueues the request ID
+onto ``_evict_finished_inbox``. The writer drops stale
+``_push_finished_blocks`` / ``_pending_d_registrations`` and stops
+self-polling.
 
 ## Writer-local matching tables
 
@@ -211,11 +214,11 @@ Two per-request timers are armed on the scheduler:
   (or the user / proxy timing out the HTTP call) that ultimately fails
   the request.
 * **P-side block lease** — same ``_kv_lease_duration`` used by pull
-  mode. ``request_finished`` sets the expiration in ``_reqs_need_send``
-  and ``update_connector_output(finished_sending=...)`` clears it on
-  successful WRITE. Stale leases are reaped by ``get_finished`` in the
-  base worker, which then enqueues the eviction onto
-  ``_evict_finished_inbox`` so the writer also stops self-polling.
+  mode. ``request_finished`` sets the deadline in ``_reqs_need_send``
+  and ``update_connector_output(finished_sending=...)`` clears ownership
+  after a successful WRITE. An elapsed deadline is recorded once and
+  removed from renewal, but the pages and writer state remain owned until
+  the WRITE reaches a terminal completion.
 
 ## Failure handling
 
@@ -232,10 +235,11 @@ Two per-request timers are armed on the scheduler:
   failure counter. We deliberately do not call
   ``_handle_failed_transfer`` here: ``req_id`` on the P side has no
   entry in ``_recving_metadata`` (P is not the receiver), so the
-  helper would put a P-local request id into ``_failed_recv_reqs``
-  and trip the assertion in the base worker's ``get_finished``. The
-  outbound WRITE is dropped on the floor; D's lease watchdog handles
-  the missing completion.
+  helper would put a P-local request ID into ``_failed_recv_reqs`` and
+  trip the assertion in the base worker's ``get_finished``. D's
+  registration watchdog fails the missing receive, while P retains the
+  source allocation rather than reusing pages whose WRITE state is not
+  proven quiescent.
 
 ## Summary
 

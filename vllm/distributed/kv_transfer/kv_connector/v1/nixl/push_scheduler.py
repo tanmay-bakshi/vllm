@@ -36,6 +36,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
+    ProducerLease,
     ReqId,
 )
 from vllm.logger import init_logger
@@ -87,9 +88,9 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # P-side: newly finished blocks to ship to P workers on next step.
         self._newly_finished_push_blocks: dict[ReqId, BlockIds] = {}
 
-        # Soft watchdog timeout (seconds) for D-side registrations that
-        # never receive a push completion. Defaults to the existing
-        # decoder KV blocks TTL so behaviour matches the lease.
+        # Soft watchdog timeout (seconds) for D-side registrations that never
+        # receive a push completion. It shares the decoder liveness deadline's
+        # default but controls request failure, not source-page release.
         assert vllm_config.kv_transfer_config is not None
         self._push_registration_timeout: float = float(
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -265,8 +266,10 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
                 request.request_id,
                 self._kv_lease_duration,
             )
-            self._reqs_need_send[request.request_id] = (
-                time.perf_counter() + self._kv_lease_duration
+            self._reqs_need_send[request.request_id] = ProducerLease(
+                deadline=time.perf_counter() + self._kv_lease_duration,
+                expected_consumers=1,
+                consumer_tp_size=1,
             )
 
             remote_num_tokens = request.num_computed_tokens

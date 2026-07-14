@@ -508,15 +508,18 @@ def make_nixl_scheduler(
     if heartbeat:
         sched._heartbeat_by_engine = {}
         sched._heartbeat_req_engine = {}
-        sched._last_heartbeat_time = 0.0
+        sched._heartbeat_snapshot_dirty = False
         sched._kv_lease_duration = kv_lease_duration
-        sched._heartbeat_interval = kv_lease_duration // 6
         # Fields touched by build_connector_meta / request_finished:
         sched._reqs_need_recv = {}
         sched._reqs_need_send = {}
+        sched._source_rosters = {}
         sched._reqs_in_batch = set()
         sched._reqs_not_processed = set()
         sched._reqs_need_save = {}
+        sched._audit_finished_reqs = set()
+        sched._pull_single_flight = False
+        sched._pull_leaders = {}
         sched.use_host_buffer = False
         sched.engine_id = "test-engine"
         sched.side_channel_host = "localhost"
@@ -587,7 +590,7 @@ def make_nixl_push_scheduler(
     # update_connector_output.
     sched._heartbeat_by_engine = {}
     sched._heartbeat_req_engine = {}
-    sched._last_heartbeat_time = 0.0
+    sched._heartbeat_snapshot_dirty = False
     sched.blocks_per_sw = [0]
 
     return sched

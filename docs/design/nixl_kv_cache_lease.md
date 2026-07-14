@@ -1,128 +1,143 @@
-# NIXL KV Cache Lease Renewal
+# NIXL KV Source Ownership and Heartbeats
 
-In disaggregated prefill/decode deployments, the Prefill instance (P) must hold KV cache blocks in GPU memory after completing a prefill, waiting for the Decode instance (D) to read them via RDMA. A mechanism is needed to determine when those blocks can safely be freed when D isn't able to retrieve them. This mechanism was introduced in [PR #41383](https://github.com/vllm-project/vllm/pull/41383).
+In disaggregated prefill/decode deployments, a producer must keep every offered
+KV page immutable until all consumers that can address it have finished their
+transfer. A timer cannot establish that condition. Network silence is
+indistinguishable from a queued consumer, a delayed model step, or an in-flight
+RDMA operation.
 
-## Motivation
+The NIXL connector therefore uses completion notifications as the authority for
+page release. Heartbeats and deadlines are liveness signals that distinguish a
+healthy queued consumer from a stalled transfer; they never authorize page
+reuse.
 
-### The single-timeout problem
+## Safety invariant
 
-The original design used a single, large timeout (`VLLM_NIXL_ABORT_REQUEST_TIMEOUT`, default 480s) to control how long P retains KV blocks. When D crashed or disconnected, P would hold onto potentially several GBs of "dead" blocks for up to 8 minutes before reclaiming them. During this window, subsequent requests hitting P would find reduced cache capacity and experience degraded performance.
+A producer request remains in `_reqs_to_process` while any consumer may still
+read its block roster. The scheduler releases the request's pages only after the
+worker reports it in `finished_sending`, which requires the entire exact
+completion-proof set for that producer rank.
 
-### The overloading problem
+The producer owns the completion contract. It records both the number of
+logical decoder children (the original request's `n`) and the decoder
+tensor-parallel size before offering any blocks. Each producer rank derives its
+immutable proof set as the Cartesian product of:
 
-Simply lowering the timeout introduces a different failure mode. Under traffic surges, requests can sit in D's waiting queue for a long time before being scheduled. If the fixed timeout on P is too short, blocks get freed before D ever has a chance to read them --- causing unnecessary recomputation and wasted prefill work.
+- every logical child index; and
+- every decoder rank that can address that producer rank under the configured
+  producer/decoder tensor-parallel mapping.
 
-### Solution: lease renewal via heartbeats
+When decoder TP is at least producer TP, each producer rank owns its contiguous
+group of decoder ranks. When producer TP is larger, each producer rank owns the
+single decoder rank to which it maps. The TP sizes must divide evenly in either
+direction.
 
-The lease renewal mechanism addresses both problems simultaneously. P grants a **short initial lease** (default 30s) when prefill completes. While a request is **queued or in-flight** on D, D **periodically sends heartbeats** to P extending the lease. If D crashes and stops heartbeating, P reclaims blocks within seconds of the last heartbeat rather than waiting minutes. If D is merely overloaded, the heartbeats keep the blocks alive for as long as needed.
+The producer lifecycle is:
 
-## How It Works
+1. **Owned with a deadline.** The request is present in `_reqs_to_process` and
+   `_reqs_to_send`. Heartbeats may extend its deadline.
+2. **Overdue but owned.** The deadline elapsed, so `_reqs_to_send` is removed
+   and the overdue metric is recorded once. `_reqs_to_process`, the partial
+   proof set, source rosters, and KV pages remain intact.
+3. **Completed.** Every exact child/rank obligation has a valid proof. The
+   worker removes `_reqs_to_process`, reports `finished_sending`, and the
+   scheduler may reuse the pages.
 
-### Lease lifecycle
+This state machine fails closed. A dead or unreachable consumer can retain
+capacity, but it cannot turn a stale block address into apparently successful
+inference.
 
-When P finishes a prefill, it pins the KV blocks with an initial lease duration (`kv_lease_duration`, default 30s). From that point, the blocks are held until either:
+## Decoder ownership tracking
 
-1. **D completes the KV transfer** --- P receives a read-completion notification and frees the blocks immediately.
-2. **D keeps heartbeating** --- each heartbeat extends the lease by `lease_duration * 2/3` (~20s), keeping blocks alive indefinitely while D is healthy.
-3. **No heartbeat arrives** --- the lease expires and P reclaims the blocks.
+Heartbeat ownership begins in the decoder scheduler as soon as a remote-prefill
+request arrives, including while the request is waiting. Ownership is grouped by
+producer engine and reference-counted by producer request ID. Reference counting
+is required because one HTTP request with `n > 1` creates multiple decoder
+requests that share one producer request ID.
 
-### Piggybacking on NIXL notifications
+The scheduler sends complete ownership snapshots to the worker only when that
+state changes:
 
-Rather than introducing a new transport channel, heartbeats reuse NIXL's existing notification system (`send_notif` / `get_new_notifs`). The notification medium is backend-specific, with automatic fallback from IB/RoCE to TCP already handled by NIXL. Each single heartbeat message sent from D to a particular P renews all requests pinned in P on behalf of that D --- in other words, a single batched message per iteration renews the lease of multiple requests.
+- `None` means the worker's retained snapshot is unchanged;
+- a nonempty mapping replaces the retained targets; and
+- an empty mapping clears all targets.
 
-### Scheduler-side tracking (D)
+Snapshots are copied before they enter asynchronous worker metadata, so later
+scheduler mutations cannot alter queued state.
 
-A critical insight is that heartbeating must start **as soon as a request enters D's scheduler** --- not when it gets scheduled for execution. Under heavy load, a request may sit in the waiting queue for much longer than the initial lease duration, and the gap between arrival and scheduling is unbounded.
+## Worker heartbeat delivery
 
-To achieve this, D's connector (`NixlConnectorScheduler`) hooks into the scheduler via `on_new_request()`. When a request with `do_remote_prefill=True` arrives, the connector immediately starts tracking it for heartbeats. Requests are grouped by `remote_engine_id` for efficient batching. On each scheduler step, heartbeat metadata is packaged into `NixlConnectorMetadata` and sent to the worker, throttled by a heartbeat interval of `lease_duration // 6` (~5s).
+The worker retains the latest ownership snapshot and owns the transmission
+cadence. It services heartbeats at the beginning of `start_load_kv()` and at the
+beginning of every `_get_finished()` poll. Servicing `_get_finished()` is
+important for phase-separated transfers because the transfer drain calls it
+repeatedly while a large staged read is in progress.
 
-Tracking stops when either the KV transfer completes (via `update_connector_output`) or the request finishes/aborts (via `request_finished`).
+The default heartbeat interval is `kv_lease_duration // 6`, with a minimum of
+one second. Each accepted heartbeat extends a matching producer deadline to at
+least `now + kv_lease_duration * 2 // 3`.
 
-### Timing and simplicity
+Pull-mode heartbeats run on the engine worker thread alongside other pull NIXL
+operations. Push mode dispatches heartbeat batches through the existing
+`nixl-push-writer` thread, which owns push-side notification operations.
 
-Heartbeat sending and processing happen **in the forward loop**, not in a background thread. This means timing is not millisecond-precise --- a long model forward pass will delay heartbeats. However, the lease durations are configured with sufficient margin: with default settings, the heartbeat interval (~5s) and lease extension (~20s) are at least an order of magnitude larger than a typical forward pass. This avoids lock complexity between threads while keeping the design simple and extensible.
+A long model operation or delayed first snapshot can still miss a deadline.
+Correctness does not depend on heartbeat punctuality: the producer transitions
+to overdue retention and waits for completion proof.
 
-## Happy Path
+## Completion and release
 
-```mermaid
-sequenceDiagram
-    participant R as Routing Proxy
-    participant P as Prefill Instance
-    participant D as Decode Instance
+The producer returns its logical-child count and decoder TP size with the block
+offer. A decoder must match that contract to its local TP world and derive its
+stable child index from the decoder request lineage before it can read.
 
-    R->>P: Request (do_remote_decode=True)
-    P->>P: Run prefill
-    P->>P: Grant lease (30s)
-    P->>R: Response (with kv_transfer_params)
+Each completion notification is a typed proof containing the producer and
+decoder request IDs, child index, decoder rank, decoder TP size, and logical
+child count. For a native NIXL read, the proof is attached to the transfer and
+is delivered only after that read succeeds. A decoder that needs no bytes
+because of a complete prefix-cache hit sends the same proof directly. A
+producer rank omitted from a fixed replicated MLA or GQA transfer plan receives
+a no-read proof because that decoder cannot address its pages.
 
-    R->>D: Request (do_remote_prefill=True)
-    note over D: Request enters waiting queue
-    D->>D: on_new_request() starts tracking
+Each producer rank validates the proof against its immutable contract and the
+decoder request lineage. It stores the resulting `(child_index, decoder_rank)`
+identity in a set. Duplicate proofs are idempotent no-ops. Malformed proofs,
+contract mismatches, impossible identities, and identities assigned to another
+producer rank are ignored, so the source pages remain pinned. The request is
+released only when the observed set exactly equals the producer rank's derived
+obligation set.
 
-    loop Every ~5s (heartbeat interval)
-        D->>P: Heartbeat (extend lease)
-        P->>P: Lease extended by ~20s
-    end
+Consumer-local `_released_rids` fencing remains in place after all logical
+decoder children complete locally. It prevents an extra or delayed local pull
+from committing against a producer request already known to be complete, but it
+is not the producer's release authority.
 
-    note over D: Request scheduled for execution
-    D->>P: KV transfer (RDMA read)
-    P-->D: Transfer complete
-    D->>D: Stop heartbeating
-    P->>P: Free KV blocks
-```
+There is no timeout-based invalidation message. Deadlines are diagnostic only
+and never authorize page reuse. A safe finite reclamation protocol would
+require a request-scoped revoke followed by an acknowledgement that queued and
+in-flight reads are quiescent. Freeing after an unacknowledged notification or
+a fixed grace period does not satisfy the ownership invariant.
 
-## Decode Instance Crash
+## Failure behavior
 
-```mermaid
-sequenceDiagram
-    participant R as Routing Proxy
-    participant P as Prefill Instance
-    participant D as Decode Instance
+If a decoder, router, or network path disappears before completion, producer
+pages stay pinned. Operators should treat a rising overdue counter as a failed
+consumer path and recycle or repair the affected service instance. Restarting an
+instance destroys its allocator and transport session together, so no surviving
+consumer can retain a valid address into that old allocation.
 
-    R->>P: Request (do_remote_decode=True)
-    P->>P: Run prefill (holds onto KVs with lease)
-    P->>R: Response
-
-    R->>D: Request (do_remote_prefill=True)
-    D->>P: Heartbeat (extend lease)
-    D->>P: Heartbeat (extend lease)
-    note over D: D crashes
-    note over P: No heartbeat received
-    P->>P: Lease expires (~20s, not 480s)
-    P->>P: Free KV blocks
-```
-
-### Worker-side sending and receiving
-
-**On D (sending):** During `start_load_kv()` (called every forward pass), the worker reads `metadata.heartbeat_by_engine` and sends batched heartbeat notifications to each remote P engine. If D hasn't yet handshaked with P for a given engine (common for requests still in the waiting queue), it triggers a **proactive handshake** in a background thread.
-The heartbeat is deferred to the next step once the handshake completes --- the early handshake also **speeds up the eventual KV transfer.**
-
-**On P (receiving):** In `_get_new_notifs()`, P's worker checks incoming NIXL notifications. Messages starting with `"HB:"` are routed to `_handle_heartbeat()`, which extends the lease expiry for each referenced request using `max(old_expiry, now + lease_extension)`. This ensures leases are never accidentally shortened.
-
-## Bidirectional KV Transfer
-
-For multi-turn conversations, [bidirectional KV transfer](../features/disagg_prefill.md) allows D to cache KV blocks that P can pull from on subsequent turns. Since the timing of the next conversational turn is **client-dependent** (not controlled by the system), the heartbeat-based lease mechanism does not apply here. Instead, a separate `decoder_kv_blocks_ttl` (default 480s) provides a simple fixed timeout for blocks cached on D. If the client takes too long to continue the conversation, the blocks expire and P recomputes. Future work may extend a symmetric heartbeat mechanism to this case.
-
-## Key Design Decisions
-
-- **Per-request leasing, not per-instance.** P has no notion of which D its KV blocks belong to --- block ownership is only resolved after prefill completes and the router selects a D. Leasing at the request level avoids coupling P/D selection in the load balancer. In practice, D batches lease extensions toward the same P by grouping requests with the same `remote_engine_id`.
-
-- **NIXL notifications as transport.** Heartbeats reuse the existing `send_notif`/`get_new_notifs` system rather than adding ZMQ connections or API changes. The notification medium is backend-specific with IB/RoCE-to-TCP fallback already handled, making heartbeats work across any NIXL-supported transport.
-
-- **No background thread.** Heartbeat sending and processing happen in the forward loop (`start_load_kv` / `get_finished`). This avoids lock complexity between threads. Lease durations provide sufficient margin over forward-pass latency (seconds vs. milliseconds).
-
-- **Proactive handshake.** When D needs to heartbeat a P engine it hasn't connected to yet (common for requests still in the waiting queue), it triggers an early handshake in a background thread. This also speeds up the eventual KV transfer.
-
-- **Heterogeneous TP support.** When P TP > D TP (e.g., P TP=4, D TP=2), a single D worker pulls from multiple P workers. Heartbeats must be sent to all P workers for a given engine. Conversely, when D TP > P TP, a single P receives notifications from multiple Ds, which simply refreshes the TTL multiple times with no downside.
+Bidirectional transfer follows the same rule. `decoder_kv_blocks_ttl` supplies a
+liveness deadline for decoder-resident pages, but an elapsed deadline alone does
+not authorize reuse while a later prefiller may still hold their block roster.
 
 ## Configuration
 
-The lease mechanism is controlled through `kv_connector_extra_config` in `--kv-transfer-config`:
+The ownership mechanism is configured through `kv_connector_extra_config`:
 
-| Parameter               | Default | Description                                                                                                                                                   |
-|-------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `kv_lease_duration`     | 30s     | Initial lease duration on P. Heartbeat interval and extension amount are derived automatically (`interval = duration // 6`, `extension = duration * 2 // 3`). |
-| `decoder_kv_blocks_ttl` | 480s    | TTL for KV blocks cached on D in bidirectional transfer mode. Simple fixed timeout, not renewed via heartbeats.                                               |
+| Parameter | Default | Meaning |
+| --- | ---: | --- |
+| `kv_lease_duration` | 30s | Initial producer deadline and basis for heartbeat cadence and extension. |
+| `decoder_kv_blocks_ttl` | 480s | Liveness deadline for decoder-resident pages in bidirectional mode. |
 
 ```bash
 vllm serve <MODEL> \
@@ -133,4 +148,9 @@ vllm serve <MODEL> \
   }'
 ```
 
-For full NixlConnector configuration details, see the [NixlConnector Usage Guide](../features/nixl_connector_usage.md).
+`vllm:nixl_num_kv_expired_reqs` counts requests whose liveness deadline
+elapsed before authoritative completion. The name refers to the deadline, not
+to page release.
+
+For full connector configuration, see the
+[NixlConnector Usage Guide](../features/nixl_connector_usage.md).

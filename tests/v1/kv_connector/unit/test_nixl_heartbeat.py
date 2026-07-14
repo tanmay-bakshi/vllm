@@ -5,8 +5,26 @@
 import time
 from unittest.mock import MagicMock
 
+import msgspec
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    PULL_READ_COMPLETE_PREFIX,
+    HeartbeatInfo,
+    NixlConnectorMetadata,
+    ProducerLease,
+    PullReadComplete,
+    RemoteMeta,
+    ReqMeta,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
+    _consumer_tp_size,
+    _expected_consumers,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
+    _consumer_ranks_for_producer,
+    _parallel_consumer_index,
+)
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import create_request, make_nixl_scheduler
@@ -30,7 +48,38 @@ def _worker_stub():
     w = object.__new__(NixlConnectorWorker)
     w._reqs_to_send = {}
     w._lease_extension = 20
+    w._heartbeat_targets = {}
+    w._heartbeat_interval = 5
+    w._last_heartbeat_time = 0.0
+    w.tp_rank = 0
+    w.world_size = 1
+    w._pull_completion_states = {}
+    w._buffered_pull_completions = {}
+    w._completed_pull_contracts = {}
     return w
+
+
+def _completion_proof(
+    *,
+    producer_request_id: str = "prefill-1",
+    consumer_index: int,
+    consumer_rank: int = 0,
+    consumer_tp_size: int = 1,
+    expected_consumers: int = 4,
+) -> bytes:
+    proof = PullReadComplete(
+        producer_request_id=producer_request_id,
+        consumer_request_id=(
+            f"{consumer_index}_decode-request"
+            if expected_consumers > 1
+            else "decode-request"
+        ),
+        consumer_index=consumer_index,
+        consumer_rank=consumer_rank,
+        consumer_tp_size=consumer_tp_size,
+        expected_consumers=expected_consumers,
+    )
+    return PULL_READ_COMPLETE_PREFIX + msgspec.msgpack.encode(proof)
 
 
 # ===================================================================
@@ -44,7 +93,10 @@ def test_on_new_request_tracks_and_groups():
     s.on_new_request(_req(1))
     s.on_new_request(_req(2))
 
-    assert s._heartbeat_by_engine[_ENGINE_A].req_ids == {"prefill-1", "prefill-2"}
+    assert s._heartbeat_by_engine[_ENGINE_A].request_refcounts == {
+        "prefill-1": 1,
+        "prefill-2": 1,
+    }
     info = s._heartbeat_by_engine[_ENGINE_A]
     assert (info.host, info.port, info.tp_size) == ("my-host", 1234, 1)
     assert s._heartbeat_req_engine["id-1"] == (_ENGINE_A, "prefill-1")
@@ -82,7 +134,7 @@ def test_stop_heartbeat_partial_and_full():
     s.on_new_request(_req(2))
 
     s._stop_heartbeat("id-1")
-    assert s._heartbeat_by_engine[_ENGINE_A].req_ids == {"prefill-2"}
+    assert s._heartbeat_by_engine[_ENGINE_A].request_refcounts == {"prefill-2": 1}
     assert "id-1" not in s._heartbeat_req_engine
 
     s._stop_heartbeat("id-2")
@@ -90,24 +142,56 @@ def test_stop_heartbeat_partial_and_full():
     assert len(s._heartbeat_req_engine) == 0
 
 
+def test_stop_heartbeat_keeps_shared_producer_request_alive() -> None:
+    s = _sched()
+    first = _req(1)
+    second = _req(2)
+    second.kv_transfer_params["remote_request_id"] = "prefill-1"
+
+    s.on_new_request(first)
+    s.on_new_request(second)
+
+    info = s._heartbeat_by_engine[_ENGINE_A]
+    assert info.request_refcounts == {"prefill-1": 2}
+
+    s._stop_heartbeat("id-1")
+    assert info.request_refcounts == {"prefill-1": 1}
+    assert _ENGINE_A in s._heartbeat_by_engine
+
+    s._stop_heartbeat("id-2")
+    assert len(s._heartbeat_by_engine) == 0
+    assert len(s._heartbeat_req_engine) == 0
+
+
 # ===================================================================
-# Scheduler: build_connector_meta throttling
+# Scheduler: heartbeat ownership snapshots
 # ===================================================================
 
 
-def test_build_connector_meta_heartbeat_throttling():
-    # kv_lease_duration=30 => _heartbeat_interval = 30 // 6 = 5
-    s = _sched(kv_lease_duration=30)
+def test_build_connector_meta_emits_immutable_ownership_changes() -> None:
+    s = _sched()
     s.on_new_request(_req(1))
 
-    # Ensure the first call triggers by placing last_heartbeat far in the past.
-    s._last_heartbeat_time = time.perf_counter() - 10
     meta1 = s.build_connector_meta(MagicMock())
-    assert _ENGINE_A in meta1.heartbeat_by_engine
+    assert meta1.heartbeat_snapshot is not None
+    assert meta1.heartbeat_snapshot[_ENGINE_A].request_refcounts == {"prefill-1": 1}
 
-    # Immediate second call is throttled (< 5s since last).
     meta2 = s.build_connector_meta(MagicMock())
-    assert len(meta2.heartbeat_by_engine) == 0
+    assert meta2.heartbeat_snapshot is None
+
+    s.on_new_request(_req(2))
+    assert meta1.heartbeat_snapshot[_ENGINE_A].request_refcounts == {"prefill-1": 1}
+    meta3 = s.build_connector_meta(MagicMock())
+    assert meta3.heartbeat_snapshot is not None
+    assert meta3.heartbeat_snapshot[_ENGINE_A].request_refcounts == {
+        "prefill-1": 1,
+        "prefill-2": 1,
+    }
+
+    s._stop_heartbeat("id-1")
+    s._stop_heartbeat("id-2")
+    meta4 = s.build_connector_meta(MagicMock())
+    assert meta4.heartbeat_snapshot == {}
 
 
 # ===================================================================
@@ -163,3 +247,329 @@ def test_handle_heartbeat():
     assert w._reqs_to_send["req-b"] >= far_future
     # req-unknown: not added.
     assert "req-unknown" not in w._reqs_to_send
+
+
+def test_overdue_lease_retains_producer_ownership() -> None:
+    worker = _worker_stub()
+    future_deadline = time.perf_counter() + 100
+    worker._reqs_to_send = {
+        "prefill-future": future_deadline,
+        "prefill-1": time.perf_counter() - 1,
+    }
+    worker._reqs_to_process = {"prefill-future", "prefill-1"}
+    worker._install_pull_completion_state(
+        "prefill-1",
+        ProducerLease(
+            deadline=worker._reqs_to_send["prefill-1"],
+            expected_consumers=4,
+            consumer_tp_size=1,
+        ),
+    )
+    state = worker._pull_completion_states["prefill-1"]
+    state.acknowledgements.update({(0, 0), (1, 0), (2, 0)})
+    worker.xfer_stats = MagicMock()
+
+    worker._mark_overdue_leases(time.perf_counter())
+
+    assert worker._reqs_to_send == {"prefill-future": future_deadline}
+    assert worker._reqs_to_process == {"prefill-future", "prefill-1"}
+    assert state.acknowledgements == {(0, 0), (1, 0), (2, 0)}
+    worker.xfer_stats.record_kv_expired_req.assert_called_once_with()
+
+    worker._mark_overdue_leases(time.perf_counter())
+    worker.xfer_stats.record_kv_expired_req.assert_called_once_with()
+
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.get_new_notifs.return_value = {
+        "decoder": [_completion_proof(consumer_index=3)]
+    }
+    worker._localization_capture_source_post = MagicMock()
+
+    assert worker._get_new_notifs() == {"prefill-1"}
+    assert worker._reqs_to_process == {"prefill-future"}
+    assert worker._pull_completion_states == {}
+    worker._localization_capture_source_post.assert_called_once_with("prefill-1")
+
+
+def test_completion_proofs_are_idempotent_and_contract_exact() -> None:
+    worker = _worker_stub()
+    worker._reqs_to_process = {"prefill-1"}
+    worker._reqs_to_send = {"prefill-1": time.perf_counter() + 30}
+    worker._install_pull_completion_state(
+        "prefill-1",
+        ProducerLease(
+            deadline=worker._reqs_to_send["prefill-1"],
+            expected_consumers=2,
+            consumer_tp_size=2,
+        ),
+    )
+    worker.nixl_wrapper = MagicMock()
+    worker._localization_capture_source_post = MagicMock()
+    duplicate = _completion_proof(
+        consumer_index=0,
+        consumer_rank=0,
+        consumer_tp_size=2,
+        expected_consumers=2,
+    )
+    conflicting = _completion_proof(
+        consumer_index=1,
+        consumer_rank=0,
+        consumer_tp_size=2,
+        expected_consumers=1,
+    )
+    worker.nixl_wrapper.get_new_notifs.return_value = {
+        "decoder": [
+            duplicate,
+            duplicate,
+            conflicting,
+            _completion_proof(
+                consumer_index=0,
+                consumer_rank=1,
+                consumer_tp_size=2,
+                expected_consumers=2,
+            ),
+            _completion_proof(
+                consumer_index=1,
+                consumer_rank=0,
+                consumer_tp_size=2,
+                expected_consumers=2,
+            ),
+        ]
+    }
+
+    assert worker._get_new_notifs() == set()
+    assert worker._pull_completion_states["prefill-1"].acknowledgements == {
+        (0, 0),
+        (0, 1),
+        (1, 0),
+    }
+
+    worker.nixl_wrapper.get_new_notifs.return_value = {
+        "decoder": [
+            _completion_proof(
+                consumer_index=1,
+                consumer_rank=1,
+                consumer_tp_size=2,
+                expected_consumers=2,
+            )
+        ]
+    }
+    assert worker._get_new_notifs() == {"prefill-1"}
+
+    worker.nixl_wrapper.get_new_notifs.return_value = {"decoder": [duplicate]}
+    assert worker._get_new_notifs() == set()
+
+
+def test_completion_proof_waits_for_async_producer_contract() -> None:
+    worker = _worker_stub()
+    worker._reqs_to_process = {"prefill-1"}
+    worker._localization_capture_source_post = MagicMock()
+    worker.nixl_wrapper = MagicMock()
+    proof = _completion_proof(
+        consumer_index=0,
+        expected_consumers=1,
+    )
+    worker.nixl_wrapper.get_new_notifs.return_value = {"decoder": [proof]}
+
+    assert worker._get_new_notifs() == set()
+    assert worker._buffered_pull_completions == {
+        "prefill-1": {
+            msgspec.msgpack.decode(
+                proof[len(PULL_READ_COMPLETE_PREFIX) :],
+                type=PullReadComplete,
+            )
+        }
+    }
+
+    deadline = time.perf_counter() + 30
+    worker._install_pull_completion_state(
+        "prefill-1",
+        ProducerLease(
+            deadline=deadline,
+            expected_consumers=1,
+            consumer_tp_size=1,
+        ),
+    )
+    worker._reqs_to_send["prefill-1"] = deadline
+    worker.nixl_wrapper.get_new_notifs.return_value = {}
+
+    assert worker._get_new_notifs() == {"prefill-1"}
+    assert worker._buffered_pull_completions == {}
+    assert worker._reqs_to_process == set()
+    assert worker._reqs_to_send == {}
+
+
+@pytest.mark.parametrize(
+    ("producer_rank", "producer_tp_size", "consumer_tp_size", "expected"),
+    [
+        (0, 1, 1, (0,)),
+        (0, 2, 4, (0, 1)),
+        (1, 2, 4, (2, 3)),
+        (0, 4, 2, (0,)),
+        (1, 4, 2, (0,)),
+        (2, 4, 2, (1,)),
+        (3, 4, 2, (1,)),
+    ],
+)
+def test_producer_obligations_follow_tensor_parallel_mapping(
+    producer_rank: int,
+    producer_tp_size: int,
+    consumer_tp_size: int,
+    expected: tuple[int, ...],
+) -> None:
+    assert (
+        _consumer_ranks_for_producer(
+            producer_rank,
+            producer_tp_size,
+            consumer_tp_size,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("producer_tp_size", "consumer_tp_size"),
+    [(2, 3), (3, 2)],
+)
+def test_producer_obligations_reject_incompatible_topologies(
+    producer_tp_size: int,
+    consumer_tp_size: int,
+) -> None:
+    with pytest.raises(ValueError, match="must be divisible"):
+        _consumer_ranks_for_producer(0, producer_tp_size, consumer_tp_size)
+
+
+def test_parallel_consumer_identity_is_strict() -> None:
+    assert _parallel_consumer_index("0_parent-request", 2) == 0
+    assert _parallel_consumer_index("1_parent-request", 2) == 1
+    assert _parallel_consumer_index("parent-request", 1) == 0
+
+    with pytest.raises(ValueError, match="lacks"):
+        _parallel_consumer_index("parent-request", 2)
+    with pytest.raises(ValueError, match="outside"):
+        _parallel_consumer_index("2_parent-request", 2)
+    with pytest.raises(ValueError, match="expects one"):
+        _parallel_consumer_index("0_parent-request", 1)
+
+
+@pytest.mark.parametrize("value", [False, "2", 1.5, 0, -1])
+def test_producer_contract_requires_positive_integers(value: object) -> None:
+    with pytest.raises(ValueError, match="expected_consumers"):
+        _expected_consumers({"expected_consumers": value})
+    with pytest.raises(ValueError, match="consumer_tp_size"):
+        _consumer_tp_size({"consumer_tp_size": value})
+
+    assert _expected_consumers({"expected_consumers": 2}) == 2
+    assert _consumer_tp_size({"consumer_tp_size": 4}) == 4
+
+
+def test_decoder_completion_proof_uses_source_owned_contract() -> None:
+    worker = _worker_stub()
+    worker.tp_rank = 1
+    worker.world_size = 2
+    meta = ReqMeta(
+        local_block_ids=(),
+        local_physical_block_ids=(),
+        tp_size=4,
+        remote=RemoteMeta(
+            block_ids=(),
+            host="producer",
+            port=1234,
+            engine_id="producer-engine",
+            request_id="prefill-1",
+            expected_consumers=4,
+            consumer_tp_size=2,
+        ),
+    )
+
+    encoded = worker._read_completion_notification("3_decode-request", meta)
+    proof = msgspec.msgpack.decode(
+        encoded[len(PULL_READ_COMPLETE_PREFIX) :],
+        type=PullReadComplete,
+    )
+
+    assert proof == PullReadComplete(
+        producer_request_id="prefill-1",
+        consumer_request_id="3_decode-request",
+        consumer_index=3,
+        consumer_rank=1,
+        consumer_tp_size=2,
+        expected_consumers=4,
+    )
+
+
+def test_zero_byte_completion_finishes_decoder_without_release_on_send_error(
+) -> None:
+    worker = _worker_stub()
+    worker._remote_agents = {"producer-engine": {0: "producer-rank-0"}}
+    worker._recving_transfers = {}
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.send_notif.side_effect = RuntimeError("transport failed")
+    worker._log_failure = MagicMock()
+    worker.xfer_stats = MagicMock()
+
+    worker._send_zero_byte_completion(
+        "decode-request",
+        "producer-engine",
+        0,
+        b"proof",
+    )
+
+    assert worker._recving_transfers == {"decode-request": []}
+    worker.xfer_stats.record_failed_notification.assert_called_once_with()
+    worker._log_failure.assert_called_once()
+
+
+def test_worker_retains_and_services_heartbeat_snapshot() -> None:
+    worker = _worker_stub()
+    worker._dispatch_heartbeat_targets = MagicMock()
+    metadata = NixlConnectorMetadata()
+    info = HeartbeatInfo(
+        request_refcounts={"prefill-1": 2},
+        host="my-host",
+        port=1234,
+        tp_size=1,
+    )
+    metadata.heartbeat_snapshot = {_ENGINE_A: info}
+
+    worker._update_heartbeat_targets(metadata)
+    worker._service_heartbeats()
+
+    worker._dispatch_heartbeat_targets.assert_called_once_with({_ENGINE_A: info})
+
+    unchanged = NixlConnectorMetadata()
+    worker._update_heartbeat_targets(unchanged)
+    assert worker._heartbeat_targets == {_ENGINE_A: info}
+    worker._service_heartbeats()
+    worker._dispatch_heartbeat_targets.assert_called_once()
+
+    worker._last_heartbeat_time -= worker._heartbeat_interval
+    worker._service_heartbeats()
+    assert worker._dispatch_heartbeat_targets.call_count == 2
+
+    cleared = NixlConnectorMetadata()
+    cleared.heartbeat_snapshot = {}
+    worker._update_heartbeat_targets(cleared)
+    assert worker._heartbeat_targets == {}
+
+
+def test_worker_heartbeat_payload_deduplicates_shared_request() -> None:
+    worker = _worker_stub()
+    worker._ensure_handshake = MagicMock(return_value=None)
+    worker._remote_agents = {_ENGINE_A: {0: "producer-rank-0"}}
+    worker.nixl_wrapper = MagicMock()
+    targets = {
+        _ENGINE_A: HeartbeatInfo(
+            request_refcounts={"prefill-1": 8},
+            host="my-host",
+            port=1234,
+            tp_size=1,
+        )
+    }
+
+    worker._send_heartbeat_targets(targets)
+
+    worker.nixl_wrapper.send_notif.assert_called_once_with(
+        "producer-rank-0",
+        notif_msg=b"HB:prefill-1",
+    )

@@ -9,6 +9,9 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    ProducerLease,
+)
 from vllm.distributed.kv_transfer.nixl_localization import NixlSourceRoster
 from vllm.logger import init_logger
 
@@ -19,6 +22,32 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _expected_consumers(params: dict[str, Any]) -> int:
+    """Read and validate the producer-owned logical consumer count.
+
+    :param params: Request KV-transfer parameters.
+    :returns: Positive logical consumer count.
+    :raises ValueError: If the contract is invalid.
+    """
+    count = params.get("expected_consumers", 1)
+    if type(count) is not int or count < 1:
+        raise ValueError("expected_consumers must be a positive integer")
+    return count
+
+
+def _consumer_tp_size(params: dict[str, Any]) -> int:
+    """Read and validate the producer-owned decoder topology contract.
+
+    :param params: Request KV-transfer parameters.
+    :returns: Positive decoder tensor-parallel size.
+    :raises ValueError: If the contract is invalid.
+    """
+    size = params.get("consumer_tp_size", 1)
+    if type(size) is not int or size < 1:
+        raise ValueError("consumer_tp_size must be a positive integer")
+    return size
 
 
 class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
@@ -220,6 +249,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
 
         is_p_node = bool(params.get("do_remote_decode"))
         is_d_node = not is_p_node
+        expected_consumers = _expected_consumers(params)
+        consumer_tp_size = _consumer_tp_size(params)
 
         # Stop heartbeating for aborted requests that never reached finished_recving:
         # normal path cleans up in update_connector_output.
@@ -268,19 +299,19 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         localization_params: dict[str, Any] = {}
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
-            request_kv_blocks_ttl = self._kv_lease_duration
+            request_deadline_duration = self._kv_lease_duration
             if is_d_node:
-                # For blocks pinned on D, use a simpler timeout for now instead of a
-                # lease mechanism as turn2 request is client-driven.
-                request_kv_blocks_ttl = self.decoder_kv_blocks_ttl
+                request_deadline_duration = self.decoder_kv_blocks_ttl
             logger.debug(
-                "NIXLConnector request_finished(%s) waiting for %d seconds "
-                "before releasing blocks",
+                "NIXLConnector request_finished(%s) assigned a %d-second "
+                "liveness deadline",
                 request.request_id,
-                request_kv_blocks_ttl,
+                request_deadline_duration,
             )
-            self._reqs_need_send[request.request_id] = (
-                time.perf_counter() + request_kv_blocks_ttl
+            self._reqs_need_send[request.request_id] = ProducerLease(
+                deadline=time.perf_counter() + request_deadline_duration,
+                expected_consumers=expected_consumers,
+                consumer_tp_size=consumer_tp_size,
             )
             if is_p_node and self._localization_config.enabled_for(request.request_id):
                 self._localization_offer_generation += 1
@@ -317,5 +348,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             remote_num_tokens=remote_num_tokens,
+            expected_consumers=expected_consumers,
+            consumer_tp_size=consumer_tp_size,
             **localization_params,
         )

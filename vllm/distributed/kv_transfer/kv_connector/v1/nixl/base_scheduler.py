@@ -3,7 +3,6 @@
 """Base scheduler-side logic for the NIXL connector."""
 
 import threading
-import time
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -24,6 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     HeartbeatInfo,
     NixlConnectorMetadata,
     NixlHandshakePayload,
+    ProducerLease,
     ReqId,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
@@ -79,8 +79,6 @@ class NixlBaseConnectorScheduler:
                 "kv_lease_duration", 30
             )
         )
-        # NOTE (NickLucche): For now we use a hardcoded value for a simpler interface.
-        self._heartbeat_interval = self._kv_lease_duration // 6
         if current_platform.device_type == "cpu":
             self.use_host_buffer = False
         else:
@@ -135,8 +133,7 @@ class NixlBaseConnectorScheduler:
         )
         self._pull_leaders: dict[str, str] = {}
         self._reqs_need_save: dict[ReqId, Request] = {}
-        # Reqs to send and their expiration time
-        self._reqs_need_send: dict[ReqId, float] = {}
+        self._reqs_need_send: dict[ReqId, ProducerLease] = {}
         self._reqs_in_batch: set[ReqId] = set()
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
@@ -147,7 +144,7 @@ class NixlBaseConnectorScheduler:
         self._heartbeat_by_engine: dict[EngineId, HeartbeatInfo] = {}
         # Reverse lookup: local req_id -> (engine_id, remote_req_id) for O(1) removal
         self._heartbeat_req_engine: dict[ReqId, tuple[EngineId, ReqId]] = {}
-        self._last_heartbeat_time: float = 0.0
+        self._heartbeat_snapshot_dirty = False
 
         # Gather Sliding Window sizes for each kv cache group (if any) in number of
         # blocks per KV cache group. This is used to clip the local attention window.
@@ -190,7 +187,7 @@ class NixlBaseConnectorScheduler:
             logger.info(
                 "Bidirectional KV transfer is enabled and the kv "
                 "recompute threshold is set to %d tokens."
-                "KV blocks on D are released after a TTL of %d seconds.",
+                "KV blocks on D use a liveness deadline of %d seconds.",
                 self.kv_recompute_threshold,
                 self.decoder_kv_blocks_ttl,
             )
@@ -224,12 +221,16 @@ class NixlBaseConnectorScheduler:
             return
         if remote_engine_id not in self._heartbeat_by_engine:
             self._heartbeat_by_engine[remote_engine_id] = HeartbeatInfo(
-                req_ids=set(),
+                request_refcounts={},
                 host=host,
                 port=port,
                 tp_size=tp_size,
             )
-        self._heartbeat_by_engine[remote_engine_id].req_ids.add(remote_request_id)
+        info = self._heartbeat_by_engine[remote_engine_id]
+        info.request_refcounts[remote_request_id] = (
+            info.request_refcounts.get(remote_request_id, 0) + 1
+        )
+        self._heartbeat_snapshot_dirty = True
         self._heartbeat_req_engine[request.request_id] = (
             remote_engine_id,
             remote_request_id,
@@ -237,13 +238,28 @@ class NixlBaseConnectorScheduler:
 
     def _stop_heartbeat(self, req_id: ReqId) -> None:
         """Remove *req_id* from heartbeat tracking (if tracked)."""
-        if key := self._heartbeat_req_engine.pop(req_id, None):
-            engine_id, remote_id = key
-            if info := self._heartbeat_by_engine.get(engine_id):
-                info.req_ids.discard(remote_id)
-                if not info.req_ids:
-                    # Clean up empty engines so we don't leak a key when remote dies.
-                    del self._heartbeat_by_engine[engine_id]
+        key = self._heartbeat_req_engine.pop(req_id, None)
+        if key is None:
+            return
+
+        engine_id, remote_id = key
+        info = self._heartbeat_by_engine.get(engine_id)
+        if info is None:
+            raise RuntimeError(f"Missing heartbeat owner for decoder request {req_id}")
+        refcount = info.request_refcounts.get(remote_id)
+        if refcount is None or refcount <= 0:
+            raise RuntimeError(
+                f"Missing heartbeat reference for producer request {remote_id}"
+            )
+        if refcount > 1:
+            info.request_refcounts[remote_id] = refcount - 1
+            self._heartbeat_snapshot_dirty = True
+            return
+
+        del info.request_refcounts[remote_id]
+        if len(info.request_refcounts) == 0:
+            del self._heartbeat_by_engine[engine_id]
+        self._heartbeat_snapshot_dirty = True
 
     def _get_transferable_block_ids(
         self,
@@ -501,12 +517,17 @@ class NixlBaseConnectorScheduler:
         meta.audit_finished = self._audit_finished_reqs
         self._audit_finished_reqs = set()
 
-        # Package heartbeats, throttled by heartbeat_interval.
-        if self._heartbeat_by_engine:
-            now = time.perf_counter()
-            if now - self._last_heartbeat_time >= self._heartbeat_interval:
-                self._last_heartbeat_time = now
-                meta.heartbeat_by_engine = self._heartbeat_by_engine
+        if self._heartbeat_snapshot_dirty:
+            meta.heartbeat_snapshot = {
+                engine_id: HeartbeatInfo(
+                    request_refcounts=dict(info.request_refcounts),
+                    host=info.host,
+                    port=info.port,
+                    tp_size=info.tp_size,
+                )
+                for engine_id, info in self._heartbeat_by_engine.items()
+            }
+            self._heartbeat_snapshot_dirty = False
 
         # Clear the list once workers start the transfers
         self._reqs_need_recv.clear()

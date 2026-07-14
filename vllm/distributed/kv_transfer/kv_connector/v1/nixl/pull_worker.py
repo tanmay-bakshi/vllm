@@ -5,8 +5,10 @@
 import os
 import time
 import traceback
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import msgspec
 import numpy as np
 
 from vllm.distributed.kv_transfer.integrity import IntegrityIdentity
@@ -14,7 +16,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    PULL_READ_COMPLETE_PREFIX,
     NixlConnectorMetadata,
+    ProducerLease,
+    PullReadComplete,
     ReqMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
@@ -37,6 +42,80 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_MAX_BUFFERED_PULL_COMPLETIONS_PER_REQUEST = 65_536
+
+
+@dataclass
+class PullCompletionState:
+    """Exact decoder read obligations for one producer-side lease.
+
+    :ivar expected_consumers: Logical parallel-sampling consumer count.
+    :ivar consumer_tp_size: Decoder tensor-parallel size.
+    :ivar expected_acknowledgements: Exact child/rank proofs required locally.
+    :ivar acknowledgements: Valid proofs observed so far.
+    """
+
+    expected_consumers: int
+    consumer_tp_size: int
+    expected_acknowledgements: frozenset[tuple[int, int]]
+    acknowledgements: set[tuple[int, int]] = field(default_factory=set)
+
+
+def _parallel_consumer_index(request_id: str, expected_consumers: int) -> int:
+    """Derive the stable child index encoded by parallel sampling.
+
+    :param request_id: Decoder-side request identifier.
+    :param expected_consumers: Producer-owned logical consumer count.
+    :returns: Parallel-sampling child index.
+    :raises ValueError: If request lineage and the consumer contract disagree.
+    """
+    prefix, separator, _ = request_id.partition("_")
+    has_child_index = len(separator) > 0 and prefix.isdigit()
+    if expected_consumers == 1:
+        if has_child_index:
+            raise ValueError(
+                f"request {request_id} is a parallel-sampling child but its "
+                "producer contract expects one consumer"
+            )
+        return 0
+    if has_child_index is False:
+        raise ValueError(
+            f"request {request_id} lacks a parallel-sampling child index for "
+            f"{expected_consumers} consumers"
+        )
+    consumer_index = int(prefix)
+    if consumer_index >= expected_consumers:
+        raise ValueError(
+            f"request {request_id} child index {consumer_index} is outside its "
+            f"{expected_consumers}-consumer contract"
+        )
+    return consumer_index
+
+
+def _consumer_ranks_for_producer(
+    producer_rank: int,
+    producer_tp_size: int,
+    consumer_tp_size: int,
+) -> tuple[int, ...]:
+    """Return decoder ranks whose reads can target one producer rank.
+
+    :param producer_rank: Local producer tensor-parallel rank.
+    :param producer_tp_size: Producer tensor-parallel size.
+    :param consumer_tp_size: Decoder tensor-parallel size.
+    :returns: Exact decoder ranks assigned to the producer rank.
+    :raises ValueError: If the tensor-parallel sizes are incompatible.
+    """
+    if consumer_tp_size >= producer_tp_size:
+        if consumer_tp_size % producer_tp_size != 0:
+            raise ValueError("consumer TP must be divisible by producer TP")
+        ratio = consumer_tp_size // producer_tp_size
+        start = producer_rank * ratio
+        return tuple(range(start, start + ratio))
+    if producer_tp_size % consumer_tp_size != 0:
+        raise ValueError("producer TP must be divisible by consumer TP")
+    ratio = producer_tp_size // consumer_tp_size
+    return (producer_rank // ratio,)
+
 
 class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     """Pull-specific (READ) worker logic."""
@@ -48,6 +127,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         kv_cache_config: "KVCacheConfig",
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        self._pull_completion_states: dict[str, PullCompletionState] = {}
+        self._buffered_pull_completions: dict[str, set[PullReadComplete]] = {}
+        self._completed_pull_contracts: dict[str, tuple[int, int]] = {}
         if self._phase_separate_transfer_decode and not self.coalesce_pull:
             raise ValueError("phase_separate_transfer_decode requires coalesced pull")
         if self._phase_separate_transfer_decode and not self._no_stock_dma():
@@ -60,6 +142,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
         :param metadata: Scheduler metadata for transfers entering this step.
         """
+        self._update_heartbeat_targets(metadata)
+        self._service_heartbeats()
         self._begin_transfer_phase()
         self._audit_retire(metadata)
         self._localization_capture_source_rosters(metadata.source_rosters)
@@ -107,6 +191,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Remove all requests that are not to be processed (eg aborted).
         for req_id in metadata.reqs_not_processed:
             self._reqs_to_process.discard(req_id)
+            self._buffered_pull_completions.pop(req_id, None)
             pre_read_plan = self._localization_pre_read_plans.get(req_id)
             producer_engine_id: str | None = None
             producer_request_id: str | None = None
@@ -128,21 +213,69 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             assert req_id not in self._reqs_to_send
 
         # Add to requests that are waiting to be read and track expiration.
-        for req_id, expiration_time in metadata.reqs_to_send.items():
+        for req_id, lease in metadata.reqs_to_send.items():
             if req_id in self._reqs_to_process:
-                self._reqs_to_send[req_id] = expiration_time
+                self._install_pull_completion_state(req_id, lease)
+                self._reqs_to_send[req_id] = lease.deadline
 
-        # Send heartbeats to P-side engines to keep KV blocks alive while
-        # requests sit in the D scheduler WAITING queue.
-        self._send_heartbeats(metadata)
         self._drain_transfer_phase()
         self._localization_capture_pre_read(metadata.scheduled_request_ids)
         self._record_transfer_decode_boundary()
+
+    def _install_pull_completion_state(
+        self,
+        request_id: str,
+        lease: ProducerLease,
+    ) -> None:
+        """Install the immutable completion obligations for a new lease.
+
+        :param request_id: Producer request that owns the source pages.
+        :param lease: Producer-owned lifetime and consumer contract.
+        """
+        if lease.expected_consumers < 1 or lease.consumer_tp_size < 1:
+            raise ValueError(f"request {request_id} has an invalid producer lease")
+        consumer_ranks = _consumer_ranks_for_producer(
+            self.tp_rank,
+            self.world_size,
+            lease.consumer_tp_size,
+        )
+        obligations = frozenset(
+            (consumer_index, consumer_rank)
+            for consumer_index in range(lease.expected_consumers)
+            for consumer_rank in consumer_ranks
+        )
+        existing = self._pull_completion_states.get(request_id)
+        if existing is not None:
+            if (
+                existing.expected_consumers != lease.expected_consumers
+                or existing.consumer_tp_size != lease.consumer_tp_size
+                or existing.expected_acknowledgements != obligations
+            ):
+                raise RuntimeError(
+                    f"request {request_id} changed its producer completion contract"
+                )
+            return
+        self._pull_completion_states[request_id] = PullCompletionState(
+            expected_consumers=lease.expected_consumers,
+            consumer_tp_size=lease.consumer_tp_size,
+            expected_acknowledgements=obligations,
+        )
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.transfer_topo is not None
         localization_enabled = self._localization_config.enabled_for(req_id)
         engine_id = meta.remote.engine_id
+        try:
+            notification_id = self._read_completion_notification(req_id, meta)
+        except ValueError as error:
+            self._log_failure(
+                failure_type="invalid_completion_contract",
+                req_id=req_id,
+                error=error,
+                meta=meta,
+            )
+            self._handle_failed_transfer(req_id, None)
+            return
         # Update last activity from this remote. Mind that cleanup is done on main
         # thread (this one), so we don't race on this structure.
         self._engine_last_active[engine_id] = time.perf_counter()
@@ -234,7 +367,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             assert len(read_specs) == 1
 
         if localization_enabled and sum(len(group) for group in local_block_ids) == 0:
-            result = self._coalesced_read_request(req_id, meta, read_specs)
+            result = self._coalesced_read_request(
+                req_id,
+                meta,
+                read_specs,
+                notification_id=notification_id,
+            )
             if result != "posted":
                 raise LocalizationError(
                     f"zero-byte request {req_id} did not complete its release path"
@@ -268,6 +406,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 req_id,
                 meta,
                 read_specs,
+                notification_id,
                 source_contracts,
             )
             if res == "posted":
@@ -304,7 +443,37 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             self._handle_failed_transfer(req_id, None)
             return
 
-        self._stock_read_specs(req_id, meta, read_specs)
+        self._stock_read_specs(req_id, meta, read_specs, notification_id)
+
+    def _read_completion_notification(self, req_id: str, meta: ReqMeta) -> bytes:
+        """Encode one decoder-rank completion identity for a logical read.
+
+        :param req_id: Decoder-side request identifier.
+        :param meta: Remote producer metadata and immutable consumer contract.
+        :returns: Typed NIXL completion notification.
+        :raises ValueError: If the decoder does not match the producer contract.
+        """
+        if meta.remote is None:
+            raise ValueError(f"request {req_id} has no remote producer metadata")
+        if meta.remote.consumer_tp_size != self.world_size:
+            raise ValueError(
+                f"request {req_id} producer contract expects decoder TP "
+                f"{meta.remote.consumer_tp_size}, local decoder TP is "
+                f"{self.world_size}"
+            )
+        consumer_index = _parallel_consumer_index(
+            req_id,
+            meta.remote.expected_consumers,
+        )
+        proof = PullReadComplete(
+            producer_request_id=meta.remote.request_id,
+            consumer_request_id=req_id,
+            consumer_index=consumer_index,
+            consumer_rank=self.tp_rank,
+            consumer_tp_size=self.world_size,
+            expected_consumers=meta.remote.expected_consumers,
+        )
+        return PULL_READ_COMPLETE_PREFIX + msgspec.msgpack.encode(proof)
 
     def _localization_build_source_contracts(
         self,
@@ -554,7 +723,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         return os.environ.get("VLLM_GEMMA4_NIXL_NO_STOCK_DMA", "1") == "1"
 
     def _stock_read_specs(
-        self, req_id: str, meta: ReqMeta, read_specs: list[ReadSpec]
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        read_specs: list[ReadSpec],
+        notification_id: bytes,
     ) -> None:
         """The stock per-descriptor pull for one request's read specs
         (extracted from _read_blocks_for_req so the pending-queue
@@ -596,23 +769,46 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 read_spec=spec,
                 request_id=req_id,
                 dst_engine_id=meta.remote.engine_id,
-                remote_request_id=meta.remote.request_id,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
-                expected_consumers=meta.remote.expected_consumers,
+                notification_id=notification_id,
             )
 
-        if self.use_mla and tp_ratio < 0 and read_specs:
-            # ..but we still need to notify the other remote ranks that we
-            # have the blocks we need so they can update the request state.
-            notif_id = (
-                f"{meta.remote.request_id}:{self.world_size}"
-                f":{meta.remote.expected_consumers}"
-            ).encode()
-            remote_agents = self._remote_agents[meta.remote.engine_id]
-            for rank_to_notify, agent in remote_agents.items():
-                if rank_to_notify != read_specs[0].remote_rank:
-                    self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
+        self._notify_non_read_producer_ranks(meta, read_specs, notification_id)
+
+    def _notify_non_read_producer_ranks(
+        self,
+        meta: ReqMeta,
+        read_specs: list[ReadSpec],
+        notification_id: bytes,
+    ) -> None:
+        """Complete obligations for producer ranks this decoder does not read.
+
+        Replicated MLA or GQA pages can be omitted from the transfer plan, but
+        their producer ranks still own the lease. A no-read proof is safe as
+        soon as the plan is fixed because this decoder cannot touch those pages.
+
+        :param meta: Remote producer metadata.
+        :param read_specs: Producer ranks this decoder may actually read.
+        :param notification_id: Typed decoder-rank completion proof.
+        """
+        assert meta.remote is not None
+        read_ranks = {spec.remote_rank for spec in read_specs}
+        remote_agents = self._remote_agents[meta.remote.engine_id]
+        for producer_rank, agent in remote_agents.items():
+            if producer_rank in read_ranks:
+                continue
+            try:
+                self.nixl_wrapper.send_notif(agent, notif_msg=notification_id)
+            except Exception:
+                logger.error(
+                    "Failed to prove no-read completion for producer request "
+                    "%s to producer rank %d; producer pages remain pinned.\n%s",
+                    meta.remote.request_id,
+                    producer_rank,
+                    traceback.format_exc(),
+                )
+                self.xfer_stats.record_failed_notification()
 
     # ------------------------------------------------------------------
     # Coalesced pull
@@ -671,10 +867,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         starved by smaller ones slipping past it)."""
         while self._coalesce_pending:
             req_id, meta, read_specs, source_contracts = self._coalesce_pending[0]
+            notification_id = self._read_completion_notification(req_id, meta)
             res = self._coalesced_read_request(
                 req_id,
                 meta,
                 read_specs,
+                notification_id,
                 source_contracts,
             )
             if res == "defer":
@@ -692,13 +890,19 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     )
                     self._handle_failed_transfer(req_id, None)
                     continue
-                self._stock_read_specs(req_id, meta, read_specs)
+                self._stock_read_specs(
+                    req_id,
+                    meta,
+                    read_specs,
+                    notification_id,
+                )
 
     def _coalesced_read_request(
         self,
         req_id: str,
         meta: ReqMeta,
         read_specs: list[ReadSpec],
+        notification_id: bytes,
         source_contracts: tuple[NixlSourceContract, ...] = (),
     ) -> str:
         """Post one whole-request READ per remote rank into owned staging.
@@ -710,6 +914,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         :param req_id: Decoder request identifier.
         :param meta: Complete transfer metadata.
         :param read_specs: Per-source-rank transfer specifications.
+        :param notification_id: Typed decoder-rank completion proof.
         :param source_contracts: Frozen diagnostic source contracts.
         :returns: ``posted``, ``defer``, or ``stock`` before native failure.
         """
@@ -739,16 +944,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             [list(g) for g in spec0.remote_block_ids],
             remote_info.remote_physical_blocks_per_logical,
         )
-        notif_id = (
-            f"{meta.remote.request_id}:{self.world_size}"
-            f":{meta.remote.expected_consumers}"
-        ).encode()
         if len(local_ids) == 0 or sum(len(g) for g in local_ids) == 0:
-            # full prefix hit: just release P's blocks on every rank
+            # A full prefix hit performs no native read, so its proof can be
+            # sent immediately and its empty transfer can complete locally.
             for s in read_specs:
                 agent = self._remote_agents[engine_id][s.remote_rank]
                 try:
-                    self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
+                    self.nixl_wrapper.send_notif(
+                        agent,
+                        notif_msg=notification_id,
+                    )
                 except Exception:
                     logger.error(
                         "full-prefix release notification failed for %s rank %s\n%s",
@@ -757,6 +962,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         traceback.format_exc(),
                     )
                     self.xfer_stats.record_failed_notification()
+            self._notify_non_read_producer_ranks(
+                meta,
+                read_specs,
+                notification_id,
+            )
+            self._recving_transfers.setdefault(req_id, [])
             return "posted"
 
         # HMA broadcast semantics (see _compute_desc_ids): every group's
@@ -1017,21 +1228,21 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 ld,
                 rd,
                 agent,
-                notif_id,
+                notification_id,
             )
+        self._notify_non_read_producer_ranks(meta, read_specs, notification_id)
         ownership.seal_posting()
         return "posted"
 
     def _read_blocks(
         self,
         *,
-        expected_consumers: int = 1,
         read_spec: ReadSpec,
         dst_engine_id: str,
         request_id: str,
-        remote_request_id: str,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
+        notification_id: bytes,
     ):
         """
         Post a READ point-to-point xfer request from a single local worker to
@@ -1080,31 +1291,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # NOTE(rob): according to nvidia the staging blocks are used to
         # saturate IB with heterogeneous TP sizes.
 
-        # Number of D TP workers that will read from dst P. Propagate info
-        # on notification so that dst worker can wait before freeing blocks.
-        notif_id = (
-            f"{remote_request_id}:{self.world_size}:{expected_consumers}"
-        ).encode()
-
         # Full prefix cache hit: do not need to read remote blocks,
         # just notify P worker that we have the blocks we need.
         if len(local_block_ids) == 0:
-            # A full prefix cache hit is indicated with an empty list.
-            agent_name = self._remote_agents[dst_engine_id][remote_rank]
-            try:
-                self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
-            except Exception as e:
-                self._log_failure(
-                    failure_type="notification_failed",
-                    msg="P worker blocks will be freed after timeout. "
-                    "This may indicate network issues.",
-                    req_id=request_id,
-                    error=e,
-                    dst_engine_id=dst_engine_id,
-                    remote_rank=remote_rank,
-                    remote_agent_name=agent_name,
-                )
-                self.xfer_stats.record_failed_notification()
+            self._send_zero_byte_completion(
+                request_id,
+                dst_engine_id,
+                remote_rank,
+                notification_id,
+            )
             return
 
         assert (
@@ -1116,6 +1311,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         local_block_ids, remote_block_ids = self._apply_prefix_caching(
             local_block_ids, remote_block_ids, remote_physical_per_logical
         )
+        if sum(len(group) for group in local_block_ids) == 0:
+            self._send_zero_byte_completion(
+                request_id,
+                dst_engine_id,
+                remote_rank,
+                notification_id,
+            )
+            return
 
         # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
@@ -1148,7 +1351,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 local_block_descs_ids,
                 remote_xfer_side_handle,
                 remote_block_descs_ids,
-                notif_msg=notif_id,
+                notif_msg=notification_id,
             )
 
             # Begin async xfer.
@@ -1168,86 +1371,202 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
             self._handle_failed_transfer(request_id, handle)
 
-    def _get_new_notifs(self) -> set[str]:
-        """
-        Get req_ids which got a remote xfer message. When multiple consumers
-        are reading from the same producer (heterogeneous TP scenario), wait
-        for all consumers to be done pulling.
+    def _send_zero_byte_completion(
+        self,
+        request_id: str,
+        producer_engine_id: str,
+        producer_rank: int,
+        notification_id: bytes,
+    ) -> None:
+        """Report a proven no-read path and complete it on the decoder.
 
-        Also handles heartbeat notifications ("HB:req1,req2,...") by
-        extending the lease on the referenced requests.
+        :param request_id: Decoder-side request identifier.
+        :param producer_engine_id: Remote producer engine.
+        :param producer_rank: Remote producer tensor-parallel rank.
+        :param notification_id: Typed decoder-rank completion proof.
         """
-        assert self.transfer_topo is not None
+        agent_name = self._remote_agents[producer_engine_id][producer_rank]
+        try:
+            self.nixl_wrapper.send_notif(agent_name, notif_msg=notification_id)
+        except Exception as error:
+            self._log_failure(
+                failure_type="notification_failed",
+                msg="P worker blocks remain pinned without this completion proof",
+                req_id=request_id,
+                error=error,
+                dst_engine_id=producer_engine_id,
+                remote_rank=producer_rank,
+                remote_agent_name=agent_name,
+            )
+            self.xfer_stats.record_failed_notification()
+        self._recving_transfers.setdefault(request_id, [])
+
+    def _get_new_notifs(self) -> set[str]:
+        """Apply heartbeats and exact decoder read-completion proofs.
+
+        :returns: Producer requests whose complete immutable obligation set
+            has been satisfied.
+        """
         notified_req_ids: set[str] = set()
+        for req_id in tuple(self._buffered_pull_completions):
+            if req_id not in self._pull_completion_states:
+                continue
+            proofs = self._buffered_pull_completions.pop(req_id)
+            for proof in proofs:
+                if self._record_pull_completion(proof, allow_buffer=False):
+                    notified_req_ids.add(req_id)
+
         for notifs in self.nixl_wrapper.get_new_notifs().values():
             for notif in notifs:
-                msg = notif.decode("utf-8")
-
-                # Handle heartbeat messages from D-side.
-                if msg.startswith("HB:"):
-                    self._handle_heartbeat(msg[3:])
+                if notif.startswith(b"HB:"):
+                    try:
+                        heartbeat_payload = notif[3:].decode("utf-8")
+                    except UnicodeDecodeError:
+                        logger.error("Ignoring malformed NIXL heartbeat payload")
+                        continue
+                    self._handle_heartbeat(heartbeat_payload)
                     continue
-
-                # Producer expired a lease: fence the rid and fail any
-                # parked pull for it (in-flight ones are handled at
-                # completion by the release fence in get_finished).
-                if msg.startswith("EXPIRED:"):
-                    rid = msg[len("EXPIRED:") :]
-                    logger.warning("Producer expired lease for %s; fencing.", rid)
-                    self._mark_rid_released(rid)
-                    still_parked = []
-                    for item in self._coalesce_pending:
-                        p_req_id, p_meta, _, _ = item
-                        if (
-                            p_meta.remote is not None
-                            and p_meta.remote.request_id == rid
-                        ):
-                            self._handle_failed_transfer(p_req_id, None)
-                        else:
-                            still_parked.append(item)
-                    self._coalesce_pending.clear()
-                    self._coalesce_pending.extend(still_parked)
+                if notif.startswith(PULL_READ_COMPLETE_PREFIX) is False:
+                    logger.error("Ignoring unknown NIXL pull notification")
                     continue
-
-                parts = msg.rsplit(":", 2)
-                if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
-                    req_id, tp_size, expected_s = parts
-                    expected_consumers = int(expected_s)
-                else:
-                    req_id, tp_size = msg.rsplit(":", 1)
-                    expected_consumers = 1
-                if (
-                    req_id not in self._reqs_to_send
-                    and req_id not in self._reqs_to_process
-                ):
+                try:
+                    proof = msgspec.msgpack.decode(
+                        notif[len(PULL_READ_COMPLETE_PREFIX) :],
+                        type=PullReadComplete,
+                    )
+                except (msgspec.DecodeError, msgspec.ValidationError):
                     logger.error(
-                        "Potentially invalid KV blocks for "
-                        "unrecognized request %s were retrieved by "
-                        "a decode worker. They may have expired.",
-                        req_id,
+                        "Ignoring malformed NIXL pull completion proof\n%s",
+                        traceback.format_exc(),
                     )
                     continue
 
-                # NOTE: `tp_ratio` is the opposite when swapping local<>remote
-                n_consumers = int(tp_size)
-                tp_ratio = self.transfer_topo.tp_ratio(n_consumers)
-
-                # Number of reads *per producer* to wait for.
-                # When remote D TP > local P TP we expect `tp_ratio` reads.
-                consumers_per_producer = (
-                    -tp_ratio if n_consumers > self.world_size else 1
-                )
-
-                self.consumer_notification_counts_by_req[req_id] += 1
-                # Wait for all consumers (D) to be done reading before
-                # freeing: TP fan-out reads AND n>1 sibling pulls.
-                if (
-                    self.consumer_notification_counts_by_req[req_id]
-                    >= consumers_per_producer * expected_consumers
-                ):
-                    self._localization_capture_source_post(req_id)
-                    notified_req_ids.add(req_id)
-                    del self.consumer_notification_counts_by_req[req_id]
-                    self._reqs_to_process.remove(req_id)
-                    self._reqs_to_send.pop(req_id, None)
+                if self._record_pull_completion(proof, allow_buffer=True):
+                    notified_req_ids.add(proof.producer_request_id)
         return notified_req_ids
+
+    def _record_pull_completion(
+        self,
+        proof: PullReadComplete,
+        *,
+        allow_buffer: bool,
+    ) -> bool:
+        """Apply one proof or retain it until its producer contract arrives.
+
+        :param proof: Decoder-authored completion proof.
+        :param allow_buffer: Whether an owned pre-contract request may retain
+            this proof for a later worker step.
+        :returns: Whether the proof completed the producer's obligation set.
+        """
+        req_id = proof.producer_request_id
+        state = self._pull_completion_states.get(req_id)
+        if state is None:
+            completed_contract = self._completed_pull_contracts.get(req_id)
+            if completed_contract is not None:
+                try:
+                    self._completion_identity(proof, *completed_contract)
+                except ValueError:
+                    logger.error(
+                        "Conflicting duplicate completion proof for released "
+                        "producer request %s\n%s",
+                        req_id,
+                        traceback.format_exc(),
+                    )
+                return False
+            if allow_buffer and req_id in self._reqs_to_process:
+                pending = self._buffered_pull_completions.setdefault(req_id, set())
+                if (
+                    proof not in pending
+                    and len(pending) >= _MAX_BUFFERED_PULL_COMPLETIONS_PER_REQUEST
+                ):
+                    logger.error(
+                        "Ignoring excess pre-contract completion proof for producer "
+                        "request %s; source pages remain pinned",
+                        req_id,
+                    )
+                    return False
+                pending.add(proof)
+                return False
+            logger.error(
+                "A decode worker reported a read for unowned request %s; its "
+                "source pages are no longer guaranteed stable.",
+                req_id,
+            )
+            return False
+
+        try:
+            identity = self._completion_identity(
+                proof,
+                state.expected_consumers,
+                state.consumer_tp_size,
+            )
+        except ValueError:
+            logger.error(
+                "Ignoring conflicting completion proof for producer request "
+                "%s\n%s",
+                req_id,
+                traceback.format_exc(),
+            )
+            return False
+        if identity not in state.expected_acknowledgements:
+            logger.error(
+                "Ignoring completion proof %s outside producer request %s obligations",
+                identity,
+                req_id,
+            )
+            return False
+        state.acknowledgements.add(identity)
+        if state.acknowledgements != state.expected_acknowledgements:
+            return False
+
+        self._localization_capture_source_post(req_id)
+        del self._pull_completion_states[req_id]
+        self._completed_pull_contracts[req_id] = (
+            state.expected_consumers,
+            state.consumer_tp_size,
+        )
+        if len(self._completed_pull_contracts) > 8192:
+            for completed_req_id in list(self._completed_pull_contracts)[:2048]:
+                del self._completed_pull_contracts[completed_req_id]
+        self._reqs_to_process.remove(req_id)
+        self._reqs_to_send.pop(req_id, None)
+        return True
+
+    def _completion_identity(
+        self,
+        proof: PullReadComplete,
+        expected_consumers: int,
+        consumer_tp_size: int,
+    ) -> tuple[int, int]:
+        """Validate a wire proof against immutable producer obligations.
+
+        :param proof: Decoder-authored completion proof.
+        :param expected_consumers: Producer-owned logical consumer count.
+        :param consumer_tp_size: Producer-owned decoder TP size.
+        :returns: Stable child-index and decoder-rank identity.
+        :raises ValueError: If any consumer claim conflicts with the contract.
+        """
+        if proof.expected_consumers != expected_consumers:
+            raise ValueError("decoder logical consumer count changed")
+        if proof.consumer_tp_size != consumer_tp_size:
+            raise ValueError("decoder tensor-parallel size changed")
+        if proof.consumer_rank < 0 or proof.consumer_rank >= consumer_tp_size:
+            raise ValueError("decoder tensor-parallel rank is outside its world")
+        derived_index = _parallel_consumer_index(
+            proof.consumer_request_id,
+            expected_consumers,
+        )
+        if proof.consumer_index != derived_index:
+            raise ValueError("decoder child index conflicts with its request lineage")
+        return proof.consumer_index, proof.consumer_rank
+
+    def _producer_completion_count(self, req_id: str) -> int:
+        """Return exact pull obligations completed for an overdue lease.
+
+        :param req_id: Producer request identifier.
+        :returns: Number of unique child/rank proofs observed.
+        """
+        state = self._pull_completion_states.get(req_id)
+        if state is None:
+            return 0
+        return len(state.acknowledgements)

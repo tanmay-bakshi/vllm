@@ -128,12 +128,12 @@ python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
 
 - `kv_lease_duration` (via `kv_connector_extra_config`): Lease duration (in seconds) for the prefiller's KV cache blocks. (Optional)
     - Default: 30
-    - When a prefill request finishes, its KV blocks are held for this duration waiting for the decoder to read them. While the request is queued on the decoder, periodic heartbeats automatically extend the lease. If neither a heartbeat nor a read notification arrives before the lease expires, the blocks are freed. The heartbeat interval and extension amount are derived automatically from this value.
+    - When a prefill request finishes, its KV blocks receive this liveness deadline while waiting for the decoder. Periodic decoder heartbeats extend the deadline. If it elapses, the request is marked overdue and its blocks remain pinned until every expected decoder transfer completes; silence alone never authorizes page reuse. The heartbeat interval and extension amount are derived automatically from this value.
     - Example: `--kv-transfer-config '{"kv_connector_extra_config": {"kv_lease_duration": 60}}'`
 
 - `decoder_kv_blocks_ttl` (via `kv_connector_extra_config`): TTL (in seconds) for KV blocks cached on the decoder in bidirectional transfer mode. (Optional)
     - Default: 480
-    - In bidirectional mode, the decoder caches KV blocks for multi-turn conversations. This TTL controls how long those blocks are held before being released. Unlike the prefiller lease, this TTL is not renewed via heartbeats.
+    - In bidirectional mode, the decoder caches KV blocks for multi-turn conversations. This value supplies a liveness deadline, but elapsed silence does not release pages that a later prefiller may still address. Unlike the prefiller lease, this deadline is not renewed via heartbeats.
     - Example: `--kv-transfer-config '{"kv_connector_extra_config": {"decoder_kv_blocks_ttl": 600}}'`
 
 ## Bidirectional KV Transfer (Multi-turn)
@@ -239,7 +239,7 @@ Additional configuration options in `kv_connector_extra_config`:
 | --------- | ------- | ----------- |
 | `bidirectional_kv_xfer` | `false` | Enable bidirectional D→P KV transfer. |
 | `kv_recompute_threshold` | `64` | Minimum number of remote tokens required to trigger a D→P pull. Below this threshold, P recomputes locally instead of pulling (to amortize transfer latency). |
-| `decoder_kv_blocks_ttl` | `480` | TTL (seconds) for KV blocks cached on D for bidirectional reuse. Blocks are released after this duration. Not renewed via heartbeats. |
+| `decoder_kv_blocks_ttl` | `480` | Liveness deadline (seconds) for KV blocks cached on D for bidirectional reuse. Elapsed silence is recorded but does not release pages. Not renewed via heartbeats. |
 
 ### Multi-turn proxy setup
 
@@ -463,13 +463,14 @@ exported when NixlConnector is active:
 | `vllm:nixl_num_descriptors` | Histogram | Descriptor count per transfer. |
 | `vllm:nixl_num_failed_transfers` | Counter | Cumulative count of failed NIXL KV-block transfers. |
 | `vllm:nixl_num_failed_notifications` | Counter | Cumulative count of failed completion notifications (`send_notif`). |
-| `vllm:nixl_num_kv_expired_reqs` | Counter | Requests whose KV blocks expired on the prefiller before the decoder read them (tracked on the P instance). |
+| `vllm:nixl_num_kv_expired_reqs` | Counter | Requests whose KV liveness deadline elapsed before authoritative transfer completion. The pages remain pinned until completion. |
 
 !!! tip
-    High `vllm:nixl_num_kv_expired_reqs` indicates that the prefiller's lease
-    duration (`kv_lease_duration`) is too short for your network or workload.
-    Increase it via `--kv-transfer-config '{"kv_connector_extra_config":
-    {"kv_lease_duration": <seconds>}}'`.
+    High `vllm:nixl_num_kv_expired_reqs` indicates delayed or missing consumer
+    progress and retained producer capacity. Investigate decoder health,
+    transfer latency, and completion notifications. A longer
+    `kv_lease_duration` can reduce false overdue reports, but it cannot repair a
+    missing completion path.
 
 ## Example Scripts/Code
 
