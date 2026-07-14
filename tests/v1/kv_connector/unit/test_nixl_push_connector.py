@@ -18,14 +18,12 @@ requiring a real NIXL agent or network:
 * ``get_finished`` enqueues evictions for the writer.
 """
 
-from __future__ import annotations
-
 import logging
 import queue
 import threading
 import time
 from collections import defaultdict
-from typing import Any
+from typing import Any, Self
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -68,6 +66,7 @@ def _make_request(
     req = MagicMock()
     req.request_id = request_id
     req.num_computed_tokens = 64
+    req.num_in_flight_tokens = 0
 
     if is_d_side:
         # D-side request: do_remote_prefill=True -> prefill on a remote P.
@@ -167,15 +166,16 @@ class TestPushScheduler:
         sched = make_nixl_push_scheduler()
 
         request = _make_request(request_id="req-p-tail", is_d_side=False)
+        request.num_in_flight_tokens = 16
         block_ids = ([20, 21, 22, 23, 24],)
 
         delay, transfer_params = sched.request_finished(request, block_ids)
 
-        expected_block_ids = [[20, 21, 22, 23]]
+        expected_block_ids = [[20, 21, 22]]
         assert delay is True
         assert transfer_params is not None
         assert transfer_params["remote_block_ids"] == expected_block_ids
-        assert transfer_params["remote_num_tokens"] == 64
+        assert transfer_params["remote_num_tokens"] == 48
         assert sched._finished_request_blocks[request.request_id] == expected_block_ids
         assert (
             sched._newly_finished_push_blocks[request.request_id] == expected_block_ids
@@ -322,7 +322,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
     the matching/notif logic without bringing up NIXL or torch."""
 
     @classmethod
-    def fresh(cls) -> _StubWriterWorker:
+    def fresh(cls) -> Self:
         w = object.__new__(cls)
 
         # Push-specific state managed by NixlPushConnectorWorker.

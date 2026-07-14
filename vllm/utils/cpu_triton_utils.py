@@ -269,13 +269,20 @@ def _copy_and_expand_dflash_inputs_kernel_impl(
             valid_ctx_end = ctx_end
             if rejected_i64 is not None:
                 valid_ctx_end -= int(rejected_i64[req_idx].item())
-            # Guard against out-of-bounds: ensure valid_ctx_end > ctx_start.
-            valid_ctx_end = max(valid_ctx_end, ctx_start + 1)
-
-            last_pos = int(target_positions_i64[valid_ctx_end - 1].item())
+            valid_num_ctx = valid_ctx_end - ctx_start
+            last_pos = (
+                int(target_positions_i64[valid_ctx_end - 1].item())
+                if valid_num_ctx > 0
+                else int(target_positions_i64[ctx_start].item()) - 1
+            )
 
             for j in range(num_ctx):
                 ctx_idx = ctx_start + j
+                if j >= valid_num_ctx:
+                    out_context_positions_i64[ctx_idx] = 0
+                    out_context_slot_mapping_i64[ctx_idx] = -1
+                    continue
+
                 ctx_pos_idx = min(ctx_idx, total_input_tokens - 1)
                 position = int(target_positions_i64[ctx_pos_idx].item())
                 block_num = min(position // block_size, block_table_stride - 1)

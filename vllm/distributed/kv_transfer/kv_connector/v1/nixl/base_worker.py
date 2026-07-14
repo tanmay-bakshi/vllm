@@ -11,7 +11,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict, deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Never, cast
@@ -112,6 +112,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.outputs import KVTransferFailure, KVTransferFailureReason
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
 
@@ -683,10 +684,15 @@ class NixlBaseConnectorWorker:
 
         # Invalid blocks from failed NIXL operations (thread-safe queue of block ids)
         self._invalid_block_ids: queue.Queue[set[int]] = queue.Queue()
-        # requests that skipped transfer (handshake or transfer failures)
-        # Uses Queue for thread-safe cross-thread coordination with the
-        # background handshake thread, matching the _ready_requests pattern.
-        self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
+        # Receive failures may originate in the background handshake thread.
+        # Only the main thread mutates transfer and request ownership state.
+        self._failed_recv_outcomes: queue.Queue[
+            tuple[ReqId, KVTransferFailureReason, TransferHandle | None]
+        ] = queue.Queue()
+        self._failed_recv_pending: dict[ReqId, KVTransferFailure] = {}
+        self._completed_failed_recv_outcomes: queue.Queue[
+            tuple[ReqId, KVTransferFailure]
+        ] = queue.Queue()
 
         # Handshake metadata of this worker for NIXL transfers.
         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
@@ -3395,6 +3401,120 @@ class NixlBaseConnectorWorker:
         self._staging_allocator.release(plan)
         del self._coalesce_plans[plan.request_id]
 
+    def _discard_completed_coalesced_plan(self, request_id: ReqId) -> None:
+        """Reclaim a successful native plan whose request failed before scatter.
+
+        :param request_id: Decoder request whose bytes must not be published.
+        :raises StagingSafetyError: If any native writer is not proven quiescent.
+        """
+        plan = self._coalesce_plans.get(request_id)
+        if plan is None:
+            return
+        if not plan.ready_to_scatter:
+            raise StagingSafetyError(
+                "A failed receive cannot discard an unquiesced staging plan: "
+                f"{plan.describe()}"
+            )
+        plan.fail("request failed after native completion and before scatter")
+        self._release_coalesced_plan(plan)
+
+    def _release_quiescent_failed_coalesced_plan(
+        self,
+        plan: CoalescedStagingPlan,
+    ) -> None:
+        """Release a failed plan only after proving every writer quiescent.
+
+        Handles that were prepared but never posted still own native resources,
+        as do completed handles that have not yet passed through the polling
+        cleanup. Resource cleanup must therefore precede allocator reuse.
+
+        :param plan: Failed, reusable staging owner.
+        :raises StagingSafetyError: If cleanup cannot preserve the reuse proof.
+        """
+        if plan.operation_failed is False or plan.reusable is False:
+            raise StagingSafetyError(
+                f"A coalesced failure is not safely reclaimable: {plan.describe()}"
+            )
+        try:
+            for source_rank, slot in plan.slots.items():
+                if slot.native_handle is None or slot.native_released:
+                    continue
+                if slot.state not in {
+                    HandleState.DONE,
+                    HandleState.SEALED_UNPOSTED,
+                }:
+                    raise StagingSafetyError(
+                        "A reusable coalesced plan retained an unexpected handle: "
+                        f"{plan.describe()}"
+                    )
+                self.nixl_wrapper.release_xfer_handle(slot.native_handle)
+                if slot.state is HandleState.DONE:
+                    plan.mark_native_released(source_rank)
+                # ``native_released`` is evidence for a posted handle's DONE
+                # cleanup. SEALED_UNPOSTED already proves that this handle
+                # never became a writer, and this plan is retired immediately.
+        except Exception as error:
+            stacktrace = traceback.format_exc()
+            plan.tombstone("failed coalesced native resource cleanup\n" + stacktrace)
+            self._fail_coalesced_plan(
+                plan,
+                "failed coalesced native resource cleanup\n" + stacktrace,
+                error,
+            )
+        self._release_coalesced_plan(plan)
+
+    def _finish_quiescent_coalesced_failure(
+        self,
+        plan: CoalescedStagingPlan,
+        reason: str,
+        error: BaseException | None = None,
+    ) -> None:
+        """Turn a provably pre-write failure into a request terminal.
+
+        :param plan: Plan whose logical operation failed.
+        :param reason: Stable failure detail.
+        :param error: Native exception, if one was raised.
+        :raises StagingSafetyError: If any possible writer remains uncertain.
+        """
+        if plan.operation_failed is False:
+            plan.fail(reason)
+        if plan.posting_sealed is False:
+            plan.seal_posting()
+        if plan.reusable is False:
+            self._fail_coalesced_plan(plan, reason, error)
+        self._release_quiescent_failed_coalesced_plan(plan)
+        logger.error(
+            "coalesced staging failed before any live writer remained: "
+            "request=%s reason=%s",
+            plan.request_id,
+            reason,
+            exc_info=error is not None,
+        )
+        self._handle_failed_transfer(plan.request_id, None)
+
+    def _resolve_failed_coalesced_plan(self, request_id: ReqId) -> bool:
+        """Resolve staging ownership before publishing a failed terminal.
+
+        :param request_id: Decoder request with a pending failed receive.
+        :returns: Whether no coalesced writer can still touch its destination.
+        :raises StagingSafetyError: If a failed plan lost its reuse proof.
+        """
+        plan = self._coalesce_plans.get(request_id)
+        if plan is None:
+            return True
+        if plan.ready_to_scatter:
+            self._discard_completed_coalesced_plan(request_id)
+            return True
+        if plan.operation_failed is False:
+            return False
+        if plan.reusable is False:
+            self._fail_coalesced_plan(
+                plan,
+                plan.failure_reason or "coalesced operation failed",
+            )
+        self._release_quiescent_failed_coalesced_plan(plan)
+        return True
+
     def _initialize_and_post_coalesced(
         self,
         plan: CoalescedStagingPlan,
@@ -3403,7 +3523,7 @@ class NixlBaseConnectorWorker:
         remote_descs: Any,
         remote_agent: str,
         notification_id: bytes,
-    ) -> None:
+    ) -> bool:
         """Prepare, attach, and post one rank without losing native ownership.
 
         :param plan: Owner installed before native preparation.
@@ -3412,6 +3532,7 @@ class NixlBaseConnectorWorker:
         :param remote_descs: NIXL remote descriptor list.
         :param remote_agent: NIXL remote agent identity.
         :param notification_id: Completion notification payload.
+        :returns: Whether the source rank was posted successfully.
         """
         try:
             handle = self.nixl_wrapper.initialize_xfer(
@@ -3429,6 +3550,12 @@ class NixlBaseConnectorWorker:
                     source_rank,
                     f"rank {source_rank} native preparation raised\n{stacktrace}",
                 )
+                self._finish_quiescent_coalesced_failure(
+                    plan,
+                    f"rank {source_rank} native preparation raised\n{stacktrace}",
+                    error,
+                )
+                return False
             else:
                 plan.tombstone(
                     f"rank {source_rank} preparation transition failed\n{stacktrace}"
@@ -3453,7 +3580,12 @@ class NixlBaseConnectorWorker:
                     f"rank {source_rank} native post raised\n{stacktrace}",
                 )
             elif slot.state is HandleState.PREPARED:
-                plan.fail(f"rank {source_rank} failed before native post\n{stacktrace}")
+                self._finish_quiescent_coalesced_failure(
+                    plan,
+                    f"rank {source_rank} failed before native post\n{stacktrace}",
+                    error,
+                )
+                return False
             else:
                 plan.tombstone(
                     f"rank {source_rank} post transition failed in "
@@ -3470,6 +3602,7 @@ class NixlBaseConnectorWorker:
                 plan,
                 plan.failure_reason or "native post failed",
             )
+        return True
 
     def _fail_coalesced_plan(
         self,
@@ -3484,7 +3617,8 @@ class NixlBaseConnectorWorker:
         :param error: Native exception, if one was raised.
         :raises StagingSafetyError: Always, after retaining the plan and handles.
         """
-        plan.fail(reason)
+        if plan.operation_failed is False:
+            plan.fail(reason)
         if plan.posting_sealed is False:
             plan.seal_posting()
         logger.error(
@@ -4092,18 +4226,31 @@ class NixlBaseConnectorWorker:
         assert self.transfer_topo is not None
         done_sending = self._get_new_notifs()
         done_recving = self._pop_done_transfers(self._recving_transfers)
-        done_recving.update(self._poll_coalesced_plans())
 
-        # Drain queue of requests where handshake or transfer setup failed.
-        failed_recv_reqs = set[ReqId]()
-        while not self._failed_recv_reqs.empty():
+        while not self._failed_recv_outcomes.empty():
             try:
-                failed_recv_reqs.add(self._failed_recv_reqs.get_nowait())
+                req_id, reason, handle = self._failed_recv_outcomes.get_nowait()
             except queue.Empty:
                 break
+            self._record_failed_receive(req_id, reason)
+            if handle is not None:
+                self.nixl_wrapper.release_xfer_handle(handle)
+            self.xfer_stats.record_failed_transfer()
 
-        # Add failed requests to done_recving for scheduler tracking
-        # (blocks are already marked invalid, scheduler will handle recompute)
+        for req_id in tuple(self._failed_recv_pending):
+            plan = self._coalesce_plans.get(req_id)
+            if plan is not None and plan.operation_failed:
+                self._resolve_failed_coalesced_plan(req_id)
+
+        done_recving.update(self._poll_coalesced_plans())
+
+        failed_recv_reqs = set[ReqId]()
+        for req_id in self._failed_recv_pending:
+            if req_id in self._recving_transfers:
+                continue
+            if self._resolve_failed_coalesced_plan(req_id) is False:
+                continue
+            failed_recv_reqs.add(req_id)
         done_recving.update(failed_recv_reqs)
 
         if len(done_sending) > 0 or len(done_recving) > 0:
@@ -4142,6 +4289,11 @@ class NixlBaseConnectorWorker:
                     req_id,
                     meta.remote.request_id,
                 )
+                self._record_failed_receive(
+                    req_id,
+                    KVTransferFailureReason.INTEGRITY,
+                    meta,
+                )
                 failed_recv_reqs.add(req_id)
             elif meta.remote is not None and req_id not in failed_recv_reqs:
                 # Count this completion; the producer frees its blocks at
@@ -4160,6 +4312,7 @@ class NixlBaseConnectorWorker:
                     "Skipping KV post-processing for failed request %s",
                     req_id,
                 )
+                self._discard_completed_coalesced_plan(req_id)
                 continue
 
             assert meta.remote is not None
@@ -4195,6 +4348,10 @@ class NixlBaseConnectorWorker:
 
         for block_ids in block_ids_for_heterogeneous_attn_post_process:
             self.post_process_device_kv_on_receive_heterogeneous_attn(block_ids)
+
+        for req_id in failed_recv_reqs:
+            failure = self._failed_recv_pending.pop(req_id)
+            self._completed_failed_recv_outcomes.put((req_id, failure))
 
         self._sync_device_after_mamba_recv(done_recving, failed_recv_reqs)
 
@@ -4470,7 +4627,11 @@ class NixlBaseConnectorWorker:
                     new_expiry,
                 )
 
-    def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
+    def _pop_done_transfers(
+        self,
+        transfers: dict[str, list[int]],
+        failed_transfer_handler: Callable[[str, int | None], None] | None = None,
+    ) -> set[str]:
         """
         Pop completed xfers by checking for DONE state.
         Args:
@@ -4478,6 +4639,9 @@ class NixlBaseConnectorWorker:
         Returns:
             set of req_ids that have all done xfers
         """
+        if failed_transfer_handler is None:
+            failed_transfer_handler = self._handle_failed_transfer
+
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = []
@@ -4495,19 +4659,19 @@ class NixlBaseConnectorWorker:
                     else:
                         self._log_failure(
                             failure_type="transfer_failed",
-                            msg="Marking blocks as invalid",
+                            msg="Handling failed transfer",
                             req_id=req_id,
                             xfer_state=xfer_state,
                         )
-                        self._handle_failed_transfer(req_id, handle)
+                        failed_transfer_handler(req_id, handle)
                 except Exception as e:
                     self._log_failure(
                         failure_type="transfer_exception",
-                        msg="Marking blocks as invalid",
+                        msg="Handling failed transfer",
                         req_id=req_id,
                         error=e,
                     )
-                    self._handle_failed_transfer(req_id, handle)
+                    failed_transfer_handler(req_id, handle)
 
             if not in_progress:
                 # Only report request as completed when all transfers are done.
@@ -4517,14 +4681,64 @@ class NixlBaseConnectorWorker:
                 transfers[req_id] = in_progress
         return done_req_ids
 
-    def _handle_failed_transfer(self, req_id: str, handle: int | None):
-        """
-        Handle a failed transfer by marking all (logical) blocks as invalid and
-        recording the failure.
+    def _make_failed_receive(
+        self,
+        req_id: ReqId,
+        reason: KVTransferFailureReason,
+        meta: ReqMeta | None = None,
+    ) -> KVTransferFailure:
+        """Build a request-scoped failure over every local cache group.
 
-        Args:
-            req_id: The request ID.
-            handle: The transfer handle.
+        :param req_id: Decoder request identifier.
+        :param reason: Failure classification.
+        :param meta: Optional metadata retained by the current caller.
+        :returns: Typed failure with every affected logical block ID.
+        """
+        if meta is None:
+            meta = self._recving_metadata.get(req_id)
+        invalid_block_ids = (
+            frozenset(
+                block_id
+                for group_block_ids in meta.local_block_ids
+                for block_id in group_block_ids
+            )
+            if meta is not None
+            else frozenset()
+        )
+        return KVTransferFailure(
+            reason=reason,
+            invalid_block_ids=invalid_block_ids,
+        )
+
+    def _record_failed_receive(
+        self,
+        req_id: ReqId,
+        reason: KVTransferFailureReason,
+        meta: ReqMeta | None = None,
+    ) -> None:
+        """Merge one failure into the main-thread request outcome.
+
+        :param req_id: Decoder request identifier.
+        :param reason: Failure classification.
+        :param meta: Optional metadata retained by the current caller.
+        """
+        failure = self._make_failed_receive(req_id, reason, meta)
+        existing = self._failed_recv_pending.get(req_id)
+        self._failed_recv_pending[req_id] = (
+            failure if existing is None else existing.aggregate(failure)
+        )
+
+    def _handle_failed_transfer(
+        self,
+        req_id: str,
+        handle: int | None,
+        reason: KVTransferFailureReason = KVTransferFailureReason.TRANSFER,
+    ) -> None:
+        """Queue a receive failure for main-thread ownership processing.
+
+        :param req_id: Decoder request identifier.
+        :param handle: Native transfer handle, if one was created.
+        :param reason: Failure classification.
         """
         meta = self._recving_metadata.get(req_id)
         remote = meta.remote if meta is not None else None
@@ -4537,11 +4751,18 @@ class NixlBaseConnectorWorker:
             detail="transfer failed before complete diagnostic capture",
         )
         self._localization_pre_read_plans.pop(req_id, None)
-        # Use .get() here as the metadata cleanup is handled by get_finished()
-        # TODO (NickLucche) handle failed transfer for HMA.
-        if meta is not None and not self._is_hma_required:
-            self._invalid_block_ids.put(set(meta.local_block_ids[0]))
-        self._failed_recv_reqs.put(req_id)
+        self._failed_recv_outcomes.put((req_id, reason, handle))
+
+    def _handle_failed_sending_transfer(
+        self,
+        _req_id: str,
+        handle: int | None,
+    ) -> None:
+        """Release a terminal send failure without reporting a failed receive.
+
+        :param _req_id: Sending request identifier retained for handler symmetry.
+        :param handle: Native transfer handle, if one was created.
+        """
         if handle is not None:
             self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
@@ -4686,21 +4907,22 @@ class NixlBaseConnectorWorker:
                 # FIRST HALF of the context (found via margin collapse +
                 # position-scrambled needle retrieval, 2026-07-08).
                 factor = 2 if sp_flags[i] else 1
-                num_keep = factor * num_local_blocks
+                total_local_blocks = (len(remote_group) + factor - 1) // factor
+                assert num_local_blocks <= total_local_blocks
+                cached_local_blocks = total_local_blocks - num_local_blocks
+                remote_start = factor * cached_local_blocks
                 if num_local_blocks != len(remote_group):
                     logger.info(
                         "[prefix-trim] group=%s len_local=%d len_remote=%d "
-                        "keep=%d first_local=%s first_remote=%s",
+                        "remote_start=%d first_local=%s first_remote=%s",
                         i,
                         num_local_blocks,
                         len(remote_group),
-                        num_keep,
+                        remote_start,
                         local_block_ids[i][:2] if num_local_blocks else [],
                         remote_group[:2],
                     )
-                assert num_local_blocks <= len(remote_group)
-                if num_keep < len(remote_group):
-                    remote_block_ids[i] = remote_group[-num_keep:]
+                remote_block_ids[i] = remote_group[remote_start:]
         else:
             # (NOTE: ZhanqiuHu) Mamba hybrid: no prefix caching support so far.HeteroTP
             # can cause different kernel block counts due to logical block rounding.
@@ -4850,6 +5072,23 @@ class NixlBaseConnectorWorker:
                 result.update(self._invalid_block_ids.get_nowait())
             except queue.Empty:
                 break
+        return result
+
+    def get_failed_recving(self) -> dict[str, KVTransferFailure]:
+        """Return and clear completed request-scoped receive failures.
+
+        :returns: Terminal failures keyed by request ID.
+        """
+        result: dict[str, KVTransferFailure] = {}
+        while not self._completed_failed_recv_outcomes.empty():
+            try:
+                req_id, failure = self._completed_failed_recv_outcomes.get_nowait()
+            except queue.Empty:
+                break
+            existing = result.get(req_id)
+            result[req_id] = (
+                failure if existing is None else existing.aggregate(failure)
+            )
         return result
 
     def _evict_stale_engines(self) -> None:

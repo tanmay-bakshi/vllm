@@ -247,15 +247,18 @@ void copy_and_expand_dflash_inputs_kernel_impl(
     if (rejected_ptr != nullptr) {
       valid_ctx_end -= rejected_ptr[req_idx];
     }
-    // Guard against out-of-bounds: ensure valid_ctx_end > ctx_start so that
-    // valid_ctx_end - 1 never reads before the request's context range.
-    valid_ctx_end =
-        std::max(valid_ctx_end, static_cast<int64_t>(ctx_start + 1));
-
-    int64_t last_pos = target_pos_ptr[valid_ctx_end - 1];
+    int64_t valid_num_ctx = valid_ctx_end - ctx_start;
+    int64_t last_pos = valid_num_ctx > 0 ? target_pos_ptr[valid_ctx_end - 1]
+                                         : target_pos_ptr[ctx_start] - 1;
 
     for (int64_t j = 0; j < num_ctx; ++j) {
       int64_t ctx_idx = ctx_start + j;
+      if (j >= valid_num_ctx) {
+        out_ctx_pos_ptr[ctx_idx] = 0;
+        out_ctx_slot_ptr[ctx_idx] = -1;
+        continue;
+      }
+
       int64_t ctx_pos_idx = std::min(ctx_idx, total_input_tokens - 1);
       int64_t position = target_pos_ptr[ctx_pos_idx];
       int64_t block_num = position / block_size;

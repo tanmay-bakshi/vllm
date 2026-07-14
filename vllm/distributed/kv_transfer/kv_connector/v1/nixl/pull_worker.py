@@ -40,6 +40,11 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     locate_subsequence,
     validate_source_contract_structure,
 )
+from vllm.distributed.kv_transfer.staging_ownership import (
+    CoalescedStagingPlan,
+    HandleState,
+    StagingSafetyError,
+)
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_path
 
@@ -1113,12 +1118,99 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         :param read_specs: Producer ranks this decoder may actually read.
         :param notification_id: Typed decoder-rank completion proof.
         """
-        assert meta.remote is not None
         read_ranks = {spec.remote_rank for spec in read_specs}
-        remote_agents = self._remote_agents[meta.remote.engine_id]
-        for producer_rank, agent in remote_agents.items():
-            if producer_rank in read_ranks:
+        self._notify_producer_ranks_without_native_read(
+            meta,
+            read_ranks,
+            notification_id,
+        )
+
+    def _notify_failed_coalesced_producer_ranks(
+        self,
+        meta: ReqMeta,
+        ownership: CoalescedStagingPlan,
+        notification_id: bytes,
+    ) -> None:
+        """Discharge only producer ranks proved untouched by a failed pull.
+
+        This decoder child was admitted, so its terminal proof remains the
+        existing :class:`PullReadComplete` carried by ``notification_id``.
+        :class:`PullOfferCancelled` is a mutually exclusive whole-offer proof
+        and would conflict with any rank whose native read reached DONE.
+
+        :param meta: Immutable producer and consumer contract.
+        :param ownership: Released failed plan retaining per-rank evidence.
+        :param notification_id: Typed decoder-rank completion proof.
+        :raises StagingSafetyError: If any source rank lacks exact terminal state.
+        """
+        if (
+            ownership.operation_failed is False
+            or ownership.released is False
+            or ownership.reusable is False
+        ):
+            raise StagingSafetyError(
+                "A failed coalesced completion lacks a released ownership proof: "
+                f"{ownership.describe()}"
+            )
+
+        native_read_ranks: set[int] = set()
+        for source_rank, slot in ownership.slots.items():
+            if slot.state is HandleState.DONE:
+                native_read_ranks.add(source_rank)
                 continue
+            if slot.state not in {
+                HandleState.NEVER_POSTED,
+                HandleState.PREPARE_FAILED,
+                HandleState.SEALED_UNPOSTED,
+            }:
+                raise StagingSafetyError(
+                    "A recoverable coalesced failure retained an ambiguous rank: "
+                    f"{ownership.describe()}"
+                )
+
+        self._notify_producer_ranks_without_native_read(
+            meta,
+            native_read_ranks,
+            notification_id,
+        )
+
+    def _notify_producer_ranks_without_native_read(
+        self,
+        meta: ReqMeta,
+        native_read_ranks: set[int],
+        notification_id: bytes,
+    ) -> None:
+        """Send one admitted-child no-read proof to each untouched rank.
+
+        Each producer rank owns its own copy of the child/rank obligation. The
+        identical typed proof must therefore reach every rank not covered by a
+        native transfer, exactly once per rank.
+
+        :param meta: Immutable producer and consumer contract.
+        :param native_read_ranks: Producer ranks whose native read carries the proof.
+        :param notification_id: Typed decoder-rank completion proof.
+        """
+        assert meta.remote is not None
+        remote_agents = self._remote_agents[meta.remote.engine_id]
+        obligated_producer_ranks = {
+            producer_rank
+            for producer_rank in remote_agents
+            if self.tp_rank
+            in _consumer_ranks_for_producer(
+                producer_rank,
+                meta.tp_size,
+                self.world_size,
+            )
+        }
+        unexpected_read_ranks = native_read_ranks - obligated_producer_ranks
+        if len(unexpected_read_ranks) > 0:
+            raise StagingSafetyError(
+                "Native reads escaped this decoder rank's producer obligations: "
+                f"{sorted(unexpected_read_ranks)}"
+            )
+
+        for producer_rank in sorted(obligated_producer_ranks - native_read_ranks):
+            agent = remote_agents[producer_rank]
             try:
                 self.nixl_wrapper.send_notif(agent, notif_msg=notification_id)
             except Exception:
@@ -1228,9 +1320,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     ) -> str:
         """Post one whole-request READ per remote rank into owned staging.
 
-        Any failure after allocation raises :class:`StagingSafetyError` and
-        leaves uncertain native writers and their range owned until process
-        replacement.
+        A failure before every possible native writer is quiescent becomes a
+        request-scoped terminal. Any uncertain native submission raises
+        :class:`StagingSafetyError` and leaves its generation owned until
+        process replacement.
 
         :param req_id: Decoder request identifier.
         :param meta: Complete transfer metadata.
@@ -1502,12 +1595,18 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 )
             except Exception as error:
                 stacktrace = traceback.format_exc()
-                self._fail_coalesced_plan(
+                self._finish_quiescent_coalesced_failure(
                     ownership,
                     "localization plan recording failed before native posting\n"
                     + stacktrace,
                     error,
                 )
+                self._notify_failed_coalesced_producer_ranks(
+                    meta,
+                    ownership,
+                    notification_id,
+                )
+                return "posted"
 
         assert self._staging_buf is not None
         staging_base = self._staging_buf.data_ptr() + off
@@ -1538,12 +1637,18 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     source_rank,
                     f"rank {source_rank} native preparation raised\n{stacktrace}",
                 )
-                self._fail_coalesced_plan(
+                self._finish_quiescent_coalesced_failure(
                     ownership,
                     f"rank {source_rank} native preparation raised\n{stacktrace}",
                     error,
                 )
-            self._initialize_and_post_coalesced(
+                self._notify_failed_coalesced_producer_ranks(
+                    meta,
+                    ownership,
+                    notification_id,
+                )
+                return "posted"
+            posted = self._initialize_and_post_coalesced(
                 ownership,
                 source_rank,
                 ld,
@@ -1551,6 +1656,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 agent,
                 notification_id,
             )
+            if posted is False:
+                self._notify_failed_coalesced_producer_ranks(
+                    meta,
+                    ownership,
+                    notification_id,
+                )
+                return "posted"
         self._notify_non_read_producer_ranks(meta, read_specs, notification_id)
         ownership.seal_posting()
         return "posted"

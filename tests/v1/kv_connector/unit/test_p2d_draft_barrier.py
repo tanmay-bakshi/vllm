@@ -28,8 +28,8 @@ def _contains_call(node: ast.AST, name: str) -> bool:
 
 
 @pytest.mark.cpu_test
-def test_delayed_draft_proposal_is_joined_before_every_connector_path() -> None:
-    """KV transfer cannot observe a still-running proposal stream."""
+def test_prior_draft_proposal_is_joined_before_reusing_runner_buffers() -> None:
+    """The next target step cannot reuse an active proposal's inputs."""
     repository_root = Path(__file__).resolve().parents[4]
     runner_path = repository_root / "vllm/v1/worker/gpu_model_runner.py"
     module = ast.parse(runner_path.read_text())
@@ -66,6 +66,79 @@ def test_delayed_draft_proposal_is_joined_before_every_connector_path() -> None:
     assert any(
         isinstance(child, ast.Attribute) and child.attr == "_draft_propose_input_refs"
         for child in ast.walk(barrier)
+    )
+
+
+@pytest.mark.cpu_test
+def test_draft_proposal_settles_before_producer_transport() -> None:
+    """A producer cannot publish DFlash KV while its proposal still writes."""
+    repository_root = Path(__file__).resolve().parents[4]
+    runner_path = repository_root / "vllm/v1/worker/gpu_model_runner.py"
+    module = ast.parse(runner_path.read_text())
+    sample_tokens = next(
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens"
+    )
+    proposal_call = next(
+        node
+        for node in ast.walk(sample_tokens)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "propose_draft_token_ids"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+    )
+    event_record = next(
+        node
+        for node in ast.walk(sample_tokens)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "record"
+        and any(
+            isinstance(child, ast.Attribute) and child.attr == "draft_propose_event"
+            for child in ast.walk(node)
+        )
+    )
+    publication_fence = next(
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_synchronize_draft_proposal_for_kv_publication"
+    )
+    publication_call = next(
+        node
+        for node in ast.walk(sample_tokens)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_synchronize_draft_proposal_for_kv_publication"
+    )
+    connector_finalize = next(
+        node
+        for node in ast.walk(sample_tokens)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "finalize_kv_connector"
+    )
+    output_returns = [
+        node
+        for node in ast.walk(sample_tokens)
+        if isinstance(node, ast.Return) and node.lineno > connector_finalize.lineno
+    ]
+
+    assert proposal_call.lineno < event_record.lineno < publication_call.lineno
+    assert publication_call.lineno < connector_finalize.lineno
+    assert len(output_returns) > 0
+    assert connector_finalize.lineno < min(node.lineno for node in output_returns)
+    assert _contains_call(publication_call, "_is_all_reqs_chunked_prefill")
+    assert _contains_call(publication_fence, "synchronize")
+    assert any(
+        isinstance(child, ast.Attribute) and child.attr == "is_kv_producer"
+        for child in ast.walk(publication_fence)
+    )
+    assert any(
+        isinstance(child, ast.Attribute) and child.attr == "_draft_propose_input_refs"
+        for child in ast.walk(publication_fence)
     )
 
 
@@ -137,7 +210,7 @@ def test_targeted_read_path_has_no_pre_transfer_source_gate() -> None:
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "_coalesced_read_request"
-        and len(node.args) == 4
+        and len(node.args) == 5
     )
 
     assert not _contains_call(read_blocks, "_localization_source_gate")

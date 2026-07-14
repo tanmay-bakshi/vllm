@@ -266,8 +266,8 @@ class NixlBaseConnectorScheduler:
 
     def _get_transferable_block_ids(
         self,
-        request: "Request",
         block_ids: BlockIds,
+        num_computed_tokens: int,
     ) -> BlockIds:
         """Return the initialized logical KV blocks for transfer.
 
@@ -276,8 +276,9 @@ class NixlBaseConnectorScheduler:
         so pages wholly beyond that extent do not contain request KV. Recurrent and
         encoder-state groups are indexed by different extents and remain unchanged.
 
-        :param request: The request that produced the KV blocks.
         :param block_ids: The request's allocated logical block tables.
+        :param num_computed_tokens: Settled request token extent represented by the
+            source cache.
         :returns: The canonical logical block tables to publish for transfer.
         """
         assert len(block_ids) == len(self.kv_cache_config.kv_cache_groups), (
@@ -300,7 +301,7 @@ class NixlBaseConnectorScheduler:
             ):
                 group_token_capacity: int = spec.block_size * context_parallel_size
                 num_transferable_blocks: int = cdiv(
-                    request.num_computed_tokens, group_token_capacity
+                    num_computed_tokens, group_token_capacity
                 )
                 del transferable_group_block_ids[num_transferable_blocks:]
             transferable_block_ids.append(transferable_group_block_ids)
@@ -660,7 +661,9 @@ class NixlBaseConnectorScheduler:
         if worker_meta is not None:
             raise RuntimeError("NIXL does not emit connector worker metadata")
 
-        for req_id in connector_output.finished_recving or ():
+        completed_receive_ids = set(connector_output.finished_recving or ())
+        completed_receive_ids.update(connector_output.failed_recving)
+        for req_id in completed_receive_ids:
             self._stop_heartbeat(req_id)
 
     def has_pending_push_work(self) -> bool:

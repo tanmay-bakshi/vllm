@@ -95,14 +95,19 @@ def _validate_kv_transfer_request_options(
     if use_beam_search:
         return "KV-transfer requests are not supported with beam search"
 
-    if kv_transfer_params.get("do_remote_decode") is True:
+    do_remote_decode = kv_transfer_params.get("do_remote_decode") is True
+    do_remote_prefill = kv_transfer_params.get("do_remote_prefill") is True
+    if do_remote_decode == do_remote_prefill:
+        return (
+            "KV-transfer requests require exactly one of do_remote_decode "
+            "and do_remote_prefill to be true"
+        )
+
+    if do_remote_decode:
         if stream:
             return "KV-transfer producer requests are not supported with streaming"
         if n != 1:
             return "KV-transfer producer requests require n=1"
-        return None
-
-    if kv_transfer_params.get("do_remote_prefill") is not True:
         return None
 
     expected_consumers = kv_transfer_params.get("expected_consumers", 1)

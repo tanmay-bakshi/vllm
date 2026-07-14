@@ -535,7 +535,14 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             self._reqs_need_save.pop(request.request_id, None)
             return False, None
 
-        block_ids = self._get_transferable_block_ids(request, block_ids)
+        settled_num_computed_tokens = max(
+            0,
+            request.num_computed_tokens - request.num_in_flight_tokens,
+        )
+        block_ids = self._get_transferable_block_ids(
+            block_ids,
+            settled_num_computed_tokens,
+        )
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
         remote_num_tokens = 0
         localization_params: dict[str, Any] = {}
@@ -561,7 +568,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                 self._source_rosters[request.request_id] = NixlSourceRoster(
                     offer_generation=offer_generation,
                     iteration=0,
-                    valid_token_extent=int(request.num_computed_tokens),
+                    valid_token_extent=settled_num_computed_tokens,
                     group_token_capacities=tuple(
                         int(group.kv_cache_spec.block_size)
                         for group in self.kv_cache_config.kv_cache_groups
@@ -578,7 +585,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                     "p2d_iteration": 0,
                 }
 
-            remote_num_tokens = request.num_computed_tokens
+            remote_num_tokens = settled_num_computed_tokens
 
         return delay_free_blocks, dict(
             do_remote_prefill=is_p_node,

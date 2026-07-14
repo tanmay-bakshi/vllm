@@ -174,6 +174,20 @@ def test_ordinary_openai_request_preserves_generate_fast_path() -> None:
             "KV-transfer consumer requests require a positive integer "
             "expected_consumers",
         ),
+        (
+            {},
+            False,
+            1,
+            "KV-transfer requests require exactly one of do_remote_decode "
+            "and do_remote_prefill to be true",
+        ),
+        (
+            {"do_remote_decode": True, "do_remote_prefill": True},
+            False,
+            1,
+            "KV-transfer requests require exactly one of do_remote_decode "
+            "and do_remote_prefill to be true",
+        ),
     ],
 )
 def test_kv_transfer_sampling_contract_is_directional(
@@ -191,6 +205,54 @@ def test_kv_transfer_sampling_contract_is_directional(
         )
         == expected_error
     )
+
+
+@pytest.mark.parametrize(
+    ("kv_transfer_params", "stream", "expected_error"),
+    [
+        ({"do_remote_prefill": True}, True, None),
+        (
+            {"do_remote_prefill": True, "expected_consumers": 2},
+            True,
+            "KV-transfer consumer requests require n to equal "
+            "expected_consumers (2), got 1",
+        ),
+        (
+            {"do_remote_decode": True},
+            True,
+            "KV-transfer producer requests are not supported with streaming",
+        ),
+    ],
+)
+def test_responses_enforces_kv_transfer_sampling_contract(
+    kv_transfer_params: dict[str, Any],
+    stream: bool,
+    expected_error: str | None,
+) -> None:
+    request = ResponsesRequest(
+        input="hello",
+        model="test-model",
+        kv_transfer_params=kv_transfer_params,
+        stream=stream,
+    )
+    rejection = object()
+    serving = SimpleNamespace(
+        use_harmony=False,
+        enable_store=True,
+        create_error_response=MagicMock(return_value=rejection),
+    )
+
+    result = OpenAIServingResponses._validate_create_responses_input(
+        serving,
+        request,
+    )
+
+    if expected_error is None:
+        assert result is None
+        serving.create_error_response.assert_not_called()
+        return
+    assert result is rejection
+    serving.create_error_response.assert_called_once_with(expected_error)
 
 
 @pytest.mark.asyncio

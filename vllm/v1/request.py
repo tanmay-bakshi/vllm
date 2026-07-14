@@ -139,6 +139,7 @@ class Request:
         # Used in async scheduling.
         self.num_output_placeholders = 0
         self.async_tokens_to_discard = 0
+        self.num_in_flight_tokens = 0
 
         # V2+PP+async: Enforces `pp_size` cadence between same-request decode steps
         # so the worker's broadcast slot ring stays consistent.

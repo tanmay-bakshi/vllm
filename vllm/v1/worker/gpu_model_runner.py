@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -504,14 +505,12 @@ class GPUModelRunner(
 
         # Async scheduling
         self.use_async_scheduling = self.scheduler_config.async_scheduling
-        import os as _os_ps
-        self._pad_sanitize = (
-            _os_ps.environ.get("VLLM_GEMMA4_PAD_SANITIZE", "0") == "1"
-        )
+        self._pad_sanitize = os.environ.get("VLLM_GEMMA4_PAD_SANITIZE", "0") == "1"
         # Token-provenance tracing needs real draft ids CPU-side every
         # step (see _copy_draft_token_ids_to_cpu).
-        self._trace_force_draft_copy = bool(
-            _os_ps.environ.get("VLLM_GEMMA4_TOKEN_TRACE"))
+        self._trace_force_draft_copy = (
+            len(os.environ.get("VLLM_GEMMA4_TOKEN_TRACE", "")) > 0
+        )
 
         # Sampler
         self.sampler = Sampler(
@@ -882,12 +881,14 @@ class GPUModelRunner(
         # Auxiliary stream (and held input references) used to overlap the
         # draft proposal with the current step's sampled-token emission.
         self.draft_propose_stream: torch.cuda.Stream | None = None
+        self.draft_propose_event: torch.cuda.Event | None = None
         self._draft_propose_input_refs: tuple | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
             self.draft_token_ids_copy_stream = torch.cuda.Stream()
             self.draft_propose_stream = torch.cuda.Stream()
+            self.draft_propose_event = torch.cuda.Event()
             self.draft_token_ids_cpu = torch.empty(
                 (self.max_num_reqs, self.num_spec_tokens),
                 dtype=torch.int64,
@@ -1347,10 +1348,12 @@ class GPUModelRunner(
                             "[opt-broken-linkage] %s: %d optimistic "
                             "drafts, no prev-frame row (sched_nct=%d "
                             "state_nct=%d n_out=%d)",
-                            req_id, optimistic_num_accepted,
+                            req_id,
+                            optimistic_num_accepted,
                             num_computed_tokens,
                             req_state.num_computed_tokens,
-                            len(req_state.output_token_ids))
+                            len(req_state.output_token_ids),
+                        )
 
                     if is_ngram_gpu and optimistic_num_accepted > 0:
                         self.input_batch.num_tokens_no_spec[req_index] += (
@@ -1506,8 +1509,10 @@ class GPUModelRunner(
                             "[opt-correction-dropped] %s: deferred spec "
                             "correction lost (%d optimistic drafts stay "
                             "counted as accepted; state_nct=%d)",
-                            req_id, optimistic_num_accepted,
-                            req_state.num_computed_tokens)
+                            req_id,
+                            optimistic_num_accepted,
+                            req_state.num_computed_tokens,
+                        )
                         continue
                     num_accepted = valid_sampled_token_count[prev_req_index] - 1
                     correction = optimistic_num_accepted - num_accepted
@@ -3751,7 +3756,9 @@ class GPUModelRunner(
                         "spec tokens in flight (row %d) — will vanish "
                         "from prev-frame map",
                         self.input_batch.req_ids[_di],
-                        len(self.input_batch.spec_token_ids[_di]), _di)
+                        len(self.input_batch.spec_token_ids[_di]),
+                        _di,
+                    )
             self.input_batch.prev_req_id_to_index = {
                 req_id: i
                 for i, req_id in enumerate(self.input_batch.req_ids)
@@ -4502,6 +4509,34 @@ class GPUModelRunner(
             <= self.effective_drafter_max_model_len
         )
 
+    def _synchronize_draft_proposal_for_kv_publication(
+        self,
+        has_source_publication_candidate: bool,
+    ) -> None:
+        """Settle producer-side draft KV before connector publication.
+
+        NIXL DMA is not ordered by a CUDA stream dependency. A producer must
+        therefore establish host-observed completion before connector
+        finalization can make the source cache externally visible. The fence is
+        limited to producer outputs and runs after CPU bookkeeping has already
+        overlapped the proposal.
+
+        :param has_source_publication_candidate: Whether at least one request
+            row reached a scheduler-visible output boundary in this batch.
+        """
+        if (
+            not has_source_publication_candidate
+            or self._draft_propose_input_refs is None
+        ):
+            return
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is None or not kv_transfer_config.is_kv_producer:
+            return
+        if self.draft_propose_event is None:
+            raise RuntimeError("A live draft proposal has no completion event")
+        self.draft_propose_event.synchronize()
+        self._draft_propose_input_refs = None
+
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -4590,6 +4625,8 @@ class GPUModelRunner(
                         slot_mappings,
                     )
                     self._copy_draft_token_ids_to_cpu(scheduler_output)
+                assert self.draft_propose_event is not None
+                self.draft_propose_event.record()
             if aux_stream is not None:
                 # Keep the proposal's GPU inputs alive across the async boundary
                 # so the caching allocator cannot recycle them while the
@@ -4708,6 +4745,11 @@ class GPUModelRunner(
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
         if spec_config is not None:
+            self._synchronize_draft_proposal_for_kv_publication(
+                has_source_publication_candidate=(
+                    not self._is_all_reqs_chunked_prefill()
+                ),
+            )
             self.finalize_kv_connector()
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):

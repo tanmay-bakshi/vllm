@@ -254,7 +254,14 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             self._reqs_need_save.pop(request.request_id, None)
             return False, None
 
-        block_ids = self._get_transferable_block_ids(request, block_ids)
+        settled_num_computed_tokens = max(
+            0,
+            request.num_computed_tokens - request.num_in_flight_tokens,
+        )
+        block_ids = self._get_transferable_block_ids(
+            block_ids,
+            settled_num_computed_tokens,
+        )
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
         remote_num_tokens = 0
         if delay_free_blocks:
@@ -270,7 +277,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
                 consumer_tp_size=1,
             )
 
-            remote_num_tokens = request.num_computed_tokens
+            remote_num_tokens = settled_num_computed_tokens
 
             # Store finished blocks for worker-level matching with D
             # registrations (via NIXL notifications).

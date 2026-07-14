@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import enum
 from abc import ABC, abstractmethod
 from copy import copy
 from dataclasses import dataclass, field
@@ -192,11 +193,47 @@ class SamplerOutput:
     logprobs_tensors: LogprobsTensors | None
 
 
+class KVTransferFailureReason(enum.Enum):
+    """Classify a terminal KV receive failure."""
+
+    TRANSFER = "transfer"
+    INTEGRITY = "integrity"
+
+
+@dataclass(frozen=True)
+class KVTransferFailure:
+    """Describe one request-scoped terminal KV receive failure.
+
+    :ivar reason: Strongest failure classification observed for the request.
+    :ivar invalid_block_ids: Logical block IDs whose contents cannot be used.
+    """
+
+    reason: KVTransferFailureReason
+    invalid_block_ids: frozenset[int] = frozenset()
+
+    def aggregate(self, other: "KVTransferFailure") -> "KVTransferFailure":
+        """Combine failures reported by separate workers or connectors.
+
+        :param other: Failure for the same logical request.
+        :returns: Strongest reason and union of invalid logical block IDs.
+        """
+        reason = (
+            KVTransferFailureReason.INTEGRITY
+            if KVTransferFailureReason.INTEGRITY in (self.reason, other.reason)
+            else KVTransferFailureReason.TRANSFER
+        )
+        return KVTransferFailure(
+            reason=reason,
+            invalid_block_ids=self.invalid_block_ids | other.invalid_block_ids,
+        )
+
+
 @dataclass
 class KVConnectorOutput:
     # [req_ids]
     finished_sending: set[str] | None = None
     finished_recving: set[str] | None = None
+    failed_recving: dict[str, KVTransferFailure] = field(default_factory=dict)
     kv_connector_stats: KVConnectorStats | None = None
     kv_cache_events: KVConnectorKVEvents | None = None
     kv_connector_worker_meta: KVConnectorWorkerMetadata | None = None
@@ -214,6 +251,7 @@ class KVConnectorOutput:
         return (
             not self.finished_sending
             and not self.finished_recving
+            and len(self.failed_recving) == 0
             and not self.kv_connector_stats
             and not self.kv_cache_events
             and not self.invalid_block_ids

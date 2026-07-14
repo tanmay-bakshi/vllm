@@ -50,7 +50,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.outputs import KVConnectorOutput, KVTransferFailure
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -373,24 +373,27 @@ class KVConnectorBase_V1(ABC):
         return None, None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        """
-        Get the set of block IDs that failed to load.
+        """Return recoverable block-scoped load errors.
 
-        Returns:
-            Set of block IDs that encountered load errors.
-            Empty set if no load errors occurred.
+        A request-scoped terminal asynchronous failure belongs in
+        :meth:`get_failed_recving` and must not also be emitted here. Block IDs
+        are allocator-local and can be reused after terminal request cleanup;
+        duplicating a request failure into this unscoped channel could
+        invalidate a later owner of the same numeric IDs.
 
-        Notes:
-            - Applies to both sync- and async-loading requests.
-            - Async loading: failed blocks may be reported in any forward pass
-              up to and including the pass where the request ID is returned by
-              `get_finished()`. Even if failures occur, the request must still
-              be reported via `get_finished()`, and the failed block IDs must
-              appear here no later than that same pass.
-            - Sync loading: failed blocks should be reported in the forward
-              pass in which they are detected.
+        :returns: Failed logical block IDs that remain safe to recover by block.
         """
         return set()
+
+    def get_failed_recving(self) -> dict[str, KVTransferFailure]:
+        """Return completed request-scoped asynchronous load failures.
+
+        Each failure must be accompanied by the same request ID in the receive
+        set returned by :meth:`get_finished` during the same worker output.
+
+        :returns: Terminal failures keyed by request ID.
+        """
+        return {}
 
     def shutdown(self):
         """

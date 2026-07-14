@@ -489,6 +489,36 @@ async def test_derender_completion_kv_transfer_params_passthrough(client):
     assert response.json()["kv_transfer_params"] == kv
 
 
+@pytest.mark.asyncio
+async def test_derender_completion_rejects_mismatched_kv_transfer_params(client):
+    gr1 = await _render_completion(client, "Hello")
+    gr2 = await _render_completion(client, "World")
+
+    response = await client.post(
+        "/v1/completions/derender",
+        json={
+            "model": MODEL_NAME,
+            "generate_responses": [
+                _make_completion_generate_response(
+                    gr1["token_ids"][:3],
+                    gr1["request_id"],
+                    kv_transfer_params={"remote_request_id": "first"},
+                ),
+                _make_completion_generate_response(
+                    gr2["token_ids"][:3],
+                    gr2["request_id"],
+                    kv_transfer_params={"remote_request_id": "second"},
+                ),
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "kv_transfer_params must match across every generate response"
+    )
+
+
 # ---------------------------------------------------------------------------
 # E2E: render -> derender roundtrip with parser (reasoning + tool calls)
 # ---------------------------------------------------------------------------

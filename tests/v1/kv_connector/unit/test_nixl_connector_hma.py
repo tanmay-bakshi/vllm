@@ -176,8 +176,6 @@ def test_transferable_blocks_exclude_speculative_hma_tail() -> None:
         blocks_per_sw=[0, cdiv(sw_size, sw_block_size) + 1, 0],
     )
     num_computed_tokens = 32_480
-    request = MagicMock()
-    request.num_computed_tokens = num_computed_tokens
     full_blocks = list(range(10_000, 11_016))
     valid_sw_blocks = list(range(20_000, 20_064))
     speculative_sw_block = 20_064
@@ -186,8 +184,8 @@ def test_transferable_blocks_exclude_speculative_hma_tail() -> None:
     mamba_blocks = [30_000, 30_001]
 
     transferable = scheduler._get_transferable_block_ids(
-        request,
         (full_blocks, sw_blocks, mamba_blocks),
+        num_computed_tokens,
     )
 
     assert transferable == (
@@ -221,6 +219,46 @@ def test_prefix_caching_pairs_normalized_sw_roster_with_valid_pages() -> None:
 
     assert aligned_local == local_block_ids
     assert aligned_remote == [valid_remote_block_ids]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("single_plane", "remote_count", "local_count", "expected_remote"),
+    [
+        pytest.param(False, 4, 4, [0, 1, 2, 3], id="dual-no-hit"),
+        pytest.param(False, 4, 2, [2, 3], id="dual-prefix-hit"),
+        pytest.param(False, 4, 0, [], id="dual-full-hit"),
+        pytest.param(True, 5, 3, [0, 1, 2, 3, 4], id="single-odd-no-hit"),
+        pytest.param(True, 5, 2, [2, 3, 4], id="single-odd-prefix-hit"),
+        pytest.param(True, 5, 1, [4], id="single-odd-tail"),
+        pytest.param(True, 5, 0, [], id="single-odd-full-hit"),
+        pytest.param(True, 6, 2, [2, 3, 4, 5], id="single-even-prefix-hit"),
+    ],
+)
+def test_prefix_caching_trims_consumed_source_prefix(
+    single_plane: bool,
+    remote_count: int,
+    local_count: int,
+    expected_remote: list[int],
+) -> None:
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    worker = object.__new__(NixlConnectorWorker)
+    worker._has_mamba = False
+    worker._skip_pull_groups = set()
+    worker._sp_group_flags = MagicMock(return_value=(single_plane,))
+    local_block_ids = (list(range(10_000, 10_000 + local_count)),)
+
+    aligned_local, aligned_remote = worker._apply_prefix_caching(
+        local_block_ids,
+        (list(range(remote_count)),),
+        remote_physical_per_logical=1,
+    )
+
+    assert aligned_local == local_block_ids
+    assert aligned_remote == [expected_remote]
 
 
 @pytest.mark.cpu_test
@@ -262,11 +300,12 @@ def test_transferable_blocks_follow_effective_block_capacity(
         decode_context_parallel_size=decode_context_parallel_size,
         prefill_context_parallel_size=prefill_context_parallel_size,
     )
-    request = MagicMock()
-    request.num_computed_tokens = num_computed_tokens
     block_ids = [[0, 1, 2, 3]]
 
-    transferable = scheduler._get_transferable_block_ids(request, block_ids)
+    transferable = scheduler._get_transferable_block_ids(
+        block_ids,
+        num_computed_tokens,
+    )
 
     assert transferable == [block_ids[0][:expected_blocks]]
 
@@ -295,8 +334,6 @@ def test_transferable_blocks_preserve_non_decoder_cache_groups() -> None:
         kv_cache_config,
         blocks_per_sw=[0, 0, 0, 0],
     )
-    request = MagicMock()
-    request.num_computed_tokens = 17
     block_ids = (
         [0, 1, 2, 3],
         [10, 11, 12, 13],
@@ -304,7 +341,7 @@ def test_transferable_blocks_preserve_non_decoder_cache_groups() -> None:
         [30, 31, 32, 33],
     )
 
-    transferable = scheduler._get_transferable_block_ids(request, block_ids)
+    transferable = scheduler._get_transferable_block_ids(block_ids, 17)
 
     assert transferable == (
         [0, 1],
@@ -336,6 +373,7 @@ def test_pull_publication_uses_transferable_blocks() -> None:
         block_size=block_size,
     )
     request.num_computed_tokens = 32
+    request.num_in_flight_tokens = 16
     request.status = RequestStatus.FINISHED_LENGTH_CAPPED
     scheduler._localization_config = NixlLocalizationConfig(
         mode=LocalizationMode.TRACE,
@@ -354,9 +392,10 @@ def test_pull_publication_uses_transferable_blocks() -> None:
 
     assert delay_free_blocks is True
     assert transfer_params is not None
-    assert transfer_params["remote_block_ids"] == [[100, 101]]
-    assert transfer_params["remote_num_tokens"] == 32
-    assert scheduler._source_rosters[request.request_id].block_ids == ((100, 101),)
+    assert transfer_params["remote_block_ids"] == [[100]]
+    assert transfer_params["remote_num_tokens"] == 16
+    assert scheduler._source_rosters[request.request_id].valid_token_extent == 16
+    assert scheduler._source_rosters[request.request_id].block_ids == ((100,),)
     assert request.request_id in scheduler._reqs_need_send
 
 
@@ -524,6 +563,8 @@ def test_read_blocks_for_req_expands_remote_ids(
     worker._localization_config = MagicMock(spec=NixlLocalizationConfig)
     worker._localization_config.enabled_for.return_value = False
     worker._released_rids = set()
+    worker._cancelled_remote_offers = set()
+    worker._read_completion_notification = MagicMock(return_value=b"")
     worker.coalesce_pull = False
     worker._sp_group_flags = MagicMock(return_value=())
     worker._no_stock_dma = MagicMock(return_value=False)

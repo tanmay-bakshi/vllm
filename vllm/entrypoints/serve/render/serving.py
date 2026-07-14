@@ -306,6 +306,19 @@ class ServingRender(BaseServing):
         if error_check_ret is not None:
             return error_check_ret
 
+        if len(request.generate_responses) == 0:
+            return self.create_error_response("generate_responses must not be empty")
+
+        first = request.generate_responses[0]
+        kv_params = first.kv_transfer_params
+        if any(
+            response.kv_transfer_params != kv_params
+            for response in request.generate_responses[1:]
+        ):
+            return self.create_error_response(
+                "kv_transfer_params must match across every generate response"
+            )
+
         (
             choices,
             total_prompt_tokens,
@@ -313,20 +326,6 @@ class ServingRender(BaseServing):
         ) = await self.online_derenderer.derender_completion(
             request.generate_responses, request.prompt_tokens
         )
-
-        if not request.generate_responses:
-            return self.create_error_response("generate_responses must not be empty")
-
-        first = request.generate_responses[0]
-        kv_params = first.kv_transfer_params
-        if any(
-            r.kv_transfer_params != kv_params for r in request.generate_responses[1:]
-        ):
-            logger.warning(
-                "derender_completion: kv_transfer_params differ across responses; "
-                "setting to None on the aggregated response"
-            )
-            kv_params = None
 
         usage = UsageInfo(
             prompt_tokens=total_prompt_tokens,

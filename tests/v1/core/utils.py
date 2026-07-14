@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheSpec,
 )
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
@@ -60,19 +61,30 @@ def create_scheduler(
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
+    kv_cache_spec: KVCacheSpec | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
-    Args:
-      model: model under test
-      max_num_seqs: max sequences to schedule
-      max_num_batch_tokens: max num tokens to batch
-      enable_prefix_caching: optionally force APC config
-                             (True/False) or use default
-                             (False)
-
-    Returns:
-      {class}`Scheduler` instance
+    :param model: Model under test.
+    :param max_num_seqs: Maximum sequences to schedule.
+    :param max_num_batched_tokens: Maximum tokens per scheduler batch.
+    :param enable_chunked_prefill: Whether chunked prefill is enabled.
+    :param enable_prefix_caching: Whether prefix caching is enabled.
+    :param long_prefill_token_threshold: Long-prefill scheduling threshold.
+    :param disable_chunked_mm_input: Whether multimodal inputs must remain whole.
+    :param use_kv_connector: Optional connector test configuration.
+    :param num_blocks: Number of cache blocks.
+    :param block_size: Cache block size.
+    :param max_model_len: Maximum model sequence length.
+    :param num_speculative_tokens: Optional speculative token count.
+    :param skip_tokenizer_init: Whether tokenizer initialization is skipped.
+    :param async_scheduling: Whether scheduler batches overlap execution.
+    :param pipeline_parallel_size: Pipeline-parallel size.
+    :param use_ec_connector: Whether to configure the encoder-cache connector.
+    :param ec_role: Encoder-cache connector role.
+    :param use_v2_model_runner: Optional model-runner override.
+    :param kv_cache_spec: Optional cache spec for the scheduler's test group.
+    :returns: Configured scheduler instance.
     """
     model_config = ModelConfig(
         model=model,
@@ -149,20 +161,17 @@ def create_scheduler(
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
     )
+    if kv_cache_spec is None:
+        kv_cache_spec = FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests
         kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                ),
-            )
-        ],
+        kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
     )
     cache_config.num_gpu_blocks = num_blocks
     register_all_kvcache_specs(vllm_config)

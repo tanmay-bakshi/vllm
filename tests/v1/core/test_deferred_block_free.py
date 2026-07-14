@@ -78,8 +78,8 @@ def _setup_request_with_inflight_step(scheduler, max_tokens: int = 5):
     return request, out0, out1
 
 
-def test_gate_enabled_for_async_consumer():
-    # Overlapping batches + consumer-side connector enables the gate. Async
+def test_gate_enabled_for_async_connector():
+    # Overlapping batches + a connector enables the gate. Async
     # scheduling (which would give >1 concurrent batches) is force-disabled on
     # CPU, where this test runs, and PP can't be built without GPUs, so force
     # max_concurrent_batches to exercise the enabled path on any platform.
@@ -200,12 +200,14 @@ def test_preempt_defers_free_and_clears_bookkeeping():
 
     request, out0, out1 = _setup_request_with_inflight_step(scheduler)
     num_free_running = pool.get_num_free_blocks()
+    assert request.num_in_flight_tokens == NUM_PROMPT_TOKENS + 1
 
     # Preempt the request while steps are in flight (mirrors the
     # preemption path inside schedule()).
     scheduler.running.remove(request)
     scheduler._preempt_request(request, time.monotonic())
     assert request.status == RequestStatus.PREEMPTED
+    assert request.num_in_flight_tokens == NUM_PROMPT_TOKENS + 1
 
     # Blocks are withheld from the pool, but the manager bookkeeping is
     # cleared immediately so the request can be rescheduled safely.
@@ -217,8 +219,10 @@ def test_preempt_defers_free_and_clears_bookkeeping():
     # Outputs of both in-flight steps are processed: blocks return to the
     # pool only after the newest one.
     scheduler.update_from_output(out0, _make_model_runner_output(out0))
+    assert request.num_in_flight_tokens == 1
     assert len(scheduler.deferred_frees) == 1
     scheduler.update_from_output(out1, _make_model_runner_output(out1))
+    assert request.num_in_flight_tokens == 0
     assert not scheduler.deferred_frees
     assert pool.get_num_free_blocks() == num_free_initially
 

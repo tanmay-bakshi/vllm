@@ -49,6 +49,7 @@ from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
     _KVTransferAdmission,
+    _validate_kv_transfer_request_options,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
@@ -312,6 +313,15 @@ class OpenAIServingResponses(OpenAIServing):
     def _validate_create_responses_input(
         self, request: ResponsesRequest
     ) -> ErrorResponse | None:
+        kv_transfer_error = _validate_kv_transfer_request_options(
+            request.kv_transfer_params,
+            use_beam_search=False,
+            stream=request.stream is True,
+            n=1,
+        )
+        if kv_transfer_error is not None:
+            return self.create_error_response(kv_transfer_error)
+
         if self.use_harmony and request.is_include_output_logprobs():
             return self.create_error_response(
                 err_type="invalid_request_error",
