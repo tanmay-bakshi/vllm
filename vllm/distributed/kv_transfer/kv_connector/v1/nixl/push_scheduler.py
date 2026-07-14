@@ -235,10 +235,8 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             # ``do_remote_prefill`` is still set, which means
             # ``update_state_after_alloc`` never ran (it would have
             # flipped this flag to False). The request was aborted
-            # before it could be scheduled — e.g. rejected at the D
-            # serving layer via abort_immediately. To keep P from
-            # stranding the prefill blocks, we still register an empty
-            # recv so the worker emits a notif that lets P free them.
+            # before it could be scheduled. Keep the request alive through an
+            # empty receive so the worker can complete connector cleanup.
             self._reqs_need_recv[request.request_id] = (request, [])
             params["do_remote_prefill"] = False
             return False, None

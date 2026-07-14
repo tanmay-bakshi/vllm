@@ -529,6 +529,21 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def request_rejected_before_admission(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        """Release connector resources for an offer never owned by generation.
+
+        :param request_id: Serving-layer request identifier.
+        :param kv_transfer_params: Immutable remote-prefill offer.
+        :param reason: Diagnostic rejection reason.
+        :returns: Whether this connector accepted the operation.
+        """
+        return False
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
         Update KVConnector state from worker-side connectors output.

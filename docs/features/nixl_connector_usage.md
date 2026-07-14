@@ -136,6 +136,31 @@ python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
     - In bidirectional mode, the decoder caches KV blocks for multi-turn conversations. This value supplies a liveness deadline, but elapsed silence does not release pages that a later prefiller may still address. Unlike the prefiller lease, this deadline is not renewed via heartbeats.
     - Example: `--kv-transfer-config '{"kv_connector_extra_config": {"decoder_kv_blocks_ttl": 600}}'`
 
+## KV-transfer request contract
+
+Chat Completions, Completions, and the disaggregated Generate API validate
+request shape before transferring offer ownership to EngineCore:
+
+| Request leg | Required sampling and response shape |
+| --- | --- |
+| Producer with `do_remote_decode` | effective `n=1` and `stream=false` |
+| Consumer with `do_remote_prefill` | effective `n` equals a positive `expected_consumers`; streaming is allowed |
+| Either leg with beam search | rejected |
+| Completion request with prompt fanout | rejected |
+| Standalone render request with KV metadata | rejected; attach the contract to the rendered GenerateRequest |
+
+Under the required contract, the producer request's own `n` is one.
+`expected_consumers` is coordinator metadata that counts logical decoder
+children; it is not the producer sampling count.
+
+!!! warning "Current release blockers"
+    The Responses API does not yet call the directional validator. A KV
+    dictionary is also not required to contain exactly one direction flag:
+    neither flag is accepted, and both flags select the producer branch.
+    Completion derender warns and drops mismatched response contracts instead
+    of failing closed. These gaps must be fixed before the current Gemma 4
+    candidate is frozen for GPU testing.
+
 ## Bidirectional KV Transfer (Multi-turn)
 
 In standard disaggregated prefilling, KV cache flows in one direction: Prefill (P) computes the KV cache and Decode (D) reads from P. For multi-turn conversations this is wasteful — D already holds the KV cache corresponding to the generated tokens from prior turns, yet P must recompute it from scratch on every new turn. Bidirectional KV transfer lets P **pull** existing KV blocks from D via RDMA before computing only the new tokens, significantly reducing Time-To-First-Token (TTFT) for long-prefill such as **multi-turn heavy scenarios**.
@@ -163,7 +188,7 @@ sequenceDiagram
     activate D
     D-->P: RDMA read (D pulls KV from P)
     note over D: decode
-    D-->>Proxy: stream response + kv_transfer_params
+    D-->>Proxy: response + kv_transfer_params
     deactivate D
     note over Proxy: cache D's kv_transfer_params
     Proxy-->>Client: response
@@ -183,7 +208,7 @@ sequenceDiagram
     activate D
     D-->P: RDMA read (D pulls new KV from P)
     note over D: decode
-    D-->>Proxy: stream response + kv_transfer_params
+    D-->>Proxy: response + kv_transfer_params
     deactivate D
     note over Proxy: update cached kv_transfer_params
     Proxy-->>Client: response
@@ -196,7 +221,8 @@ sequenceDiagram
 2. Proxy forwards the request to P with no remote block info — P computes the full KV cache.
 3. Proxy forwards the request to D along with P's `kv_transfer_params` (block IDs, engine ID, host/port).
 4. D reads KV blocks from P via RDMA (peer-to-peer pull), then generates the response.
-5. D streams the response back through the proxy. The final chunk includes D's own `kv_transfer_params`.
+5. D returns the response through the proxy with its own
+   `kv_transfer_params`.
 6. Proxy caches D's `kv_transfer_params` keyed by `conversation_id`, then returns the response to the client.
 
 **Turn 2+ (cache hit — bidirectional):**
@@ -206,6 +232,10 @@ sequenceDiagram
 3. P reads the existing KV cache from D via RDMA (D→P pull), then computes KV only for the new tokens.
 4. Proxy forwards the request to D with P's updated `kv_transfer_params`.
 5. D reads the new KV blocks from P, generates the response, and returns updated `kv_transfer_params` which the proxy caches for the next turn.
+
+The example uses non-streaming responses so each returned producer contract is
+an ordinary final response. A consumer `do_remote_prefill` leg may stream, but
+any request carrying `do_remote_decode` is rejected when `stream=true`.
 
 ### Configuration
 
@@ -313,6 +343,9 @@ python benchmarks/multi_turn/benchmark_serving_multi_turn.py \
 
 - Requires a stateful proxy (or equivalent router) to track and forward `kv_transfer_params` between turns.
 - Currently supported on CUDA with device-buffer KV cache. Host-buffer support (e.g., for Intel XPU) is planned for future work.
+- Producer legs are non-streaming and n=1. Consumer parallel sampling requires
+  exact positive `expected_consumers` metadata. Beam search and completion
+  prompt fanout are not supported with a KV-transfer contract.
 
 !!! warning "Reasoning models with stripped thinking traces"
     When using reasoning models (e.g. DeepSeek-R1) that produce thinking traces

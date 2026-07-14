@@ -6,10 +6,11 @@ from http import HTTPStatus
 from typing import Annotated
 
 from fastapi import APIRouter, Form, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.utils.api_utils import (
+    CloseableStreamingResponse,
     load_aware_call,
     with_cancellation,
 )
@@ -58,4 +59,7 @@ async def create_translations(
     elif isinstance(generator, TranslationResponseVariant):
         return JSONResponse(content=generator.model_dump())
 
-    return StreamingResponse(content=generator, media_type="text/event-stream")
+    return CloseableStreamingResponse(
+        content=generator,
+        media_type="text/event-stream",
+    )

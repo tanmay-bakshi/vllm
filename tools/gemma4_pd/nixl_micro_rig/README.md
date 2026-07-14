@@ -1,5 +1,21 @@
 # Gemma 4 NIXL transport micro-rig
 
+## Current status
+
+The production-topology rig is implemented and its host-only planning,
+self-test, integrity, lifecycle, and staging-generation checks have passed.
+The former strict-XFAIL staging-lifetime test is no longer the current
+expectation:
+`test_partial_post_failure_never_reuses_live_staging_generation` now passes
+against the tombstoning ownership state machine.
+
+No authoritative GPU transport result for this rig is preserved in the
+current workspace. Do not infer a native run from the rig, launcher, or
+campaign scaffolding. The immediate GPU priority is the full-server
+post-admission/preemption gate, followed by the F9 campaign. Run this transport
+rig only if that campaign fires or transport localization is otherwise
+reopened.
+
 This rig isolates the same-host TP4-to-TP1 NIXL/UCX data plane from model
 startup. Its production-topology lane uses four independent producer OS
 processes and NIXL agents, plus one consumer process and agent.
@@ -36,11 +52,13 @@ $VENV/bin/python -m pytest -q \
   tests/v1/kv_connector/unit/test_nixl_integrity.py
 ```
 
-The strict XFAIL calls the source-bound production `_coalesce_drop_plan`
-implementation. It demonstrates the known staging lifetime defect when one
-rank is still `PROC` and a sibling reports `ERR`. The safe ownership model
-requires a sealed post phase and terminal or cancellation-acknowledged state
-for every possible writer before range reuse.
+The staging-generation regression calls the source-bound production ownership
+path. A generation with any posted native operation remains live until every
+possible writer is terminal and device quiescence is established. `ERR`,
+`UNKNOWN`, nonterminal timeout, or failed handle release tombstones the
+generation and forbids range reuse. The historical fail-first result proved
+the former defect; the current passing test proves the replacement host state
+machine, not native GPU behavior.
 
 ## GPU campaign
 

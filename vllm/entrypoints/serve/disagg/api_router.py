@@ -7,7 +7,7 @@ import json
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
@@ -20,6 +20,7 @@ from vllm.entrypoints.serve.disagg.serving import (
 )
 from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
 from vllm.entrypoints.serve.utils.api_utils import (
+    CloseableStreamingResponse,
     load_aware_call,
     validate_json_request,
     with_cancellation,
@@ -71,7 +72,10 @@ async def generate(request: GenerateRequest, raw_request: Request):
     elif isinstance(generator, GenerateResponse):
         return JSONResponse(content=generator.model_dump())
 
-    return StreamingResponse(content=generator, media_type="text/event-stream")
+    return CloseableStreamingResponse(
+        content=generator,
+        media_type="text/event-stream",
+    )
 
 
 def attach_router(app: FastAPI):

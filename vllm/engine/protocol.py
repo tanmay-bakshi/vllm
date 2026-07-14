@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +37,20 @@ class StreamingInput:
     sampling_params: SamplingParams | None = None
 
 
+class GenerationStream(ABC):
+    """Closeable asynchronous stream of generation outputs."""
+
+    @abstractmethod
+    def __aiter__(self) -> "GenerationStream": ...
+
+    @abstractmethod
+    async def __anext__(self) -> RequestOutput: ...
+
+    @abstractmethod
+    async def aclose(self) -> None:
+        """Abort unfinished generation and release resources idempotently."""
+
+
 class EngineClient(ABC):
     """Protocol class for Clients to Engine"""
 
@@ -62,7 +76,7 @@ class EngineClient(ABC):
     def dead_error(self) -> BaseException: ...
 
     @abstractmethod
-    def generate(
+    async def generate(
         self,
         prompt: EngineCoreRequest
         | PromptType
@@ -79,8 +93,12 @@ class EngineClient(ABC):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
-    ) -> AsyncGenerator[RequestOutput, None]:
-        """Generate outputs for a request."""
+        on_engine_admission: Callable[[], None] | None = None,
+    ) -> GenerationStream:
+        """Admit a request and return its output stream.
+
+        ``on_engine_admission`` runs only after EngineCore commits ownership.
+        """
         ...
 
     @abstractmethod
@@ -113,12 +131,17 @@ class EngineClient(ABC):
         self,
         request_id: str,
         kv_transfer_params: dict[str, Any],
+        reason: str,
         *,
         data_parallel_rank: int | None = None,
-    ) -> None:
-        """Notify the engine that a KV-transfer request was rejected before
-        engine admission, so connector-side cleanup can run (e.g. free
-        prefill blocks pinned on the P node).
+    ) -> bool:
+        """Notify the engine of a rejection before generation ownership.
+
+        :param request_id: Serving-layer request identifier.
+        :param kv_transfer_params: Immutable remote-prefill offer.
+        :param reason: Diagnostic rejection reason.
+        :param data_parallel_rank: Decoder rank selected by the router.
+        :returns: Whether a connector accepted the rejection notification.
         """
         ...
 

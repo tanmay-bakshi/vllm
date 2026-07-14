@@ -5,7 +5,9 @@ import asyncio
 import dataclasses
 import functools
 import os
+import traceback
 from argparse import Namespace
+from collections.abc import Mapping
 from logging import Logger
 from string import Template
 from typing import Any
@@ -15,6 +17,7 @@ from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask, BackgroundTasks
+from starlette.types import Receive, Scope, Send
 
 from vllm import envs
 from vllm.engine.arg_utils import EngineArgs
@@ -23,6 +26,7 @@ from vllm.entrypoints.openai.models.protocol import LoRAModulePath
 from vllm.logger import current_formatter_type, init_logger
 from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.async_utils import ManagedAsyncIterator
 
 logger = init_logger(__name__)
 
@@ -32,6 +36,56 @@ VLLM_SUBCMD_PARSER_EPILOG = (
     "For a flag:               vllm {subcmd} --help=max-model-len  (_ or - accepted)\n"  # noqa: E501
     "Documentation:            https://docs.vllm.ai\n"
 )
+
+
+class CloseableStreamingResponse(StreamingResponse):
+    """Streaming response that closes eagerly acquired iterator resources."""
+
+    _managed_content: ManagedAsyncIterator[str | bytes | memoryview]
+
+    def __init__(
+        self,
+        content: ManagedAsyncIterator[str | bytes | memoryview],
+        status_code: int = 200,
+        headers: Mapping[str, str] | None = None,
+        media_type: str | None = None,
+        background: BackgroundTask | None = None,
+    ) -> None:
+        """Create a response with deterministic content cleanup.
+
+        :param content: Managed response body iterator.
+        :param status_code: HTTP response status code.
+        :param headers: Optional HTTP response headers.
+        :param media_type: Optional response media type.
+        :param background: Optional Starlette background task.
+        """
+        super().__init__(
+            content=content,
+            status_code=status_code,
+            headers=headers,
+            media_type=media_type,
+            background=background,
+        )
+        self._managed_content = content
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        active_error: BaseException | None = None
+        try:
+            await super().__call__(scope, receive, send)
+        except BaseException as error:
+            active_error = error
+            raise
+        finally:
+            try:
+                await self._managed_content.aclose()
+            except BaseException:
+                if active_error is None:
+                    raise
+                logger.error(
+                    "Failed to close streaming response content while handling "
+                    "another error\n%s",
+                    traceback.format_exc(),
+                )
 
 
 async def listen_for_disconnect(request: Request) -> None:

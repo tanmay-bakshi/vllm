@@ -6,6 +6,7 @@ import queue
 import signal
 import threading
 import time
+import traceback
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
@@ -369,13 +370,11 @@ class EngineCore:
             )
         return metadata
 
-    def add_request(self, request: Request, request_wave: int = 0):
-        """Add request to the scheduler.
+    def _validate_add_request(self, request: Request) -> None:
+        """Validate a request before it enters scheduler ownership.
 
-        `request_wave`: indicate which wave of requests this is expected to
-        belong to in DP case
+        :param request: Prepared scheduler request.
         """
-        # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
                 f"request_id must be a string, got {type(request.request_id)}"
@@ -400,11 +399,117 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
+    def _request_added(self, request: Request, request_wave: int) -> None:
+        """Apply engine-specific state after scheduler ownership commits.
+
+        :param request: Scheduler-owned request.
+        :param request_wave: Data-parallel wave carried by the request.
+        """
+
+    def add_request(self, request: Request, request_wave: int = 0) -> None:
+        """Add one request to the scheduler.
+
+        :param request: Prepared scheduler request.
+        :param request_wave: Data-parallel wave expected to own the request.
+        """
+        self._validate_add_request(request)
         self.scheduler.add_request(request)
-        if request.abort_immediately:
-            # Immediately abort so the connector's request_finished hook runs
-            # to free any pre-admission KV-transfer resources.
-            self.abort_requests([request.request_id])
+        self._request_added(request, request_wave)
+
+    def validate_add_requests(self, requests: list[tuple[Request, int]]) -> None:
+        """Validate a request batch before accepting cleanup ownership.
+
+        :param requests: Prepared requests paired with data-parallel waves.
+        :raises ValueError: If the complete batch cannot be admitted.
+        """
+        if len(requests) == 0:
+            raise ValueError("request batch must not be empty")
+        for request, _ in requests:
+            self._validate_add_request(request)
+        self.scheduler.validate_add_requests([request for request, _ in requests])
+
+    def commit_requests(self, requests: list[tuple[Request, int]]) -> None:
+        """Atomically commit scheduler ownership for a request batch.
+
+        :param requests: Prepared requests paired with data-parallel waves.
+        :raises ValueError: If validation fails before scheduler mutation.
+        """
+        self.validate_add_requests(requests)
+        self.scheduler.commit_requests([request for request, _ in requests])
+
+    def admit_committed_requests(self, requests: list[tuple[Request, int]]) -> bool:
+        """Run connector and engine hooks for a committed request batch.
+
+        :param requests: Scheduler-owned requests paired with data-parallel waves.
+        :returns: Whether connector admission completed without an error.
+        """
+
+        connector_admitted = self.scheduler.admit_committed_requests(
+            [request for request, _ in requests]
+        )
+        if connector_admitted is False:
+            return False
+        try:
+            for request, request_wave in requests:
+                self._request_added(request, request_wave)
+        except Exception:
+            logger.error(
+                "Engine admission bookkeeping failed after batch commit\n%s",
+                traceback.format_exc(),
+            )
+            self.scheduler.finish_requests(
+                [request.request_id for request, _ in requests],
+                RequestStatus.FINISHED_ABORTED,
+            )
+            return False
+        return True
+
+    def notify_kv_transfer_request_rejected(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+    ) -> Future[bool] | bool:
+        """Queue connector cleanup for a request not owned by generation.
+
+        :param request_id: Serving-layer request identifier.
+        :param kv_transfer_params: Immutable remote-prefill offer.
+        :param reason: Diagnostic rejection reason.
+        :returns: Whether the configured connector accepted the operation.
+        """
+        if self.scheduler.owns_kv_transfer_offer(kv_transfer_params):
+            logger.error(
+                "Refusing to cancel remote-prefill offer for request %s because "
+                "an admitted request owns it",
+                request_id,
+            )
+            return False
+
+        worker_future = cast(
+            Future[list[bool]],
+            self.model_executor.collective_rpc(
+                "notify_kv_transfer_request_rejected",
+                args=(request_id, kv_transfer_params, reason),
+                non_block=True,
+            ),
+        )
+        result_future: Future[bool] = Future()
+
+        def aggregate_result(completed: Future[list[bool]]) -> None:
+            if completed.cancelled():
+                result_future.cancel()
+                return
+            error = completed.exception()
+            if error is not None:
+                result_future.set_exception(error)
+                return
+            handled = completed.result()
+            result_future.set_result(
+                len(handled) > 0 and all(result is True for result in handled)
+            )
+
+        worker_future.add_done_callback(aggregate_result)
+        return result_future
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -476,18 +581,23 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
-    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+    def step(
+        self, *, maintenance_only: bool = False
+    ) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
-        Returns tuple of outputs and a flag indicating whether the model
-        was executed.
+        :param maintenance_only: Advance connector cleanup without scheduling
+            runnable request tokens.
+        :returns: Outputs and whether the model executed runnable tokens.
         """
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        scheduler_output = self.scheduler.schedule(
+            self._should_throttle_prefills(), maintenance_only=maintenance_only
+        )
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -1245,12 +1355,32 @@ class EngineCoreProc(EngineCore):
         pass
 
     def has_work(self) -> bool:
-        """Returns true if the engine should be stepped."""
-        return (
-            self.engines_running
-            or self.scheduler.has_requests()
-            or bool(self.batch_queue)
-        )
+        """Return whether the engine owns work that still needs progress.
+
+        :returns: Whether request, connector, wave, or queued execution work exists.
+        """
+        has_queued_batch = self.batch_queue is not None and len(self.batch_queue) > 0
+        return self.engines_running or self.scheduler.has_requests() or has_queued_batch
+
+    def has_unfinished_work(self) -> bool:
+        """Return whether shutdown must continue draining owned work.
+
+        This includes terminal requests and connector work whose cleanup has not
+        completed. Teardown cannot safely begin while the scheduler still owns
+        either kind of work.
+
+        :returns: Whether requests, connector work, a DP wave, or queued
+            execution remain unfinished.
+        """
+        has_queued_batch = self.batch_queue is not None and len(self.batch_queue) > 0
+        return self.engines_running or self.scheduler.has_requests() or has_queued_batch
+
+    def has_step_work(self) -> bool:
+        """Return whether the main loop may run an engine iteration.
+
+        :returns: Whether stepping can make safe forward progress.
+        """
+        return self.has_work()
 
     def is_running(self) -> bool:
         """Returns true if shutdown has not been requested."""
@@ -1270,7 +1400,7 @@ class EngineCoreProc(EngineCore):
         """Exits when an engine step needs to be performed."""
 
         waited = False
-        while not self.has_work() and self.is_running():
+        while not self.has_step_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
             if self.input_queue.empty():
@@ -1297,11 +1427,16 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
-    def _process_engine_step(self) -> bool:
-        """Called only when there are unfinished local requests."""
+    def _process_engine_step(self, *, maintenance_only: bool = False) -> bool:
+        """Run one compute or connector-maintenance iteration.
 
-        # Step the engine core.
-        outputs, model_executed = self.step_fn()
+        :param maintenance_only: Advance cleanup without scheduling request tokens.
+        :returns: Whether runnable model tokens were executed.
+        """
+
+        outputs, model_executed = (
+            self.step(maintenance_only=True) if maintenance_only else self.step_fn()
+        )
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
@@ -1360,7 +1495,7 @@ class EngineCoreProc(EngineCore):
             self.shutdown_state = EngineShutdownState.SHUTTING_DOWN
 
         # Exit when no work remaining
-        if not self.has_work():
+        if not self.has_unfinished_work():
             logger.info(
                 "[shutdown] EngineCore: request processing complete; "
                 "starting resource teardown"
@@ -1376,6 +1511,107 @@ class EngineCoreProc(EngineCore):
 
         if request_type == EngineCoreRequestType.WAKEUP:
             return
+        elif request_type == EngineCoreRequestType.ADD_BATCH:
+            prepared, client_index, call_id = request
+            prepared_requests = [request for request, _ in prepared]
+            if self.shutdown_state != EngineShutdownState.RUNNING:
+                self._send_batch_admission_result(
+                    client_index,
+                    call_id,
+                    failure_message="Server shutting down",
+                )
+                return
+
+            try:
+                if any(
+                    prepared_request.client_index != client_index
+                    for prepared_request, _ in prepared
+                ):
+                    raise ValueError("request batch contains a mismatched client index")
+                self.commit_requests(prepared)
+            except Exception as error:
+                logger.error(
+                    "Atomic request batch validation failed before ownership\n%s",
+                    traceback.format_exc(),
+                )
+                self._send_batch_admission_result(
+                    client_index,
+                    call_id,
+                    failure_message=str(error),
+                )
+                return
+
+            self._send_batch_admission_result(client_index, call_id)
+            try:
+                connector_admitted = self.admit_committed_requests(prepared)
+            except Exception as admission_error:
+                logger.error(
+                    "Atomic request batch failed after EngineCore accepted "
+                    "cleanup ownership\n%s",
+                    traceback.format_exc(),
+                )
+                request_ids = [request.request_id for request in prepared_requests]
+                owned_request_ids = [
+                    request_id
+                    for request_id in request_ids
+                    if request_id in self.scheduler.requests
+                ]
+                incomplete_terminal_ids = [
+                    request_id
+                    for request_id in owned_request_ids
+                    if self.scheduler.requests[request_id].is_finished()
+                    and self.scheduler.has_completed_request_cleanup(
+                        self.scheduler.requests[request_id]
+                    )
+                    is False
+                ]
+                if len(incomplete_terminal_ids) > 0:
+                    raise RuntimeError(
+                        "claimed request cleanup failed after terminal state: "
+                        f"{incomplete_terminal_ids}"
+                    ) from admission_error
+                try:
+                    if len(owned_request_ids) > 0:
+                        self.scheduler.finish_requests(
+                            owned_request_ids,
+                            RequestStatus.FINISHED_ABORTED,
+                        )
+                except Exception as cleanup_error:
+                    logger.critical(
+                        "EngineCore could not retire a claimed request batch; "
+                        "terminating to prevent execution after terminal output\n%s",
+                        traceback.format_exc(),
+                    )
+                    raise RuntimeError(
+                        "failed to retire a claimed request batch"
+                    ) from cleanup_error
+                incomplete_cleanup_ids = [
+                    request.request_id
+                    for request in prepared_requests
+                    if self.scheduler.has_completed_request_cleanup(request) is False
+                ]
+                if len(incomplete_cleanup_ids) > 0:
+                    raise RuntimeError(
+                        "EngineCore lacks terminal cleanup proof for claimed "
+                        f"requests {incomplete_cleanup_ids}"
+                    ) from admission_error
+                self._send_error_outputs_to_client(request_ids, client_index)
+                return
+            if connector_admitted is False:
+                incomplete_cleanup_ids = [
+                    request.request_id
+                    for request in prepared_requests
+                    if self.scheduler.has_completed_request_cleanup(request) is False
+                ]
+                if len(incomplete_cleanup_ids) > 0:
+                    raise RuntimeError(
+                        "connector rejected a claimed batch without terminal "
+                        f"cleanup proof for {incomplete_cleanup_ids}"
+                    )
+                self._send_error_outputs_to_client(
+                    [prepared_request.request_id for prepared_request, _ in prepared],
+                    client_index,
+                )
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
             if self._reject_add_in_shutdown(req):
@@ -1403,6 +1639,28 @@ class EngineCoreProc(EngineCore):
             logger.error(
                 "Unrecognized input request type encountered: %s", request_type
             )
+
+    def _send_batch_admission_result(
+        self,
+        client_index: int,
+        call_id: int,
+        failure_message: str | None = None,
+    ) -> None:
+        """Return the authoritative result of an atomic batch admission.
+
+        :param client_index: Frontend client awaiting the result.
+        :param call_id: Correlation identifier allocated by the frontend.
+        :param failure_message: Pre-ownership failure, or ``None`` after
+            EngineCore accepts cleanup ownership.
+        """
+        utility_output = UtilityOutput(
+            call_id,
+            failure_message=failure_message,
+            result=None if failure_message is not None else UtilityResult(None),
+        )
+        self.output_queue.put_nowait(
+            (client_index, EngineCoreOutputs(utility_output=utility_output))
+        )
 
     def _reject_add_in_shutdown(self, request: Request) -> bool:
         if self.shutdown_state == EngineShutdownState.RUNNING:
@@ -1494,6 +1752,10 @@ class EngineCoreProc(EngineCore):
         add_request_decoder = MsgpackDecoder(
             EngineCoreRequest, oob_tensor_provider=self.tensor_ipc_receiver
         )
+        add_request_batch_decoder = MsgpackDecoder(
+            list[EngineCoreRequest],
+            oob_tensor_provider=self.tensor_ipc_receiver,
+        )
         generic_decoder = MsgpackDecoder(oob_tensor_provider=self.tensor_ipc_receiver)
 
         with ExitStack() as stack, zmq.Context() as ctx:
@@ -1573,6 +1835,49 @@ class EngineCoreProc(EngineCore):
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
+                    elif request_type == EngineCoreRequestType.ADD_BATCH:
+                        try:
+                            correlation_frame, *batch_frames = data_frames
+                            client_index, call_id = msgspec.msgpack.decode(
+                                correlation_frame.buffer,
+                                type=tuple[int, int],
+                            )
+                            if (
+                                type(client_index) is not int
+                                or client_index < 0
+                                or client_index >= len(input_addresses)
+                                or type(call_id) is not int
+                                or call_id < 0
+                            ):
+                                raise ValueError(
+                                    "invalid atomic request batch correlation header"
+                                )
+                        except Exception:
+                            logger.critical(
+                                "EngineCore received an uncorrelatable atomic request "
+                                "batch; terminating the input protocol\n%s",
+                                traceback.format_exc(),
+                            )
+                            self.input_queue.put_nowait(
+                                (EngineCoreRequestType.EXECUTOR_FAILED, b"")
+                            )
+                            return
+                        try:
+                            batch_requests = add_request_batch_decoder.decode(
+                                batch_frames
+                            )
+                            prepared = [
+                                self.preprocess_add_request(req)
+                                for req in batch_requests
+                            ]
+                        except Exception as error:
+                            self._handle_request_batch_preproc_error(
+                                client_index,
+                                call_id,
+                                error,
+                            )
+                            continue
+                        request = (prepared, client_index, call_id)
                     else:
                         request = generic_decoder.decode(data_frames)
 
@@ -1661,6 +1966,28 @@ class EngineCoreProc(EngineCore):
             "Unexpected error pre-processing request %s", request.request_id
         )
         self._send_error_outputs_to_client([request.request_id], request.client_index)
+
+    def _handle_request_batch_preproc_error(
+        self,
+        client_index: int,
+        call_id: int,
+        error: Exception,
+    ) -> None:
+        """Reject an entire batch when any request fails preprocessing.
+
+        :param client_index: Frontend client awaiting the admission result.
+        :param call_id: Correlation identifier decoded independently.
+        :param error: Preprocessing failure raised for one batch member.
+        """
+        logger.error(
+            "Atomic request batch failed preprocessing\n%s",
+            traceback.format_exc(),
+        )
+        self._send_batch_admission_result(
+            client_index,
+            call_id,
+            failure_message=str(error),
+        )
 
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
@@ -1833,8 +2160,39 @@ class DPEngineCoreProc(EngineCoreProc):
 
         return False
 
-    def add_request(self, request: Request, request_wave: int = 0):
-        super().add_request(request, request_wave)
+    def has_step_work(self) -> bool:
+        """Keep runnable work dormant until the coordinator starts its wave.
+
+        Connector cleanup remains eligible because an empty scheduler batch does
+        not enter model or data-parallel collectives.
+
+        :returns: Whether this rank may run a compute or maintenance iteration.
+        """
+        if self.has_coordinator and self.engines_running is False:
+            has_queued_batch: bool = (
+                self.batch_queue is not None and len(self.batch_queue) > 0
+            )
+            return has_queued_batch or self.scheduler.has_maintenance_work()
+        return super().has_step_work()
+
+    def _is_maintenance_only_iteration(self) -> bool:
+        """Return whether only connector cleanup may progress on this rank.
+
+        :returns: Whether the current iteration must schedule no runnable tokens.
+        """
+        return (
+            self.has_coordinator
+            and self.engines_running is False
+            and (self.batch_queue is None or len(self.batch_queue) == 0)
+            and self.scheduler.has_maintenance_work()
+        )
+
+    def _request_added(self, request: Request, request_wave: int) -> None:
+        """Update data-parallel wave state after scheduler admission.
+
+        :param request: Scheduler-owned request.
+        :param request_wave: Data-parallel wave carried by the request.
+        """
         if self.has_coordinator and request_wave != self.current_wave:
             if request_wave > self.current_wave:
                 self.current_wave = request_wave
@@ -1940,8 +2298,15 @@ class DPEngineCoreProc(EngineCoreProc):
                     self.process_input_queue_block = True
                     self.eep_scaling_state = None
 
-            executed = self._process_engine_step()
+            maintenance_only = self._is_maintenance_only_iteration()
+            if self.has_step_work() is False:
+                time.sleep(0.001)
+                continue
+            executed = self._process_engine_step(maintenance_only=maintenance_only)
             self._maybe_publish_request_counts()
+
+            if maintenance_only:
+                continue
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
             if not executed:

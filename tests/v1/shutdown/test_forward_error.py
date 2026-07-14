@@ -73,10 +73,12 @@ async def test_async_llm_model_error(
     async_llm = AsyncLLM.from_engine_args(engine_args)
 
     async def generate(request_id: str):
-        generator = async_llm.generate(
-            "Hello my name is", request_id=request_id, sampling_params=SamplingParams()
-        )
         try:
+            generator = await async_llm.generate(
+                "Hello my name is",
+                request_id=request_id,
+                sampling_params=SamplingParams(),
+            )
             async for _ in generator:
                 pass
         except Exception as e:
@@ -95,10 +97,9 @@ async def test_async_llm_model_error(
 
     # We should not be able to make another request.
     with pytest.raises(EngineDeadError):
-        async for _ in async_llm.generate(
+        await async_llm.generate(
             "Hello my name is", request_id="abc", sampling_params=SamplingParams()
-        ):
-            raise Exception("We should not get here.")
+        )
 
     # Confirm all the processes are cleaned up.
     wait_for_gpu_memory_to_clear(

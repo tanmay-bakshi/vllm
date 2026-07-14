@@ -5,6 +5,8 @@ use rmpv::Value;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
+use crate::error::Error;
+
 /// Tensors and ndarrays are encoded with this extension type in Python.
 ///
 /// Original Python definition:
@@ -109,6 +111,28 @@ impl WireNdArray {
             shape,
             data: WireArrayData::RawView(data),
         }
+    }
+
+    pub(super) fn resolve_aux_frame_in_place<Frame>(
+        &mut self,
+        frames: &[Frame],
+        field: &str,
+    ) -> crate::error::Result<()>
+    where
+        Frame: AsRef<[u8]>,
+    {
+        let WireArrayData::AuxIndex(index) = &self.data else {
+            return Ok(());
+        };
+        let index = *index;
+        let frame = frames.get(index).ok_or_else(|| Error::ExtValueDecode {
+            message: format!(
+                "{field}: aux frame index {index} out of range for {} frames",
+                frames.len()
+            ),
+        })?;
+        self.data = WireArrayData::RawView(frame.as_ref().to_vec());
+        Ok(())
     }
 }
 

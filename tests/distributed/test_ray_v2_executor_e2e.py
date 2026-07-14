@@ -79,9 +79,10 @@ class _AsyncLLMActor:
 
         params = SamplingParams(max_tokens=16)
         result = None
-        async for output in self.engine.generate(
+        stream = await self.engine.generate(
             prompt, params, request_id="test_request_id"
-        ):
+        )
+        async for output in stream:
             result = output
         assert result is not None
         return result.outputs[0].text
@@ -91,9 +92,10 @@ class _AsyncLLMActor:
 
         params = SamplingParams(max_tokens=16)
         result = None
-        async for output in self.engine.generate(
+        stream = await self.engine.generate(
             prompt, params, request_id="test_request_id"
-        ):
+        )
+        async for output in stream:
             result = output
         assert result is not None
         text = result.outputs[0].text

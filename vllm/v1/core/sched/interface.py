@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
 
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
@@ -49,7 +49,12 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
+    def schedule(
+        self,
+        throttle_prefills: bool = False,
+        *,
+        maintenance_only: bool = False,
+    ) -> "SchedulerOutput":
         """Schedule the requests to process in this scheduling step.
 
         The scheduling decision is made at the iteration level. Each scheduling
@@ -73,6 +78,8 @@ class SchedulerInterface(ABC):
                 engine core on non-cadence-aligned steps), new prefill compute is
                 deferred to a later step so prefills stay aligned across DP ranks;
                 automatically overridden when the rank is saturated.
+            maintenance_only: Build an empty compute batch that advances connector
+                cleanup without admitting runnable request tokens.
 
         Returns:
             A SchedulerOutput object containing information about the scheduled
@@ -140,6 +147,51 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def validate_add_requests(self, requests: list["Request"]) -> None:
+        """Validate a fresh request group without mutating scheduler state.
+
+        :param requests: Requests proposed for one ownership transaction.
+        :raises ValueError: If the complete group cannot be admitted.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def commit_requests(self, requests: list["Request"]) -> None:
+        """Atomically establish scheduler ownership of fresh requests.
+
+        :param requests: Requests that share one frontend admission boundary.
+        :raises ValueError: If validation fails before scheduler mutation.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def admit_committed_requests(self, requests: list["Request"]) -> bool:
+        """Run connector admission for an already-committed request group.
+
+        :param requests: Scheduler-owned requests sharing one transaction.
+        :returns: Whether connector admission completed without an error.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def owns_kv_transfer_offer(self, kv_transfer_params: Mapping[str, object]) -> bool:
+        """Return whether any admitted request owns a remote KV offer.
+
+        :param kv_transfer_params: Remote offer identity and transport metadata.
+        :returns: Whether an admitted request owns the same offer.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def has_completed_request_cleanup(self, request: "Request") -> bool:
+        """Return whether terminal connector cleanup completed for a request.
+
+        :param request: Claimed request whose terminal state is queried.
+        :returns: Whether the scheduler durably completed its cleanup handoff.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def finish_requests(
         self,
         request_ids: str | Iterable[str] | None,
@@ -192,6 +244,13 @@ class SchedulerInterface(ABC):
         """Returns True if there are unfinished requests, or finished requests
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests() or self.has_finished_requests()
+
+    def has_maintenance_work(self) -> bool:
+        """Return whether cleanup can progress without model execution.
+
+        :returns: Whether a maintenance-only scheduler iteration is useful.
+        """
+        return self.has_finished_requests()
 
     @property
     @abstractmethod

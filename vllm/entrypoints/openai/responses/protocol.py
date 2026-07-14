@@ -14,6 +14,8 @@ from openai.types.responses import (
     ResponseCodeInterpreterCallInterpretingEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
+    ResponseErrorEvent,
+    ResponseFailedEvent,
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseMcpCallArgumentsDeltaEvent,
@@ -805,6 +807,8 @@ StreamingResponsesResponse: TypeAlias = (
     ResponseCreatedEvent
     | ResponseInProgressEvent
     | ResponseCompletedEvent
+    | ResponseErrorEvent
+    | ResponseFailedEvent
     | ResponseOutputItemAddedEvent
     | ResponseOutputItemDoneEvent
     | ResponseContentPartAddedEvent

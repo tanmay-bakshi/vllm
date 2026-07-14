@@ -31,6 +31,7 @@ GET_META_MSG = b"get_meta_msg"
 # PUSH_REG_NOTIF_PREFIX + msgpack(registration_data).
 PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 PULL_READ_COMPLETE_PREFIX = b"PULL_READ_COMPLETE:"
+PULL_OFFER_CANCELLATION_CONTROL_PREFIX = b"PULL_OFFER_CANCELLATION:"
 #
 # NIXL Connector Version
 #
@@ -49,8 +50,9 @@ PULL_READ_COMPLETE_PREFIX = b"PULL_READ_COMPLETE:"
 #   5: Add gated P-to-D source integrity manifests
 #   6: Replace source gating with post-transfer source references
 #   7: Add producer-owned leases and idempotent pull completion proofs
+#   8: Add exact decoder-rank whole-offer cancellation proofs
 #
-NIXL_CONNECTOR_VERSION: int = 7
+NIXL_CONNECTOR_VERSION: int = 8
 
 
 @dataclass
@@ -202,6 +204,45 @@ class PullReadComplete(msgspec.Struct, frozen=True, array_like=True):
     expected_consumers: int
 
 
+class PullOfferCancelled(msgspec.Struct, frozen=True, array_like=True):
+    """Proof that one decoder rank admitted no consumer from an offer.
+
+    :ivar producer_request_id: Producer request whose pages remain offered.
+    :ivar consumer_rank: Decoder tensor-parallel rank making the assertion.
+    :ivar consumer_tp_size: Decoder tensor-parallel world size.
+    :ivar expected_consumers: Decoder view of the producer-owned contract.
+    """
+
+    producer_request_id: ReqId
+    consumer_rank: int
+    consumer_tp_size: int
+    expected_consumers: int
+
+
+class PullOfferCancellationControl(msgspec.Struct, frozen=True, array_like=True):
+    """Side-channel request carrying one decoder-rank cancellation proof.
+
+    :ivar producer_ranks: Exact producer ranks covered by the decoder rank.
+    :ivar proof: Whole-offer cancellation proof to deliver to those ranks.
+    """
+
+    producer_ranks: tuple[int, ...]
+    proof: PullOfferCancelled
+
+
+class PullOfferCancellationAck(msgspec.Struct, frozen=True, array_like=True):
+    """Producer acknowledgement for a queued cancellation control request.
+
+    :ivar producer_request_id: Producer offer accepted by the control plane.
+    :ivar producer_ranks: Exact producer ranks that will receive the proof.
+    :ivar accepted: Whether the complete control request was queued atomically.
+    """
+
+    producer_request_id: ReqId
+    producer_ranks: tuple[int, ...]
+    accepted: bool
+
+
 @dataclass
 class RemoteMeta:
     block_ids: BlockIds
@@ -236,6 +277,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
         self.reqs_to_send: dict[ReqId, ProducerLease] = {}
+        self.offer_cancellations_by_rank: dict[int, tuple[PullOfferCancelled, ...]] = {}
         # P-side block rosters retained until completed remote reads are observed.
         self.source_rosters: dict[ReqId, NixlSourceRoster] = {}
         # Requests that will execute a model forward with this metadata. This

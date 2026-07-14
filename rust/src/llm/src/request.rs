@@ -107,7 +107,6 @@ impl GenerateRequest {
                 // reasoning logic in engine-sided structured output manager handle it.
                 reasoning_ended: None,
                 reasoning_parser_kwargs,
-                abort_immediately: false,
             },
         })
     }

@@ -74,7 +74,6 @@ class EngineCoreRequest(
     external_req_id: str | None = None
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, object] | None = None
-    abort_immediately: bool = False
 
 
 class EngineCoreOutput(

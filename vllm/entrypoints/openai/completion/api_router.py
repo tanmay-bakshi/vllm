@@ -5,7 +5,7 @@
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
@@ -14,6 +14,7 @@ from vllm.entrypoints.openai.completion.protocol import (
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.utils.api_utils import (
+    CloseableStreamingResponse,
     load_aware_call,
     validate_json_request,
     with_cancellation,
@@ -63,7 +64,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             headers=metrics_header(metrics_header_format),
         )
 
-    return StreamingResponse(content=generator, media_type="text/event-stream")
+    return CloseableStreamingResponse(content=generator, media_type="text/event-stream")
 
 
 def attach_router(app: FastAPI):

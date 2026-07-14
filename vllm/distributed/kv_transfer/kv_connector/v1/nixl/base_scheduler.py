@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base scheduler-side logic for the NIXL connector."""
 
+import queue
 import threading
+import traceback
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -20,10 +22,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
+    PULL_OFFER_CANCELLATION_CONTROL_PREFIX,
     HeartbeatInfo,
     NixlConnectorMetadata,
     NixlHandshakePayload,
     ProducerLease,
+    PullOfferCancellationAck,
+    PullOfferCancellationControl,
+    PullOfferCancelled,
     ReqId,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
@@ -53,6 +59,8 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+_MAX_PENDING_OFFER_CANCELLATIONS = 65_536
 
 
 class NixlBaseConnectorScheduler:
@@ -105,6 +113,9 @@ class NixlBaseConnectorScheduler:
         # Background thread for handling new handshake requests.
         self._nixl_handshake_listener_t: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._offer_cancellation_queue: queue.Queue[PullOfferCancellationControl] = (
+            queue.Queue(maxsize=_MAX_PENDING_OFFER_CANCELLATIONS)
+        )
         self._localization_config = NixlLocalizationConfig.from_environment()
         self._source_rosters: dict[ReqId, NixlSourceRoster] = {}
         self._localization_offer_generation = 0
@@ -124,14 +135,6 @@ class NixlBaseConnectorScheduler:
         self._reqs_need_recv: dict[ReqId, tuple[Request, BlockIds]] = {}
         # KV-audit: rids finished since the last build_connector_meta.
         self._audit_finished_reqs: set[ReqId] = set()
-        # Single-flight sibling pulls: remote registration id -> local
-        # leader request id (VLLM_GEMMA4_PULL_SINGLE_FLIGHT=1).
-        import os as _os_sf
-
-        self._pull_single_flight = (
-            _os_sf.environ.get("VLLM_GEMMA4_PULL_SINGLE_FLIGHT", "0") == "1"
-        )
-        self._pull_leaders: dict[str, str] = {}
         self._reqs_need_save: dict[ReqId, Request] = {}
         self._reqs_need_send: dict[ReqId, ProducerLease] = {}
         self._reqs_in_batch: set[ReqId] = set()
@@ -364,6 +367,7 @@ class NixlBaseConnectorScheduler:
                     encoded_data,
                     ready_event,
                     self._stop_event,
+                    self._offer_cancellation_queue,
                     self.side_channel_host,
                     self.side_channel_port,
                 ),
@@ -375,12 +379,13 @@ class NixlBaseConnectorScheduler:
 
     @staticmethod
     def _nixl_handshake_listener(
-        encoded_data: dict[int, Any],
+        encoded_data: dict[int, bytes],
         ready_event: threading.Event,
         stop_event: threading.Event,
+        offer_cancellation_queue: queue.Queue[PullOfferCancellationControl],
         host: str,
         port: int,
-    ):
+    ) -> None:
         """Background thread for getting new NIXL handshakes."""
         # NOTE(rob): this is a simple implementation. We will move
         # to a better approach via HTTP endpoint soon.
@@ -397,6 +402,14 @@ class NixlBaseConnectorScheduler:
                 except zmq.Again:
                     if stop_event.is_set():
                         break
+                    continue
+                if msg.startswith(PULL_OFFER_CANCELLATION_CONTROL_PREFIX):
+                    response = NixlBaseConnectorScheduler._queue_offer_cancellation(
+                        msg,
+                        frozenset(encoded_data),
+                        offer_cancellation_queue,
+                    )
+                    sock.send_multipart((identity, b"", response))
                     continue
                 try:
                     request = msgspec.msgpack.decode(msg)
@@ -422,6 +435,77 @@ class NixlBaseConnectorScheduler:
                     target_tp_rank,
                 )
                 sock.send_multipart((identity, b"", encoded_data[target_tp_rank]))
+
+    @staticmethod
+    def _queue_offer_cancellation(
+        message: bytes,
+        producer_ranks: frozenset[int],
+        pending: queue.Queue[PullOfferCancellationControl],
+    ) -> bytes:
+        """Validate and atomically queue one side-channel cancellation.
+
+        :param message: Prefixed typed side-channel request.
+        :param producer_ranks: Producer ranks served by this scheduler.
+        :param pending: Bounded cross-thread cancellation queue.
+        :returns: Typed acknowledgement bytes, or empty bytes if undecodable.
+        """
+        try:
+            control = msgspec.msgpack.decode(
+                message[len(PULL_OFFER_CANCELLATION_CONTROL_PREFIX) :],
+                type=PullOfferCancellationControl,
+            )
+        except (msgspec.DecodeError, msgspec.ValidationError):
+            logger.error(
+                "Rejecting malformed NIXL offer cancellation control\n%s",
+                traceback.format_exc(),
+            )
+            return b""
+
+        proof = control.proof
+        target_ranks = control.producer_ranks
+        canonical_ranks = tuple(sorted(set(target_ranks)))
+        valid = (
+            len(target_ranks) > 0
+            and target_ranks == canonical_ranks
+            and all(
+                type(rank) is int and rank in producer_ranks for rank in target_ranks
+            )
+            and type(proof.producer_request_id) is str
+            and len(proof.producer_request_id) > 0
+            and type(proof.consumer_rank) is int
+            and type(proof.consumer_tp_size) is int
+            and proof.consumer_tp_size > 0
+            and proof.consumer_rank >= 0
+            and proof.consumer_rank < proof.consumer_tp_size
+            and type(proof.expected_consumers) is int
+            and proof.expected_consumers > 0
+        )
+        accepted = False
+        if valid:
+            try:
+                pending.put_nowait(control)
+            except queue.Full:
+                logger.error(
+                    "NIXL offer cancellation queue is full; producer request %s "
+                    "remains pinned",
+                    proof.producer_request_id,
+                )
+            else:
+                accepted = True
+        else:
+            logger.error(
+                "Rejecting invalid NIXL offer cancellation for producer request "
+                "%s and ranks %s",
+                proof.producer_request_id,
+                target_ranks,
+            )
+
+        ack = PullOfferCancellationAck(
+            producer_request_id=proof.producer_request_id,
+            producer_ranks=target_ranks,
+            accepted=accepted,
+        )
+        return msgspec.msgpack.encode(ack)
 
     def _mamba_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. Returns N-1 for Mamba models since the decoder
@@ -491,11 +575,43 @@ class NixlBaseConnectorScheduler:
                 # Therefore, only pop if `not is_partial`.
                 self._reqs_need_save.pop(req_id)
 
+    def _drain_offer_cancellations(
+        self,
+    ) -> dict[int, tuple[PullOfferCancelled, ...]]:
+        """Drain queued control proofs into worker-rank metadata.
+
+        :returns: Deduplicated cancellation proofs keyed by producer rank.
+        """
+        proofs_by_rank: dict[int, set[PullOfferCancelled]] = {}
+        while True:
+            try:
+                control = self._offer_cancellation_queue.get_nowait()
+            except queue.Empty:
+                break
+            for producer_rank in control.producer_ranks:
+                proofs_by_rank.setdefault(producer_rank, set()).add(control.proof)
+
+        return {
+            producer_rank: tuple(
+                sorted(
+                    proofs,
+                    key=lambda proof: (
+                        proof.producer_request_id,
+                        proof.consumer_rank,
+                        proof.consumer_tp_size,
+                        proof.expected_consumers,
+                    ),
+                )
+            )
+            for producer_rank, proofs in proofs_by_rank.items()
+        }
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         meta = NixlConnectorMetadata()
+        meta.offer_cancellations_by_rank = self._drain_offer_cancellations()
 
         # Loop through scheduled reqs and convert to ReqMeta.
         for req_id, (req, block_ids) in self._reqs_need_recv.items():

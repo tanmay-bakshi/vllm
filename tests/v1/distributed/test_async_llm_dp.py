@@ -45,12 +45,13 @@ async def generate(
         temperature=0,
         prompt_logprobs=prompt_logprobs,
     )
-    async for out in engine.generate(
+    stream = await engine.generate(
         request_id=request_id,
         prompt=prompt,
         sampling_params=sampling_params,
         data_parallel_rank=data_parallel_rank,
-    ):
+    )
+    async for out in stream:
         num_tokens = len(out.outputs[0].token_ids)
         if output_kind == RequestOutputKind.DELTA:
             count += num_tokens
@@ -288,11 +289,12 @@ async def test_dp_pause_resume_basic(expert_parallel: bool):
 
         # Engine still works after resume
         sampling_params = SamplingParams(max_tokens=5)
-        async for out in engine.generate(
+        stream = await engine.generate(
             request_id="after-resume",
             prompt=DP_PAUSE_PROMPT,
             sampling_params=sampling_params,
-        ):
+        )
+        async for out in stream:
             pass
         assert out.finished
 
@@ -314,11 +316,12 @@ async def test_dp_pause_abort(expert_parallel: bool):
         async def gen(rid: str):
             out_list: list[RequestOutput] = []
             outputs_by_id[rid] = out_list
-            async for out in engine.generate(
+            stream = await engine.generate(
                 request_id=rid,
                 prompt=DP_PAUSE_PROMPT,
                 sampling_params=sampling_params,
-            ):
+            )
+            async for out in stream:
                 out_list.append(out)
             return out_list[-1] if out_list else None
 
@@ -340,11 +343,12 @@ async def test_dp_pause_abort(expert_parallel: bool):
         assert not await engine.is_paused()
 
         # New request completes after resume
-        async for out in engine.generate(
+        stream = await engine.generate(
             request_id="after-abort",
             prompt=DP_PAUSE_PROMPT,
             sampling_params=SamplingParams(max_tokens=5),
-        ):
+        )
+        async for out in stream:
             pass
         assert out.finished
         assert not engine.output_processor.has_unfinished_requests()
@@ -370,11 +374,12 @@ async def test_dp_pause_keep_then_resume(expert_parallel: bool):
         async def generator_task():
             nonlocal pause_token_idx
             out = None
-            async for output in engine.generate(
+            stream = await engine.generate(
                 request_id="keep-resume-req",
                 prompt=DP_PAUSE_PROMPT,
                 sampling_params=sampling_params,
-            ):
+            )
+            async for output in stream:
                 token_count = len(output.outputs[0].token_ids)
                 token_times.append((token_count, time.monotonic()))
                 out = output
@@ -437,11 +442,12 @@ async def test_dp_pause_keep_race_staggered_engines():
             sp = SamplingParams(max_tokens=5, ignore_eos=True)
 
             async def consume_gen(req_id: str) -> None:
-                async for _ in engine.generate(
+                stream = await engine.generate(
                     request_id=req_id,
                     prompt=DP_PAUSE_PROMPT,
                     sampling_params=sp,
-                ):
+                )
+                async for _ in stream:
                     pass
 
             t1 = asyncio.create_task(consume_gen("race-1"))
@@ -526,11 +532,12 @@ async def test_dp_pause_barrier_request_deadlock():
             client.get_core_engine_for_request = route_to_engine_1
 
             async def consume_gen(req_id: str) -> None:
-                async for _ in engine.generate(
+                stream = await engine.generate(
                     request_id=req_id,
                     prompt=DP_PAUSE_PROMPT,
                     sampling_params=sp,
-                ):
+                )
+                async for _ in stream:
                     pass
 
             t1 = asyncio.create_task(consume_gen("race-1"))

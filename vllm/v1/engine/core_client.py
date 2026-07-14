@@ -4,16 +4,17 @@ import asyncio
 import contextlib
 import queue
 import sys
+import traceback
 import uuid
 import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from multiprocessing.queues import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, TypeAlias, TypeVar
 
 import msgspec.msgpack
@@ -66,6 +67,8 @@ AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
+
+_COORDINATOR_CONTROL_ACK = b"FORWARDED"
 
 
 class EngineCoreClient(ABC):
@@ -175,6 +178,24 @@ class EngineCoreClient(ABC):
     def abort_requests(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
+    def notify_kv_transfer_request_rejected(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+        *,
+        data_parallel_rank: int | None = None,
+    ) -> bool:
+        """Queue connector cleanup for an unconsumed remote-prefill offer.
+
+        :param request_id: Serving-layer request identifier.
+        :param kv_transfer_params: Immutable remote-prefill offer.
+        :param reason: Diagnostic rejection reason.
+        :param data_parallel_rank: Decoder rank selected by the router.
+        :returns: Whether a connector accepted the operation.
+        """
+        raise NotImplementedError
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         raise NotImplementedError
 
@@ -215,7 +236,23 @@ class EngineCoreClient(ABC):
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         raise NotImplementedError
 
-    async def add_request_async(self, request: EngineCoreRequest) -> None:
+    async def add_request_async(
+        self,
+        request: EngineCoreRequest,
+        on_engine_admission: Callable[[], None] | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+    async def add_requests_async(
+        self,
+        requests: list[EngineCoreRequest],
+        on_engine_admission: Callable[[], None] | None = None,
+    ) -> None:
+        """Atomically admit fresh requests through one EngineCore message.
+
+        :param requests: Requests sharing one admission boundary.
+        :param on_engine_admission: Callback invoked after EngineCore commits.
+        """
         raise NotImplementedError
 
     async def profile_async(
@@ -244,6 +281,24 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
+        raise NotImplementedError
+
+    async def notify_kv_transfer_request_rejected_async(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+        *,
+        data_parallel_rank: int | None = None,
+    ) -> bool:
+        """Queue connector cleanup for an unconsumed remote-prefill offer.
+
+        :param request_id: Serving-layer request identifier.
+        :param kv_transfer_params: Immutable remote-prefill offer.
+        :param reason: Diagnostic rejection reason.
+        :param data_parallel_rank: Decoder rank selected by the router.
+        :returns: Whether a connector accepted the operation.
+        """
         raise NotImplementedError
 
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
@@ -298,9 +353,55 @@ class InprocClient(EngineCoreClient):
         req, request_wave = self.engine_core.preprocess_add_request(request)
         self.engine_core.add_request(req, request_wave)
 
+    async def add_requests_async(
+        self,
+        requests: list[EngineCoreRequest],
+        on_engine_admission: Callable[[], None] | None = None,
+    ) -> None:
+        prepared = [
+            self.engine_core.preprocess_add_request(request) for request in requests
+        ]
+        self.engine_core.commit_requests(prepared)
+        if on_engine_admission is not None:
+            on_engine_admission()
+        if self.engine_core.admit_committed_requests(prepared) is False:
+            raise RuntimeError("connector rejected a claimed request batch")
+
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
+
+    def notify_kv_transfer_request_rejected(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+        *,
+        data_parallel_rank: int | None = None,
+    ) -> bool:
+        result = self.engine_core.notify_kv_transfer_request_rejected(
+            request_id,
+            kv_transfer_params,
+            reason,
+        )
+        if isinstance(result, Future):
+            return result.result()
+        return result
+
+    async def notify_kv_transfer_request_rejected_async(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+        *,
+        data_parallel_rank: int | None = None,
+    ) -> bool:
+        return self.notify_kv_transfer_request_rejected(
+            request_id,
+            kv_transfer_params,
+            reason,
+            data_parallel_rank=data_parallel_rank,
+        )
 
     def shutdown(self, timeout: float | None = None) -> None:
         self.engine_core.shutdown()
@@ -383,11 +484,14 @@ class BackgroundResources:
     stats_update_socket: zmq.asyncio.Socket | None = None
     output_queue_task: asyncio.Task | None = None
     stats_update_task: asyncio.Task | None = None
+    stats_update_error: BaseException | None = None
     shutdown_path: str | None = None
 
     # Set if any of the engines are dead. Here so that the output
     # processing threads can access it without holding a ref to the client.
     engine_dead: bool = False
+    output_error: BaseException | None = None
+    utility_results_lock: Lock = field(default_factory=Lock)
 
     def __call__(self):
         """Clean up background resources."""
@@ -671,6 +775,30 @@ class MPClient(EngineCoreClient):
         if self.resources.engine_dead:
             raise EngineDeadError()
 
+    def _register_utility_result(
+        self,
+        call_id: int,
+        future: AnyFuture,
+    ) -> None:
+        """Register a waiter only while the output path can resolve it.
+
+        :param call_id: Correlation identifier sent to EngineCore.
+        :param future: Result future owned by the caller.
+        """
+        resources = self.resources
+        with resources.utility_results_lock:
+            if resources.output_error is not None:
+                raise resources.output_error
+            self.utility_results[call_id] = future
+
+    def _discard_utility_result(self, call_id: int) -> None:
+        """Discard a waiter after its input submission fails.
+
+        :param call_id: Correlation identifier that was not submitted.
+        """
+        with self.resources.utility_results_lock:
+            self.utility_results.pop(call_id, None)
+
     def add_pending_message(self, tracker: zmq.MessageTracker, msg: Any):
         if not tracker.done:
             self.pending_messages.appendleft((tracker, msg))
@@ -755,10 +883,24 @@ class MPClient(EngineCoreClient):
 
 
 def _process_utility_output(
-    output: UtilityOutput, utility_results: dict[int, AnyFuture]
-):
-    """Set the result from a utility method in the waiting future."""
-    future = utility_results.pop(output.call_id)
+    output: UtilityOutput,
+    utility_results: dict[int, AnyFuture],
+    utility_results_lock: Lock,
+) -> None:
+    """Resolve a utility or admission waiter from an EngineCore output.
+
+    :param output: Correlated EngineCore utility output.
+    :param utility_results: Pending call IDs and their result futures.
+    :param utility_results_lock: Lock protecting the waiter registry.
+    """
+    with utility_results_lock:
+        future = utility_results.pop(output.call_id, None)
+    if future is None:
+        logger.debug(
+            "Ignoring late utility result for completed call %d",
+            output.call_id,
+        )
+        return
     failure_message = output.failure_message
     try:
         if failure_message is not None:
@@ -774,6 +916,25 @@ def _process_utility_output(
                 "Cancelled call to utility method failed with error: %s",
                 failure_message,
             )
+
+
+def _fail_utility_results(
+    utility_results: dict[int, AnyFuture],
+    utility_results_lock: Lock,
+    error: BaseException,
+) -> None:
+    """Fail every utility or admission waiter during output teardown.
+
+    :param utility_results: Pending call IDs and their result futures.
+    :param utility_results_lock: Lock protecting the waiter registry.
+    :param error: Terminal output-path failure.
+    """
+    with utility_results_lock:
+        pending_results = tuple(utility_results.values())
+        utility_results.clear()
+    for future in pending_results:
+        if future.done() is False:
+            future.set_exception(error)
 
 
 class SyncMPClient(MPClient):
@@ -805,9 +966,10 @@ class SyncMPClient(MPClient):
         resources = self.resources
         resources.shutdown_path = shutdown_path
 
-        def process_outputs_socket():
+        def process_outputs_socket() -> None:
             assert isinstance(out_socket, zmq.Socket)
             shutdown_socket = ctx.socket(zmq.PAIR)
+            terminal_error: BaseException | None = None
             try:
                 shutdown_socket.bind(shutdown_path)
                 poller = zmq.Poller()
@@ -825,13 +987,32 @@ class SyncMPClient(MPClient):
                     resources.validate_alive(frames)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
                     if outputs.utility_output:
-                        _process_utility_output(outputs.utility_output, utility_results)
+                        _process_utility_output(
+                            outputs.utility_output,
+                            utility_results,
+                            resources.utility_results_lock,
+                        )
                     else:
                         outputs_queue.put_nowait(outputs)
-            except Exception as e:
-                outputs_queue.put_nowait(e)
+            except Exception as error:
+                terminal_error = error
+                logger.error(
+                    "EngineCore output processing failed\n%s",
+                    traceback.format_exc(),
+                )
+                outputs_queue.put_nowait(error)
             finally:
-                # Close sockets.
+                if terminal_error is None:
+                    terminal_error = EngineDeadError()
+                with resources.utility_results_lock:
+                    if resources.output_error is None:
+                        resources.output_error = terminal_error
+                    output_error = resources.output_error
+                _fail_utility_results(
+                    utility_results,
+                    resources.utility_results_lock,
+                    output_error,
+                )
                 shutdown_socket.close(linger=0)
                 out_socket.close(linger=0)
 
@@ -875,8 +1056,12 @@ class SyncMPClient(MPClient):
     def call_utility(self, method: str, *args) -> Any:
         call_id = uuid.uuid1().int >> 64
         future: Future[Any] = Future()
-        self.utility_results[call_id] = future
-        self._send_input(EngineCoreRequestType.UTILITY, (0, call_id, method, args))
+        self._register_utility_result(call_id, future)
+        try:
+            self._send_input(EngineCoreRequestType.UTILITY, (0, call_id, method, args))
+        except BaseException:
+            self._discard_utility_result(call_id)
+            raise
 
         return future.result()
 
@@ -891,6 +1076,21 @@ class SyncMPClient(MPClient):
     def abort_requests(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
+
+    def notify_kv_transfer_request_rejected(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+        *,
+        data_parallel_rank: int | None = None,
+    ) -> bool:
+        return self.call_utility(
+            "notify_kv_transfer_request_rejected",
+            request_id,
+            kv_transfer_params,
+            reason,
+        )
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         self.call_utility("profile", is_start, profile_prefix)
@@ -981,9 +1181,17 @@ class AsyncMPClient(MPClient):
         except RuntimeError:
             pass
 
-    def _ensure_output_queue_task(self):
+    def _ensure_output_queue_task(self) -> None:
         resources = self.resources
-        if resources.output_queue_task is not None:
+        with resources.utility_results_lock:
+            output_error = resources.output_error
+        if output_error is not None:
+            raise output_error
+
+        output_queue_task = resources.output_queue_task
+        if output_queue_task is not None:
+            if output_queue_task.done():
+                raise EngineDeadError() from None
             return
 
         # Perform IO in separate task to parallelize as much as possible.
@@ -1003,6 +1211,7 @@ class AsyncMPClient(MPClient):
         ) = getattr(self.__class__, "eep_process_engine_core_notification", None)
 
         async def process_outputs_socket():
+            terminal_error: BaseException | None = None
             try:
                 while True:
                     frames = await output_socket.recv_multipart(copy=False)
@@ -1027,7 +1236,9 @@ class AsyncMPClient(MPClient):
                             )
                         else:
                             _process_utility_output(
-                                outputs.utility_output, utility_results
+                                outputs.utility_output,
+                                utility_results,
+                                resources.utility_results_lock,
                             )
                         continue
 
@@ -1041,10 +1252,28 @@ class AsyncMPClient(MPClient):
 
                     if outputs.outputs or outputs.scheduler_stats:
                         outputs_queue.put_nowait(outputs)
-            except Exception as e:
-                outputs_queue.put_nowait(e)
+            except Exception as error:
+                terminal_error = error
+                logger.error(
+                    "EngineCore output processing failed\n%s",
+                    traceback.format_exc(),
+                )
+                outputs_queue.put_nowait(error)
             except asyncio.CancelledError:
-                outputs_queue.put_nowait(EngineDeadError())
+                terminal_error = EngineDeadError()
+                outputs_queue.put_nowait(terminal_error)
+            finally:
+                if terminal_error is None:
+                    terminal_error = EngineDeadError()
+                with resources.utility_results_lock:
+                    if resources.output_error is None:
+                        resources.output_error = terminal_error
+                    output_error = resources.output_error
+                _fail_utility_results(
+                    utility_results,
+                    resources.utility_results_lock,
+                    output_error,
+                )
 
         resources.output_queue_task = asyncio.create_task(
             process_outputs_socket(), name="EngineCoreOutputQueueTask"
@@ -1104,28 +1333,93 @@ class AsyncMPClient(MPClient):
     async def _call_utility_async(
         self, method: str, *args, engine: EngineIdentity
     ) -> Any:
+        self._ensure_output_queue_task()
         call_id = uuid.uuid1().int >> 64
         future = asyncio.get_running_loop().create_future()
-        self.utility_results[call_id] = future
-        message = (
-            EngineCoreRequestType.UTILITY.value,
-            *self.encoder.encode((self.client_index, call_id, method, args)),
-        )
-        await self._send_input_message(message, engine, args)
-        self._ensure_output_queue_task()
-        return await future
+        self._register_utility_result(call_id, future)
+        try:
+            message = (
+                EngineCoreRequestType.UTILITY.value,
+                *self.encoder.encode((self.client_index, call_id, method, args)),
+            )
+            await self._send_input_message(message, engine, args)
+            return await future
+        except BaseException:
+            self._discard_utility_result(call_id)
+            raise
 
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         return await self.call_utility_async("get_supported_tasks")
 
-    async def add_request_async(self, request: EngineCoreRequest) -> None:
+    async def add_request_async(
+        self,
+        request: EngineCoreRequest,
+        on_engine_admission: Callable[[], None] | None = None,
+    ) -> None:
         request.client_index = self.client_index
-        await self._send_input(EngineCoreRequestType.ADD, request)
         self._ensure_output_queue_task()
+        await self._send_input(EngineCoreRequestType.ADD, request)
+        if on_engine_admission is not None:
+            on_engine_admission()
+
+    async def _submit_request_batch(
+        self,
+        requests: list[EngineCoreRequest],
+        engine: EngineIdentity,
+    ) -> None:
+        """Send a request batch and await EngineCore's commit result.
+
+        :param requests: Requests already stamped with this client index.
+        :param engine: EngineCore process that owns the transaction.
+        """
+        self._ensure_output_queue_task()
+        call_id = uuid.uuid1().int >> 64
+        future = asyncio.get_running_loop().create_future()
+        self._register_utility_result(call_id, future)
+        try:
+            correlation_header = msgspec.msgpack.encode((self.client_index, call_id))
+            message = (
+                EngineCoreRequestType.ADD_BATCH.value,
+                correlation_header,
+                *self.encoder.encode(requests),
+            )
+            await self._send_input_message(message, engine, requests)
+            await future
+        except BaseException:
+            self._discard_utility_result(call_id)
+            raise
+
+    async def add_requests_async(
+        self,
+        requests: list[EngineCoreRequest],
+        on_engine_admission: Callable[[], None] | None = None,
+    ) -> None:
+        if len(requests) == 0:
+            raise ValueError("request batch must not be empty")
+        for request in requests:
+            request.client_index = self.client_index
+        await self._submit_request_batch(requests, self.core_engine)
+        if on_engine_admission is not None:
+            on_engine_admission()
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
+
+    async def notify_kv_transfer_request_rejected_async(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+        *,
+        data_parallel_rank: int | None = None,
+    ) -> bool:
+        return await self.call_utility_async(
+            "notify_kv_transfer_request_rejected",
+            request_id,
+            kv_transfer_params,
+            reason,
+        )
 
     async def pause_scheduler_async(
         self, mode: PauseMode = "abort", clear_cache: bool = True
@@ -1231,6 +1525,7 @@ class DPAsyncMPClient(AsyncMPClient):
         self.first_req_send_socket = self.resources.first_req_send_socket = (
             make_zmq_socket(self.ctx, self.first_req_sock_addr, zmq.PAIR, bind=True)
         )
+        self._coordinator_control_lock = asyncio.Lock()
         try:
             # If we are running in an asyncio event loop, start the stats task.
             # Otherwise, it will be started lazily.
@@ -1239,142 +1534,318 @@ class DPAsyncMPClient(AsyncMPClient):
         except RuntimeError:
             pass
 
-    def _ensure_stats_update_task(self):
+    def _raise_stats_update_error(self) -> None:
+        """Raise the terminal coordinator-control error.
+
+        :raises BaseException: The latched task error, or an engine-death error
+            if the task terminated without publishing one.
+        """
         resources = self.resources
-        if resources.stats_update_task is not None:
+        with resources.utility_results_lock:
+            stats_update_error = resources.stats_update_error
+        if stats_update_error is not None:
+            raise stats_update_error
+
+        stats_update_task = resources.stats_update_task
+        if stats_update_task is None or stats_update_task.cancelled():
+            raise EngineDeadError() from None
+        task_error = stats_update_task.exception()
+        if task_error is not None:
+            raise task_error
+        raise EngineDeadError() from None
+
+    def _latch_stats_update_error(self, error: Exception) -> None:
+        """Publish a terminal coordinator-control failure to all async waiters.
+
+        Coordinator-control failure does not prove that an EngineCore died, so
+        ``engine_dead`` remains false and cleanup may still send best-effort
+        aborts for requests already committed by the Core.
+
+        :param error: Terminal failure raised by the stats update task.
+        """
+        resources = self.resources
+        publish_output_error = False
+        with resources.utility_results_lock:
+            if resources.stats_update_error is None:
+                resources.stats_update_error = error
+            if resources.output_error is None:
+                resources.output_error = error
+                publish_output_error = True
+            output_error = resources.output_error
+
+        _fail_utility_results(
+            self.utility_results,
+            resources.utility_results_lock,
+            output_error,
+        )
+        if publish_output_error:
+            self.outputs_queue.put_nowait(error)
+
+    def _ensure_stats_update_task(self) -> None:
+        resources = self.resources
+        stats_update_task = resources.stats_update_task
+        if stats_update_task is not None:
+            if stats_update_task.done():
+                self._raise_stats_update_error()
             return
 
         assert self.stats_update_address is not None
         stats_addr: str = self.stats_update_address
         assert len(self.engine_ranks_managed) > 0
 
-        async def run_engine_stats_update_task():
-            with (
-                make_zmq_socket(self.ctx, stats_addr, zmq.XSUB, linger=0) as socket,
-                make_zmq_socket(
-                    self.ctx, self.first_req_sock_addr, zmq.PAIR, bind=False, linger=0
-                ) as first_req_rcv_socket,
-            ):
-                assert isinstance(socket, zmq.asyncio.Socket)
-                assert isinstance(first_req_rcv_socket, zmq.asyncio.Socket)
-                self.resources.stats_update_socket = socket
-                self.resources.first_req_rcv_socket = first_req_rcv_socket
-                # Send subscription message.
-                await socket.send(b"\x01")
+        async def run_engine_stats_update_task() -> None:
+            try:
+                with (
+                    make_zmq_socket(self.ctx, stats_addr, zmq.XSUB, linger=0) as socket,
+                    make_zmq_socket(
+                        self.ctx,
+                        self.first_req_sock_addr,
+                        zmq.PAIR,
+                        bind=False,
+                        linger=0,
+                    ) as first_req_rcv_socket,
+                ):
+                    assert isinstance(socket, zmq.asyncio.Socket)
+                    assert isinstance(first_req_rcv_socket, zmq.asyncio.Socket)
+                    resources.stats_update_socket = socket
+                    resources.first_req_rcv_socket = first_req_rcv_socket
+                    await socket.send(b"\x01")
 
-                poller = zmq.asyncio.Poller()
-                poller.register(socket, zmq.POLLIN)
-                poller.register(first_req_rcv_socket, zmq.POLLIN)
+                    poller = zmq.asyncio.Poller()
+                    poller.register(socket, zmq.POLLIN)
+                    poller.register(first_req_rcv_socket, zmq.POLLIN)
 
-                while True:
-                    events = await poller.poll()
-                    if (
-                        not self.engines_running
-                        and len(events) == 2
-                        or (events[0][0] == first_req_rcv_socket)
-                    ):
-                        # Check if this is a regular request notification or
-                        # scale up notification
-                        buf = first_req_rcv_socket.recv(flags=zmq.NOBLOCK).result()
-
-                        decoded = msgspec.msgpack.decode(buf)
-                        if (
-                            isinstance(decoded, (list, tuple))
-                            and len(decoded) == 2
-                            and decoded[0] == "SCALE_ELASTIC_EP"
-                        ):
-                            # Extract new engine count from the decoded message
-                            new_engine_count = decoded[1]
-                            # Update engine_ranks_managed and count_slice
-                            parallel_config = self.vllm_config.parallel_config
-                            dp_size = parallel_config.data_parallel_size
-                            dp_rank = parallel_config.data_parallel_rank
-                            assert dp_rank == 0
-                            assert dp_size == new_engine_count
-                            assert not (
-                                parallel_config.data_parallel_hybrid_lb
-                                or parallel_config.data_parallel_external_lb
-                            )
-                            num_ranks = dp_size
-                            self.engine_ranks_managed = list(
-                                range(dp_rank, dp_rank + num_ranks)
-                            )
-                            if len(self.lb_engines) < new_engine_count:
-                                self.lb_engines = self.lb_engines + [
-                                    [0, 0]
-                                    for _ in range(
-                                        new_engine_count - len(self.lb_engines)
+                    while True:
+                        events = dict(await poller.poll())
+                        if first_req_rcv_socket in events:
+                            control_message = await first_req_rcv_socket.recv()
+                            decoded = msgspec.msgpack.decode(control_message)
+                            if (
+                                isinstance(decoded, (list, tuple))
+                                and len(decoded) == 2
+                                and decoded[0] == "SCALE_ELASTIC_EP"
+                            ):
+                                new_engine_count = decoded[1]
+                                parallel_config = self.vllm_config.parallel_config
+                                dp_size = parallel_config.data_parallel_size
+                                dp_rank = parallel_config.data_parallel_rank
+                                assert dp_rank == 0
+                                assert dp_size == new_engine_count
+                                assert not (
+                                    parallel_config.data_parallel_hybrid_lb
+                                    or parallel_config.data_parallel_external_lb
+                                )
+                                self.engine_ranks_managed = list(
+                                    range(dp_rank, dp_rank + dp_size)
+                                )
+                                if len(self.lb_engines) < new_engine_count:
+                                    self.lb_engines.extend(
+                                        [
+                                            [0, 0]
+                                            for _ in range(
+                                                new_engine_count - len(self.lb_engines)
+                                            )
+                                        ]
                                     )
-                                ]
-                            else:
-                                self.lb_engines = self.lb_engines[:new_engine_count]
-                            # Send scale up notification to coordinator
-                            scale_msg = msgspec.msgpack.encode(
-                                ("SCALE_ELASTIC_EP", new_engine_count)
+                                else:
+                                    self.lb_engines = self.lb_engines[:new_engine_count]
+                                scale_message = msgspec.msgpack.encode(
+                                    ("SCALE_ELASTIC_EP", new_engine_count)
+                                )
+                                await socket.send(scale_message)
+                                await first_req_rcv_socket.send(
+                                    _COORDINATOR_CONTROL_ACK
+                                )
+                                continue
+
+                            if (
+                                not isinstance(decoded, (list, tuple))
+                                or len(decoded) != 2
+                                or decoded[0] != "FIRST_REQ"
+                            ):
+                                raise ValueError("invalid coordinator-control message")
+                            target_engine_index = decoded[1]
+                            self.engines_running = True
+                            first_request_message = msgspec.msgpack.encode(
+                                (target_engine_index, self.current_wave)
                             )
-                            await socket.send(scale_msg)
+                            await socket.send(first_request_message)
+                            await first_req_rcv_socket.send(_COORDINATOR_CONTROL_ACK)
+
+                        if socket not in events:
+                            continue
+                        stats_message = await socket.recv()
+                        while True:
+                            try:
+                                stats_message = await socket.recv(flags=zmq.NOBLOCK)
+                            except zmq.Again:
+                                break
+
+                        counts, wave, running = msgspec.msgpack.decode(stats_message)
+                        self.current_wave = wave
+                        self.engines_running = running
+                        if counts is None:
                             continue
 
-                        # we're sending a request while the engines are
-                        # paused, so that it can wake the others up
-                        # (to run dummy EP loop).
-                        assert decoded[0] == "FIRST_REQ"
-                        target_eng_index = decoded[1]
-                        self.engines_running = True
-                        msg = msgspec.msgpack.encode(
-                            (target_eng_index, self.current_wave)
-                        )
-                        await socket.send(msg)
-
-                    buf = None
-                    while True:
-                        # Drain all stats events (we only care about latest).
-                        future: asyncio.Future[bytes] = socket.recv(flags=zmq.NOBLOCK)
-                        if isinstance(future.exception(), zmq.Again):
-                            break
-                        buf = future.result()
-                    if buf is None:
-                        continue
-
-                    # Update local load-balancing state.
-                    counts, wave, running = msgspec.msgpack.decode(buf)
-                    self.current_wave = wave
-                    self.engines_running = running
-                    if counts is not None:
-                        # Running and waiting counts are global from the
-                        # Coordinator including all EngineCores. Slice to get
-                        # just the cores managed by this client.
                         ranks = self.engine_ranks_managed
                         count_slice = slice(ranks[0], ranks[-1] + 1)
                         sliced_counts = counts[count_slice]
                         self.lb_engines = sliced_counts
                         logger.debug(
-                            "Received counts: %s (%s)", sliced_counts, count_slice
+                            "Received counts: %s (%s)",
+                            sliced_counts,
+                            count_slice,
                         )
+            except asyncio.CancelledError:
+                if resources.engine_dead is False:
+                    self._latch_stats_update_error(EngineDeadError())
+                raise
+            except Exception as error:
+                logger.error(
+                    "EngineCore coordinator-control processing failed\n%s",
+                    traceback.format_exc(),
+                )
+                self._latch_stats_update_error(error)
+                raise
 
         resources.stats_update_task = asyncio.create_task(
-            run_engine_stats_update_task()
+            run_engine_stats_update_task(),
+            name="EngineCoreStatsUpdateTask",
         )
 
-    async def add_request_async(self, request: EngineCoreRequest) -> None:
+    async def _race_stats_update_task(self, operation: Awaitable[_R]) -> _R:
+        """Complete local coordinator I/O only while its consumer is alive.
+
+        :param operation: PAIR socket send or receive operation.
+        :returns: Result of the socket operation.
+        :raises BaseException: If the stats task terminates first.
+        """
+        stats_update_task = self.resources.stats_update_task
+        assert stats_update_task is not None
+        operation_future = asyncio.ensure_future(operation)
+        try:
+            done, _ = await asyncio.wait(
+                (operation_future, stats_update_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stats_update_task in done:
+                if operation_future in done and operation_future.cancelled() is False:
+                    operation_future.exception()
+                self._raise_stats_update_error()
+            return operation_future.result()
+        finally:
+            if operation_future.done() is False:
+                operation_future.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await operation_future
+
+    async def _send_coordinator_control(self, message: bytes) -> None:
+        """Forward one control message and prove the stats task consumed it.
+
+        :param message: Encoded FIRST_REQ or elastic-scaling control message.
+        :raises BaseException: If the stats task terminates before forwarding
+            the message to the coordinator.
+        """
+        async with self._coordinator_control_lock:
+            self._ensure_stats_update_task()
+            await self._race_stats_update_task(self.first_req_send_socket.send(message))
+            acknowledgement = await self._race_stats_update_task(
+                self.first_req_send_socket.recv()
+            )
+            if acknowledgement != _COORDINATOR_CONTROL_ACK:
+                raise RuntimeError(
+                    "invalid acknowledgement from coordinator-control task"
+                )
+            stats_update_task = self.resources.stats_update_task
+            assert stats_update_task is not None
+            if stats_update_task.done():
+                self._raise_stats_update_error()
+
+    async def add_request_async(
+        self,
+        request: EngineCoreRequest,
+        on_engine_admission: Callable[[], None] | None = None,
+    ) -> None:
         self._ensure_stats_update_task()
+        self._ensure_output_queue_task()
 
         request.current_wave = self.current_wave
         request.client_index = self.client_index
 
         chosen_engine = self.get_core_engine_for_request(request)
         to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
+        submitted = False
+        try:
+            await to_await
+            submitted = True
+        finally:
+            if submitted is False:
+                self._add_request_submission_failed(request)
+
+        self._add_request_submission_succeeded(request)
+        if on_engine_admission is not None:
+            on_engine_admission()
+
         if not self.engines_running:
-            # Notify coordinator that we're sending a request
-            req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engine))
-            await self.first_req_send_socket.send(req_msg)
+            req_msg = msgspec.msgpack.encode(("FIRST_REQ", None))
+            await self._send_coordinator_control(req_msg)
 
-        await to_await
+    async def add_requests_async(
+        self,
+        requests: list[EngineCoreRequest],
+        on_engine_admission: Callable[[], None] | None = None,
+    ) -> None:
+        if len(requests) == 0:
+            raise ValueError("request batch must not be empty")
+        self._ensure_stats_update_task()
 
-        self._ensure_output_queue_task()
+        for request in requests:
+            request.current_wave = self.current_wave
+            request.client_index = self.client_index
+
+        chosen_engine = self.get_core_engine_for_requests(requests)
+        submitted = False
+        try:
+            await self._submit_request_batch(requests, chosen_engine)
+            submitted = True
+        finally:
+            if submitted is False:
+                for request in requests:
+                    self._add_request_submission_failed(request)
+
+        for request in requests:
+            self._add_request_submission_succeeded(request)
+        if on_engine_admission is not None:
+            on_engine_admission()
+
+        if not self.engines_running:
+            req_msg = msgspec.msgpack.encode(("FIRST_REQ", None))
+            await self._send_coordinator_control(req_msg)
+
+    def _add_request_submission_failed(self, request: EngineCoreRequest) -> None:
+        """Roll back client bookkeeping after a confirmed ADD send failure.
+
+        :param request: Request whose ADD message was not submitted.
+        """
+
+    def _add_request_submission_succeeded(self, request: EngineCoreRequest) -> None:
+        """Finalize client bookkeeping after a confirmed ADD submission.
+
+        :param request: Request whose ADD message was submitted.
+        """
 
     def get_core_engine_for_request(self, request: EngineCoreRequest):
         return self.core_engine
+
+    def get_core_engine_for_requests(
+        self, requests: list[EngineCoreRequest]
+    ) -> EngineIdentity:
+        """Route one atomic request batch to an EngineCore process.
+
+        :param requests: Requests sharing one admission transaction.
+        :returns: EngineCore identity that owns the complete batch.
+        """
+        return self.get_core_engine_for_request(requests[0])
 
 
 class DPLBAsyncMPClient(DPAsyncMPClient):
@@ -1394,6 +1865,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         # To route aborts to the correct engine.
         self.reqs_in_flight: dict[str, EngineIdentity] = {}
+        self._optimistic_waiting_counts: dict[str, int] = {}
 
         super().__init__(
             vllm_config,
@@ -1412,11 +1884,14 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
-        if (eng_index := request.data_parallel_rank) is None and (
-            eng_index := get_late_interaction_engine_index(
-                request.pooling_params, len(self.core_engines)
+        eng_index = request.data_parallel_rank
+        if eng_index is None:
+            eng_index = get_late_interaction_engine_index(
+                request.pooling_params,
+                len(self.core_engines),
             )
-        ) is None:
+        optimistically_counted = False
+        if eng_index is None:
             current_counts = self.lb_engines
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
@@ -1434,11 +1909,73 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
             current_counts[eng_index][0] += self.client_count
+            optimistically_counted = True
 
         chosen_engine = self.core_engines[eng_index]
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
+        if optimistically_counted:
+            self._optimistic_waiting_counts[request.request_id] = eng_index
         return chosen_engine
+
+    def get_core_engine_for_requests(
+        self, requests: list[EngineCoreRequest]
+    ) -> EngineIdentity:
+        """Co-locate an atomic parallel-sampling group on one engine.
+
+        :param requests: Fresh sibling requests sharing one producer offer.
+        :returns: EngineCore identity selected for the complete group.
+        :raises ValueError: If request IDs or explicit DP ranks conflict.
+        """
+        request_ids = [request.request_id for request in requests]
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("request batch contains duplicate request IDs")
+
+        explicit_ranks = {
+            request.data_parallel_rank
+            for request in requests
+            if request.data_parallel_rank is not None
+        }
+        if len(explicit_ranks) > 1:
+            raise ValueError("request batch spans multiple data-parallel ranks")
+        if len(explicit_ranks) == 1:
+            (explicit_rank,) = explicit_ranks
+            if explicit_rank < 0 or explicit_rank >= len(self.core_engines):
+                raise ValueError(
+                    f"invalid data_parallel_rank for request batch: {explicit_rank}"
+                )
+            routing_request = next(
+                request
+                for request in requests
+                if request.data_parallel_rank == explicit_rank
+            )
+        else:
+            routing_request = requests[0]
+
+        chosen_engine = self.get_core_engine_for_request(routing_request)
+        optimistically_counted = (
+            routing_request.request_id in self._optimistic_waiting_counts
+        )
+        eng_index = self.core_engines.index(chosen_engine)
+        for request in requests:
+            if request is routing_request:
+                continue
+            self.reqs_in_flight[request.request_id] = chosen_engine
+            if optimistically_counted:
+                self.lb_engines[eng_index][0] += self.client_count
+                self._optimistic_waiting_counts[request.request_id] = eng_index
+        return chosen_engine
+
+    def _add_request_submission_failed(self, request: EngineCoreRequest) -> None:
+        self.reqs_in_flight.pop(request.request_id, None)
+        eng_index = self._optimistic_waiting_counts.pop(request.request_id, None)
+        if eng_index is None:
+            return
+        waiting_count = self.lb_engines[eng_index][0]
+        self.lb_engines[eng_index][0] = max(0, waiting_count - self.client_count)
+
+    def _add_request_submission_succeeded(self, request: EngineCoreRequest) -> None:
+        self._optimistic_waiting_counts.pop(request.request_id, None)
 
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
@@ -1450,6 +1987,54 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 ]
             )
         )[0]
+
+    async def notify_kv_transfer_request_rejected_async(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+        *,
+        data_parallel_rank: int | None = None,
+    ) -> bool:
+        """Route a pre-generation rejection to the owning DP engine.
+
+        :param request_id: Serving-layer request identifier.
+        :param kv_transfer_params: Immutable remote-prefill offer.
+        :param reason: Diagnostic rejection reason.
+        :param data_parallel_rank: Decoder rank selected by the router.
+        :returns: Whether any targeted connector accepted the operation.
+        """
+        method = "notify_kv_transfer_request_rejected"
+        if data_parallel_rank is not None:
+            if data_parallel_rank < 0 or data_parallel_rank >= len(self.core_engines):
+                logger.warning(
+                    "Ignoring rejected KV-transfer request %s with invalid "
+                    "data_parallel_rank=%s",
+                    request_id,
+                    data_parallel_rank,
+                )
+                return False
+            return await self._call_utility_async(
+                method,
+                request_id,
+                kv_transfer_params,
+                reason,
+                engine=self.core_engines[data_parallel_rank],
+            )
+
+        results = await asyncio.gather(
+            *(
+                self._call_utility_async(
+                    method,
+                    request_id,
+                    kv_transfer_params,
+                    reason,
+                    engine=engine,
+                )
+                for engine in self.core_engines
+            )
+        )
+        return any(results)
 
     @staticmethod
     async def process_engine_outputs(
@@ -1481,7 +2066,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             dummy_output = UtilityOutput(
                 call_id=EEP_NOTIFICATION_CALL_ID, result=UtilityResult(None)
             )
-            _process_utility_output(dummy_output, self.utility_results)
+            _process_utility_output(
+                dummy_output,
+                self.utility_results,
+                self.resources.utility_results_lock,
+            )
             return
         assert cache is not None
         if notification_type not in cache.pending_notifications:
@@ -1575,10 +2164,14 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         notification is received from engine 0. We create a future with
         that call_id and wait for it to be resolved.
         """
-        future = asyncio.get_running_loop().create_future()
-        self.utility_results[EEP_NOTIFICATION_CALL_ID] = future
         self._ensure_output_queue_task()
-        await future
+        future = asyncio.get_running_loop().create_future()
+        self._register_utility_result(EEP_NOTIFICATION_CALL_ID, future)
+        try:
+            await future
+        except BaseException:
+            self._discard_utility_result(EEP_NOTIFICATION_CALL_ID)
+            raise
 
     def _setup_elastic_ep_reconfig_bootstrap(self) -> tuple[str, int]:
         from vllm.distributed.utils import create_tcp_store
@@ -1684,11 +2277,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
         # Notify coordinator about scale up through existing
         # stats_update_task connection
-        self._ensure_stats_update_task()
         scale_up_marker = msgspec.msgpack.encode(
             ("SCALE_ELASTIC_EP", new_data_parallel_size)
         )
-        await self.first_req_send_socket.send(scale_up_marker)
+        await self._send_coordinator_control(scale_up_marker)
 
         logger.info(
             "[Elastic EP] Scale up completed, new data parallel size: %s",
@@ -1742,11 +2334,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         await asyncio.gather(*reconfig_futures)
 
         self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
-        self._ensure_stats_update_task()
         scale_down_marker = msgspec.msgpack.encode(
             ("SCALE_ELASTIC_EP", new_data_parallel_size)
         )
-        await self.first_req_send_socket.send(scale_down_marker)
+        await self._send_coordinator_control(scale_down_marker)
 
         # NOTE(yongji): Unlike scaling up,
         # here we don't actually need to wait for the setup switch to complete.

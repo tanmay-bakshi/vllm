@@ -3,11 +3,12 @@
 
 import asyncio
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import Awaitable
 from http import HTTPStatus
 
 from fastapi import Request
 
+from vllm.engine.protocol import GenerationStream
 from vllm.entrypoints.chat_utils import ConversationMessage
 from vllm.entrypoints.openai.chat_completion.protocol import (
     BatchChatCompletionRequest,
@@ -147,7 +148,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
         max_model_len = self.model_config.max_model_len
 
-        generators: list[AsyncGenerator[RequestOutput, None]] = []
+        generation_awaitables: list[Awaitable[GenerationStream]] = []
         for i, engine_prompt in enumerate(engine_prompts):
             sub_request_id = f"{request_id}_{i}"
             max_tokens = get_max_tokens(
@@ -174,18 +175,56 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 if raw_request is None
                 else await self._get_trace_headers(raw_request.headers)
             )
-            generators.append(
+            generation_awaitables.append(
                 self.engine_client.generate(
                     engine_prompt,
                     sampling_params,
                     sub_request_id,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
-                    priority=request.priority if hasattr(request, "priority") else 0,
+                    priority=0,
                     data_parallel_rank=data_parallel_rank,
                     reasoning_ended=None,
                 )
             )
+
+        generation_tasks = [
+            asyncio.create_task(awaitable) for awaitable in generation_awaitables
+        ]
+        try:
+            generation_results = await asyncio.gather(
+                *generation_tasks,
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            generation_results = await asyncio.gather(
+                *generation_tasks,
+                return_exceptions=True,
+            )
+            admitted_generators = [
+                result
+                for result in generation_results
+                if isinstance(result, GenerationStream)
+            ]
+            await asyncio.gather(
+                *(generator.aclose() for generator in admitted_generators),
+                return_exceptions=True,
+            )
+            raise
+        generators = [
+            result
+            for result in generation_results
+            if isinstance(result, GenerationStream)
+        ]
+        failures = [
+            result for result in generation_results if isinstance(result, BaseException)
+        ]
+        if len(failures) > 0:
+            await asyncio.gather(
+                *(generator.aclose() for generator in generators),
+                return_exceptions=True,
+            )
+            raise failures[0]
 
         return await self.chat_completion_full_generator_batch(
             request,  # type: ignore[arg-type]
@@ -201,7 +240,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
     async def chat_completion_full_generator_batch(
         self,
         request: BatchChatCompletionRequest,  # type: ignore[override]
-        generators: list[AsyncGenerator[RequestOutput, None]],
+        generators: list[GenerationStream],
         request_id: str,
         model_name: str,
         all_conversations: list[list[ConversationMessage]],

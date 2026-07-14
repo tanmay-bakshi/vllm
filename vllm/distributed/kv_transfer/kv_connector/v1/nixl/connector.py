@@ -345,6 +345,19 @@ class NixlPullConnector(NixlBaseConnector):
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
 
+    def request_rejected_before_admission(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        assert isinstance(self.connector_worker, NixlPullConnectorWorker)
+        return self.connector_worker.request_rejected_before_admission(
+            request_id,
+            kv_transfer_params,
+            reason,
+        )
+
 
 class NixlPushConnector(NixlBaseConnector):
     """Push-based (WRITE) NIXL KV transfer connector."""

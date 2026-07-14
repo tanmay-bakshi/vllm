@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 from collections.abc import AsyncGenerator
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.responses.protocol import (
@@ -16,11 +15,13 @@ from vllm.entrypoints.openai.responses.protocol import (
 )
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.serve.utils.api_utils import (
+    CloseableStreamingResponse,
     load_aware_call,
     validate_json_request,
     with_cancellation,
 )
 from vllm.logger import init_logger
+from vllm.utils.async_utils import CloseableAsyncIterator, ManagedAsyncIterator
 
 logger = init_logger(__name__)
 
@@ -31,18 +32,25 @@ def responses(request: Request) -> OpenAIServingResponses | None:
     return request.app.state.openai_serving_responses
 
 
-async def _convert_stream_to_sse_events(
-    generator: AsyncGenerator[StreamingResponsesResponse, None],
-) -> AsyncGenerator[str, None]:
-    """Convert the generator to a stream of events in SSE format"""
-    async for event in generator:
-        event_type = getattr(event, "type", "unknown")
-        # https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#event_stream_format
-        event_data = (
-            f"event: {event_type}\ndata: "
-            f"{event.model_dump_json(indent=None, by_alias=True)}\n\n"
-        )
-        yield event_data
+def _convert_stream_to_sse_events(
+    generator: CloseableAsyncIterator[StreamingResponsesResponse],
+) -> ManagedAsyncIterator[str]:
+    """Convert response events to an eagerly-owned SSE stream.
+
+    :param generator: Structured response-event stream.
+    :returns: SSE stream that owns the structured source immediately.
+    """
+
+    async def convert() -> AsyncGenerator[str, None]:
+        async for event in generator:
+            event_type = getattr(event, "type", "unknown")
+            event_data = (
+                f"event: {event_type}\ndata: "
+                f"{event.model_dump_json(indent=None, by_alias=True)}\n\n"
+            )
+            yield event_data
+
+    return ManagedAsyncIterator(convert(), (generator,))
 
 
 @router.post(
@@ -72,7 +80,7 @@ async def create_responses(request: ResponsesRequest, raw_request: Request):
     elif isinstance(generator, ResponsesResponse):
         return JSONResponse(content=generator.model_dump(mode="json", by_alias=True))
 
-    return StreamingResponse(
+    return CloseableStreamingResponse(
         content=_convert_stream_to_sse_events(generator), media_type="text/event-stream"
     )
 
@@ -102,7 +110,7 @@ async def retrieve_responses(
         )
     elif isinstance(response, ResponsesResponse):
         return JSONResponse(content=response.model_dump(mode="json", by_alias=True))
-    return StreamingResponse(
+    return CloseableStreamingResponse(
         content=_convert_stream_to_sse_events(response), media_type="text/event-stream"
     )
 

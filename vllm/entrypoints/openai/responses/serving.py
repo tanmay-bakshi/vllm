@@ -3,8 +3,16 @@
 
 import asyncio
 import time
+import traceback
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    Mapping,
+    Sequence,
+)
 from contextlib import AsyncExitStack
 from copy import copy
 from http import HTTPStatus
@@ -12,6 +20,7 @@ from typing import Any, Final
 
 from fastapi import Request
 from openai.types.responses import (
+    ResponseErrorEvent,
     ResponseFunctionToolCall,
     ResponseOutputItem,
     ResponseOutputMessage,
@@ -22,11 +31,10 @@ from openai.types.responses import (
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 from openai.types.responses.tool import Mcp, Tool
 from openai_harmony import Message as OpenAIHarmonyMessage
-from pydantic import TypeAdapter
 
 from vllm import envs
 from vllm.config.utils import replace
-from vllm.engine.protocol import EngineClient
+from vllm.engine.protocol import EngineClient, GenerationStream
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
@@ -40,6 +48,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
+    _KVTransferAdmission,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
@@ -105,6 +114,7 @@ from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import random_uuid
+from vllm.utils.async_utils import ManagedAsyncIterator
 from vllm.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
@@ -237,7 +247,12 @@ class OpenAIServingResponses(OpenAIServing):
         # FIXME: If enable_store=True, this may cause a memory leak since we
         # never remove events from the store.
         self.event_store: dict[
-            str, tuple[deque[StreamingResponsesResponse], asyncio.Event]
+            str,
+            tuple[
+                deque[StreamingResponsesResponse],
+                asyncio.Event,
+                asyncio.Event,
+            ],
         ] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
@@ -332,18 +347,26 @@ class OpenAIServingResponses(OpenAIServing):
         request: ResponsesRequest,
         raw_request: Request | None = None,
     ) -> (
-        AsyncGenerator[StreamingResponsesResponse, None]
+        ManagedAsyncIterator[StreamingResponsesResponse]
         | ResponsesResponse
         | ErrorResponse
     ):
+        admission = self._create_kv_transfer_admission(request.kv_transfer_params)
         return await self._with_kv_transfer_rejection_cleanup(
-            self._create_responses(request, raw_request), request, raw_request
+            self._create_responses(request, admission, raw_request),
+            request.request_id,
+            request.kv_transfer_params,
+            raw_request,
+            admission,
         )
 
     async def _create_responses(
-        self, request: ResponsesRequest, raw_request: Request | None = None
+        self,
+        request: ResponsesRequest,
+        admission: _KVTransferAdmission,
+        raw_request: Request | None = None,
     ) -> (
-        AsyncGenerator[StreamingResponsesResponse, None]
+        ManagedAsyncIterator[StreamingResponsesResponse]
         | ResponsesResponse
         | ErrorResponse
     ):
@@ -390,13 +413,20 @@ class OpenAIServingResponses(OpenAIServing):
         else:
             messages, engine_inputs = await self._make_request(request, prev_response)
 
+        if len(engine_inputs) != 1:
+            return self.create_error_response(
+                "Responses rendering did not produce exactly one prompt",
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+
         request_metadata = RequestResponseMetadata(request_id=request.request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
-        generators: list[AsyncGenerator[ConversationContext, None]] = []
+        generators: list[ManagedAsyncIterator[ConversationContext]] = []
 
         # Only include builtin tools that the request actually asked for.
         # Without this filter, tools registered on the server (e.g. via
@@ -518,7 +548,7 @@ class OpenAIServingResponses(OpenAIServing):
                             )
                         ),
                     )
-            generator = self._generate_with_builtin_tools(
+            generator = await self._start_generation_with_builtin_tools(
                 request_id=request.request_id,
                 engine_input=engine_input,
                 sampling_params=sampling_params,
@@ -529,10 +559,10 @@ class OpenAIServingResponses(OpenAIServing):
                 reasoning_parser_kwargs=reasoning_parser_kwargs
                 if self.parser and self.parser.reasoning_parser_cls is not None
                 else None,
+                on_engine_admission=admission.callback,
             )
             generators.append(generator)
 
-        assert len(generators) == 1
         (result_generator,) = generators
 
         # Store the input messages.
@@ -550,59 +580,99 @@ class OpenAIServingResponses(OpenAIServing):
                 status="queued",
                 usage=None,
             )
-            async with self.response_store_lock:
-                self.response_store[response.id] = response
-
-            # Run the request in the background.
-            if request.stream:
-                task = asyncio.create_task(
-                    self._run_background_request_stream(
-                        request,
-                        sampling_params,
-                        result_generator,
-                        context,
-                        model_name,
-                        tokenizer,
-                        request_metadata,
-                        created_time,
-                    ),
-                    name=f"create_{request.request_id}",
-                )
-            else:
-                task = asyncio.create_task(
-                    self._run_background_request(
-                        request,
-                        sampling_params,
-                        result_generator,
-                        context,
-                        model_name,
-                        tokenizer,
-                        request_metadata,
-                        created_time,
-                    ),
-                    name=f"create_{response.id}",
-                )
-
-            # For cleanup.
             response_id = response.id
-            self.background_tasks[response_id] = task
-            task.add_done_callback(
-                lambda _: self.background_tasks.pop(response_id, None)
-            )
+            background_started = asyncio.Event()
+            try:
+                async with self.response_store_lock:
+                    self.response_store[response_id] = response
+
+                background_coro: Coroutine[Any, Any, None]
+                if request.stream:
+                    event_deque: deque[StreamingResponsesResponse] = deque()
+                    new_event_signal = asyncio.Event()
+                    background_done = asyncio.Event()
+                    self.event_store[response_id] = (
+                        event_deque,
+                        new_event_signal,
+                        background_done,
+                    )
+                    background_coro = self._run_background_request_stream(
+                        request,
+                        sampling_params,
+                        result_generator,
+                        context,
+                        model_name,
+                        tokenizer,
+                        request_metadata,
+                        created_time,
+                        event_deque,
+                        new_event_signal,
+                        background_done,
+                        background_started,
+                    )
+                    task_name = f"create_{request.request_id}"
+                else:
+                    background_coro = self._run_background_request(
+                        request,
+                        sampling_params,
+                        result_generator,
+                        context,
+                        model_name,
+                        tokenizer,
+                        request_metadata,
+                        created_time,
+                        background_started,
+                    )
+                    task_name = f"create_{response_id}"
+
+                await self._install_background_task(
+                    response_id,
+                    result_generator,
+                    background_coro,
+                    background_started,
+                    task_name,
+                )
+            except BaseException as exc:
+                setup_traceback = traceback.format_exc()
+                self.background_tasks.pop(response_id, None)
+                self.event_store.pop(response_id, None)
+                if self.msg_store.get(request.request_id) is messages:
+                    self.msg_store.pop(request.request_id)
+                async with self.response_store_lock:
+                    if self.response_store.get(response_id) is response:
+                        self.response_store.pop(response_id)
+                try:
+                    await result_generator.aclose()
+                except BaseException:
+                    logger.error(
+                        "Failed to close Responses generation during background "
+                        "setup cleanup\n%s",
+                        traceback.format_exc(),
+                    )
+                if not isinstance(exc, asyncio.CancelledError):
+                    logger.error(
+                        "Failed to set up background Responses request %s\n%s",
+                        response_id,
+                        setup_traceback,
+                    )
+                raise
 
             if request.stream:
-                return self.responses_background_stream_generator(request.request_id)
+                return self.responses_background_stream_generator(response_id)
             return response
 
         if request.stream:
-            return self.responses_stream_generator(
-                request,
-                sampling_params,
-                result_generator,
-                context,
-                model_name,
-                tokenizer,
-                request_metadata,
+            return ManagedAsyncIterator(
+                self.responses_stream_generator(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                ),
+                (result_generator,),
             )
 
         return await self.responses_full_generator(
@@ -664,7 +734,7 @@ class OpenAIServingResponses(OpenAIServing):
         )
         return engine_inputs
 
-    async def _generate_with_builtin_tools(
+    async def _start_generation_with_builtin_tools(
         self,
         request_id: str,
         engine_input: EngineInput,
@@ -674,7 +744,65 @@ class OpenAIServingResponses(OpenAIServing):
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
-    ):
+        on_engine_admission: Callable[[], None] | None = None,
+    ) -> ManagedAsyncIterator[ConversationContext]:
+        """Admit the first Responses turn and return its conversation stream.
+
+        :param request_id: External Responses request identifier.
+        :param engine_input: Rendered first-turn model input.
+        :param sampling_params: Sampling configuration.
+        :param context: Mutable response conversation context.
+        :param lora_request: Optional LoRA adapter request.
+        :param priority: Scheduler priority.
+        :param trace_headers: Distributed tracing headers.
+        :param reasoning_parser_kwargs: Reasoning parser configuration.
+        :param on_engine_admission: Callback invoked after EngineCore admission.
+        :returns: Iterator over conversation context updates.
+        """
+        sub_request_id = f"{request_id}_0"
+        self._log_inputs(
+            sub_request_id,
+            engine_input,
+            params=sampling_params,
+            lora_request=lora_request,
+        )
+        initial_generator = await self.engine_client.generate(
+            engine_input,
+            sampling_params,
+            sub_request_id,
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            priority=priority,
+            reasoning_parser_kwargs=reasoning_parser_kwargs,
+            on_engine_admission=on_engine_admission,
+        )
+        return ManagedAsyncIterator(
+            self._generate_with_builtin_tools(
+                request_id=request_id,
+                engine_input=engine_input,
+                sampling_params=sampling_params,
+                context=context,
+                initial_generator=initial_generator,
+                lora_request=lora_request,
+                priority=priority,
+                trace_headers=trace_headers,
+                reasoning_parser_kwargs=reasoning_parser_kwargs,
+            ),
+            (initial_generator,),
+        )
+
+    async def _generate_with_builtin_tools(
+        self,
+        request_id: str,
+        engine_input: EngineInput,
+        sampling_params: SamplingParams,
+        context: ConversationContext,
+        initial_generator: GenerationStream,
+        lora_request: LoRARequest | None = None,
+        priority: int = 0,
+        trace_headers: Mapping[str, str] | None = None,
+        reasoning_parser_kwargs: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[ConversationContext, None]:
         max_model_len = self.model_config.max_model_len
 
         orig_priority = priority
@@ -682,28 +810,39 @@ class OpenAIServingResponses(OpenAIServing):
         while True:
             # Ensure that each sub-request has a unique request id.
             sub_request_id = f"{request_id}_{sub_request}"
+            if sub_request == 0:
+                generator = initial_generator
+            else:
+                if sub_request == 1:
+                    sampling_params = sampling_params.clone()
+                    sampling_params.extra_args = {
+                        key: value
+                        for key, value in (sampling_params.extra_args or {}).items()
+                        if key != "kv_transfer_params"
+                    }
+                self._log_inputs(
+                    sub_request_id,
+                    engine_input,
+                    params=sampling_params,
+                    lora_request=lora_request,
+                )
+                generator = await self.engine_client.generate(
+                    engine_input,
+                    sampling_params,
+                    sub_request_id,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                    priority=priority,
+                    reasoning_parser_kwargs=reasoning_parser_kwargs,
+                )
 
-            self._log_inputs(
-                sub_request_id,
-                engine_input,
-                params=sampling_params,
-                lora_request=lora_request,
-            )
-
-            generator = self.engine_client.generate(
-                engine_input,
-                sampling_params,
-                sub_request_id,
-                lora_request=lora_request,
-                trace_headers=trace_headers,
-                priority=priority,
-                reasoning_parser_kwargs=reasoning_parser_kwargs,
-            )
-
-            async for res in generator:
-                context.append_output(res)
-                # NOTE(woosuk): The stop condition is handled by the engine.
-                yield context
+            try:
+                async for res in generator:
+                    context.append_output(res)
+                    # NOTE(woosuk): The stop condition is handled by the engine.
+                    yield context
+            finally:
+                await generator.aclose()
 
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.
@@ -787,7 +926,7 @@ class OpenAIServingResponses(OpenAIServing):
         self,
         request: ResponsesRequest,
         sampling_params: SamplingParams,
-        result_generator: AsyncIterator[ConversationContext],
+        result_generator: ManagedAsyncIterator[ConversationContext],
         context: ConversationContext,
         model_name: str,
         tokenizer: TokenizerLike,
@@ -798,6 +937,7 @@ class OpenAIServingResponses(OpenAIServing):
             created_time = int(time.time())
 
         async with AsyncExitStack() as exit_stack:
+            exit_stack.push_async_callback(result_generator.aclose)
             try:
                 await self._initialize_tool_sessions(request, context, exit_stack)
                 async for _ in result_generator:
@@ -1214,39 +1354,154 @@ class OpenAIServingResponses(OpenAIServing):
                     prev_outputs.append(response_msg)
         return messages
 
+    async def _install_background_task(
+        self,
+        response_id: str,
+        result_generator: ManagedAsyncIterator[ConversationContext],
+        background_coro: Coroutine[Any, Any, None],
+        background_started: asyncio.Event,
+        task_name: str,
+    ) -> None:
+        """Transfer generation ownership to a started background task.
+
+        A task cancelled before its first execution does not enter the
+        coroutine's ``finally`` block. The startup handshake keeps serving as
+        owner until the task has entered its closure-protected body.
+
+        :param response_id: Stored response and task identifier.
+        :param result_generator: Admitted generation owned during transfer.
+        :param background_coro: Background response coroutine.
+        :param background_started: Signal set inside the coroutine's owner scope.
+        :param task_name: Diagnostic asyncio task name.
+        """
+        task = asyncio.create_task(background_coro, name=task_name)
+        self.background_tasks[response_id] = task
+
+        def background_done(completed: asyncio.Task[None]) -> None:
+            started = background_started.is_set()
+            self.background_tasks.pop(response_id, None)
+            background_started.set()
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None and started:
+                logger.error(
+                    "Background Responses task %s failed",
+                    response_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(background_done)
+        try:
+            await background_started.wait()
+            if task.cancelled():
+                raise asyncio.CancelledError
+            if task.done() and (task_error := task.exception()) is not None:
+                raise task_error
+        except BaseException:
+            if task.done() is False:
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            try:
+                await result_generator.aclose()
+            except BaseException:
+                logger.error(
+                    "Failed to close Responses generation during background "
+                    "ownership transfer\n%s",
+                    traceback.format_exc(),
+                )
+            raise
+
     async def _run_background_request_stream(
         self,
         request: ResponsesRequest,
-        *args,
-        **kwargs,
-    ):
-        event_deque: deque[StreamingResponsesResponse] = deque()
-        new_event_signal = asyncio.Event()
-        self.event_store[request.request_id] = (event_deque, new_event_signal)
-        generator = self.responses_stream_generator(request, *args, **kwargs)
+        sampling_params: SamplingParams,
+        result_generator: ManagedAsyncIterator[ConversationContext],
+        context: ConversationContext,
+        model_name: str,
+        tokenizer: TokenizerLike,
+        request_metadata: RequestResponseMetadata,
+        created_time: int,
+        event_deque: deque[StreamingResponsesResponse],
+        new_event_signal: asyncio.Event,
+        background_done: asyncio.Event,
+        background_started: asyncio.Event,
+    ) -> None:
+        completed = False
         try:
-            async for event in generator:
-                event_deque.append(event)
-                new_event_signal.set()  # Signal new event available
+            background_started.set()
+            generator = self.responses_stream_generator(
+                request,
+                sampling_params,
+                result_generator,
+                context,
+                model_name,
+                tokenizer,
+                request_metadata,
+                created_time,
+            )
+            try:
+                async for event in generator:
+                    event_deque.append(event)
+                    new_event_signal.set()
+                    if event.type == "response.completed":
+                        completed = True
+            finally:
+                await generator.aclose()
         finally:
-            new_event_signal.set()
+            try:
+                if completed is False:
+                    await self._mark_background_response_failed(request.request_id)
+            finally:
+                try:
+                    await result_generator.aclose()
+                finally:
+                    background_done.set()
+                    new_event_signal.set()
 
     async def _run_background_request(
         self,
         request: ResponsesRequest,
-        *args,
-        **kwargs,
-    ):
-        response = await self.responses_full_generator(request, *args, **kwargs)
+        sampling_params: SamplingParams,
+        result_generator: ManagedAsyncIterator[ConversationContext],
+        context: ConversationContext,
+        model_name: str,
+        tokenizer: TokenizerLike,
+        request_metadata: RequestResponseMetadata,
+        created_time: int,
+        background_started: asyncio.Event,
+    ) -> None:
+        completed = False
+        try:
+            background_started.set()
+            response = await self.responses_full_generator(
+                request,
+                sampling_params,
+                result_generator,
+                context,
+                model_name,
+                tokenizer,
+                request_metadata,
+                created_time,
+            )
+            completed = isinstance(response, ErrorResponse) is False
+        finally:
+            try:
+                if completed is False:
+                    await self._mark_background_response_failed(request.request_id)
+            finally:
+                await result_generator.aclose()
 
-        if isinstance(response, ErrorResponse):
-            # If the request has failed, update the status to "failed".
-            response_id = request.request_id
-            async with self.response_store_lock:
-                stored_response = self.response_store.get(response_id)
-                assert stored_response is not None
-                if stored_response.status not in ("completed", "cancelled"):
-                    stored_response.status = "failed"
+    async def _mark_background_response_failed(self, response_id: str) -> None:
+        """Persist a failed terminal state unless cancellation already won.
+
+        :param response_id: Stored background response identifier.
+        """
+        async with self.response_store_lock:
+            response = self.response_store.get(response_id)
+            if response is None or response.status in ("completed", "cancelled"):
+                return
+            response.status = "failed"
 
     async def responses_background_stream_generator(
         self,
@@ -1260,7 +1515,7 @@ class OpenAIServingResponses(OpenAIServing):
                 value=response_id,
             )
 
-        event_deque, new_event_signal = self.event_store[response_id]
+        event_deque, new_event_signal, background_done = self.event_store[response_id]
         start_index = 0 if starting_after is None else starting_after + 1
         current_index = start_index
 
@@ -1271,10 +1526,12 @@ class OpenAIServingResponses(OpenAIServing):
             while current_index < len(event_deque):
                 event = event_deque[current_index]
                 yield event
-                if getattr(event, "type", "unknown") == "response.completed":
+                if event.type in ("response.completed", "response.failed", "error"):
                     return
                 current_index += 1
 
+            if background_done.is_set():
+                return
             await new_event_signal.wait()
 
     async def retrieve_responses(
@@ -1341,7 +1598,7 @@ class OpenAIServingResponses(OpenAIServing):
         self,
         request: ResponsesRequest,
         sampling_params: SamplingParams,
-        result_generator: AsyncIterator[ConversationContext | None],
+        result_generator: ManagedAsyncIterator[ConversationContext],
         context: ConversationContext,
         model_name: str,
         tokenizer: TokenizerLike,
@@ -1474,6 +1731,7 @@ class OpenAIServingResponses(OpenAIServing):
             return event
 
         async with AsyncExitStack() as exit_stack:
+            exit_stack.push_async_callback(result_generator.aclose)
             if self.use_harmony:
                 # TODO: in streaming, we noticed this bug:
                 # https://github.com/vllm-project/vllm/issues/25697
@@ -1521,9 +1779,14 @@ class OpenAIServingResponses(OpenAIServing):
                 ):
                     yield event_data
             except GenerationError as e:
-                error_json = self._convert_generation_error_to_streaming_response(e)
                 yield _increment_sequence_number_and_return(
-                    TypeAdapter(StreamingResponsesResponse).validate_json(error_json)
+                    ResponseErrorEvent(
+                        type="error",
+                        code="server_error",
+                        message=str(e),
+                        param=None,
+                        sequence_number=-1,
+                    )
                 )
                 return
 

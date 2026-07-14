@@ -3,17 +3,20 @@
 """Pull-specific scheduler-side logic for the NIXL connector."""
 
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ProducerLease,
+    ReqId,
 )
 from vllm.distributed.kv_transfer.nixl_localization import NixlSourceRoster
 from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -22,6 +25,67 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _ProducerOfferIdentity:
+    """Immutable identity of one producer-side KV offer.
+
+    :ivar engine_id: Engine that owns the offered blocks.
+    :ivar request_id: Producer request that owns the offered blocks.
+    :ivar generation: Producer offer generation when one is available.
+    """
+
+    engine_id: EngineId
+    request_id: ReqId
+    generation: int | None
+
+
+@dataclass
+class _ParallelPullFlight:
+    """Single-flight state for consumers of one producer offer.
+
+    :ivar expected_consumers: Number of logical consumers in the producer lease.
+    :ivar num_tokens: Exact prompt extent shared by every logical consumer.
+    :ivar baseline_num_computed_tokens: APC hit observed when the leader started.
+    :ivar publication_num_computed_tokens: APC hit proving full-prefix publication.
+    :ivar leader_request_id: Consumer currently performing the full suffix pull.
+    :ivar released_request_ids: Consumers allowed to enter normal receive setup.
+    :ivar completed_request_ids: Consumers whose receive setup or abort committed.
+    """
+
+    expected_consumers: int
+    num_tokens: int
+    baseline_num_computed_tokens: int
+    publication_num_computed_tokens: int
+    leader_request_id: ReqId | None
+    released_request_ids: set[ReqId]
+    completed_request_ids: set[ReqId]
+
+
+def _producer_offer_identity(
+    params: dict[str, Any],
+) -> _ProducerOfferIdentity | None:
+    """Extract the immutable producer identity required for single-flight.
+
+    :param params: Request KV-transfer parameters.
+    :returns: Producer identity, or ``None`` when required identity is absent.
+    :raises ValueError: If an explicit offer generation is invalid.
+    """
+    engine_id = params.get("remote_engine_id")
+    request_id = params.get("remote_request_id")
+    if (
+        type(engine_id) is not str
+        or len(engine_id) == 0
+        or type(request_id) is not str
+        or len(request_id) == 0
+    ):
+        return None
+
+    generation = params.get("p2d_offer_generation")
+    if generation is not None and (type(generation) is not int or generation < 0):
+        raise ValueError("p2d_offer_generation must be a non-negative integer")
+    return _ProducerOfferIdentity(engine_id, request_id, generation)
 
 
 def _expected_consumers(params: dict[str, Any]) -> int:
@@ -53,6 +117,10 @@ def _consumer_tp_size(params: dict[str, Any]) -> int:
 class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
     """Pull-specific scheduler logic (READ-based KV transfer)."""
 
+    _parallel_pull_single_flight_enabled: bool
+    _parallel_pull_publication_granularity: int
+    _parallel_pull_flights: dict[_ProducerOfferIdentity, _ParallelPullFlight]
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -60,10 +128,196 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        self._parallel_pull_single_flight_enabled: bool = (
+            vllm_config.cache_config.enable_prefix_caching
+        )
+        self._parallel_pull_publication_granularity = resolve_kv_cache_block_sizes(
+            kv_cache_config, vllm_config
+        )[0]
+        self._parallel_pull_flights: dict[
+            _ProducerOfferIdentity, _ParallelPullFlight
+        ] = {}
+
+    def _remove_completed_parallel_pull(
+        self,
+        offer: _ProducerOfferIdentity,
+        flight: _ParallelPullFlight,
+    ) -> None:
+        """Remove an offer after every consumer commits receive setup.
+
+        :param offer: Producer offer owning the flight.
+        :param flight: Current single-flight state for the offer.
+        """
+        if len(flight.completed_request_ids) < flight.expected_consumers:
+            return
+        if len(flight.completed_request_ids) > flight.expected_consumers:
+            raise RuntimeError("producer offer completed too many consumers")
+        del self._parallel_pull_flights[offer]
+
+    def _claim_parallel_pull_leader(
+        self,
+        offer: _ProducerOfferIdentity,
+        flight: _ParallelPullFlight,
+        request_id: ReqId,
+        num_computed_tokens: int,
+    ) -> None:
+        """Make one consumer responsible for the offer's uncached suffix.
+
+        :param offer: Producer offer whose pull is being coordinated.
+        :param flight: Current single-flight state for the offer.
+        :param request_id: Consumer becoming the leader.
+        :param num_computed_tokens: APC hit visible before the leader's pull.
+        """
+        flight.leader_request_id = request_id
+        flight.baseline_num_computed_tokens = num_computed_tokens
+        flight.released_request_ids.add(request_id)
+        logger.info(
+            "[single-flight] leader=%s offer=%s/%s generation=%s "
+            "baseline_tokens=%d consumers=%d",
+            request_id,
+            offer.engine_id,
+            offer.request_id,
+            offer.generation,
+            num_computed_tokens,
+            flight.expected_consumers,
+        )
+
+    def _coordinate_parallel_pull(
+        self,
+        request: "Request",
+        params: dict[str, Any],
+        num_computed_tokens: int,
+        num_external_tokens: int,
+        max_cacheable_tokens: int,
+    ) -> bool:
+        """Allow one cold pull until APC exposes its published prefix.
+
+        Followers are reconsidered from a fresh APC lookup on every scheduler
+        pass. A follower is released only when the complete publishable prefix
+        is present. Async external blocks enter APC only after ``finished_recving``
+        promotes the leader, so that hit also proves the leader's receive reached
+        its authoritative terminal state. The follower then follows the ordinary
+        receive path, including its own tail read or empty-read notification, so
+        the producer still receives one completion from every logical consumer.
+
+        :param request: Candidate decoder consumer.
+        :param params: Request KV-transfer parameters.
+        :param num_computed_tokens: Prefix tokens found by APC for this attempt.
+        :param num_external_tokens: Remaining tokens offered by the producer.
+        :param max_cacheable_tokens: Largest APC hit this prompt can publish.
+        :returns: Whether normal allocation and receive setup may proceed.
+        """
+        expected_consumers = _expected_consumers(params)
+        if (
+            not self._parallel_pull_single_flight_enabled
+            or expected_consumers == 1
+            or request.skip_reading_prefix_cache
+        ):
+            return True
+
+        offer = _producer_offer_identity(params)
+        if offer is None:
+            return True
+
+        flight = self._parallel_pull_flights.get(offer)
+        if flight is None:
+            if num_external_tokens <= 0 or max_cacheable_tokens <= num_computed_tokens:
+                return True
+            flight = _ParallelPullFlight(
+                expected_consumers=expected_consumers,
+                num_tokens=request.num_tokens,
+                baseline_num_computed_tokens=num_computed_tokens,
+                publication_num_computed_tokens=max_cacheable_tokens,
+                leader_request_id=None,
+                released_request_ids=set(),
+                completed_request_ids=set(),
+            )
+            self._parallel_pull_flights[offer] = flight
+            self._claim_parallel_pull_leader(
+                offer, flight, request.request_id, num_computed_tokens
+            )
+            return True
+
+        if flight.expected_consumers != expected_consumers:
+            raise ValueError("expected_consumers changed for an active producer offer")
+        if flight.num_tokens != request.num_tokens:
+            raise ValueError("prompt length changed for an active producer offer")
+        if flight.publication_num_computed_tokens != max_cacheable_tokens:
+            raise ValueError(
+                "APC publication target changed for an active producer offer"
+            )
+        if request.request_id in flight.released_request_ids:
+            return True
+
+        if num_computed_tokens >= flight.publication_num_computed_tokens:
+            flight.released_request_ids.add(request.request_id)
+            logger.info(
+                "[single-flight] follower=%s observed offer=%s/%s "
+                "generation=%s publication %d->%d tokens",
+                request.request_id,
+                offer.engine_id,
+                offer.request_id,
+                offer.generation,
+                flight.baseline_num_computed_tokens,
+                num_computed_tokens,
+            )
+            return True
+
+        if flight.leader_request_id is None:
+            self._claim_parallel_pull_leader(
+                offer, flight, request.request_id, num_computed_tokens
+            )
+            return True
+
+        return False
+
+    def _complete_parallel_pull_allocation(
+        self,
+        request: "Request",
+        params: dict[str, Any],
+    ) -> None:
+        """Record that a released consumer committed its receive metadata.
+
+        :param request: Consumer whose allocation and receive setup committed.
+        :param params: Request KV-transfer parameters.
+        """
+        offer = _producer_offer_identity(params)
+        if offer is None:
+            return
+        flight = self._parallel_pull_flights.get(offer)
+        if flight is None:
+            return
+        if request.request_id not in flight.released_request_ids:
+            raise RuntimeError("parallel pull allocation committed before release")
+        flight.completed_request_ids.add(request.request_id)
+        self._remove_completed_parallel_pull(offer, flight)
+
+    def _finish_parallel_pull_request(
+        self,
+        request: "Request",
+        params: dict[str, Any],
+    ) -> None:
+        """Retire or replace a single-flight participant that has finished.
+
+        :param request: Finished decoder consumer.
+        :param params: Request KV-transfer parameters.
+        """
+        offer = _producer_offer_identity(params)
+        if offer is None:
+            return
+        flight = self._parallel_pull_flights.get(offer)
+        if flight is None:
+            return
+
+        flight.released_request_ids.add(request.request_id)
+        flight.completed_request_ids.add(request.request_id)
+        if flight.leader_request_id == request.request_id:
+            flight.leader_request_id = None
+        self._remove_completed_parallel_pull(offer, flight)
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         """
         For remote prefill, pull all prompt blocks from remote
         asynchronously relative to engine execution.
@@ -92,6 +346,18 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             token_ids = request.prompt_token_ids or []
             actual = self._mamba_prefill_token_count(len(token_ids))
             count = actual - num_computed_tokens
+            max_cacheable_tokens = max(0, request.num_tokens - 1)
+            max_cacheable_tokens -= (
+                max_cacheable_tokens % self._parallel_pull_publication_granularity
+            )
+            if not self._coordinate_parallel_pull(
+                request,
+                params,
+                num_computed_tokens,
+                count,
+                max_cacheable_tokens,
+            ):
+                return None, False
             if count > 0:
                 return count, True
 
@@ -134,23 +400,6 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         self.kv_recompute_threshold,
                     )
                     return 0, False
-                if self._pull_single_flight:
-                    rid = params.get("remote_request_id")
-                    leader = self._pull_leaders.get(rid) if rid else None
-                    if rid and leader is None:
-                        self._pull_leaders[rid] = request.request_id
-                        logger.info(
-                            "[single-flight] %s leads pull of %s",
-                            request.request_id,
-                            rid,
-                        )
-                    elif leader is not None and leader != request.request_id:
-                        # A sibling is already pulling this registration:
-                        # defer (re-evaluated every step). Once the
-                        # leader's blocks commit+publish, our local hit
-                        # covers the prompt and count stops being > 0, so
-                        # this branch is never reached again.
-                        return None, False  # type: ignore[return-value]
                 return count, True
 
         # No remote prefill for this request.
@@ -170,6 +419,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         if not params:
             return
 
+        was_remote_prefill = params.get("do_remote_prefill") is True
         if params.get("do_remote_decode") or (
             params.get("do_remote_prefill") and self.is_bidirectional_kv_xfer_enabled
         ):
@@ -224,6 +474,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # Only trigger 1 KV transfer per request.
             params["do_remote_prefill"] = False
             params["_remote_blocks_processed"] = True
+            if was_remote_prefill:
+                self._complete_parallel_pull_allocation(request, params)
 
     def request_finished(
         self,
@@ -258,26 +510,16 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         # KV-audit: let the worker retire this rid's audit state before
         # its blocks can be reallocated to a new pull.
         self._audit_finished_reqs.add(request.request_id)
-        if self._pull_single_flight:
-            _sf_rid = params.get("remote_request_id")
-            if _sf_rid and self._pull_leaders.get(_sf_rid) == request.request_id:
-                # Leader finished (any status). If it committed, siblings
-                # are already local-hitting; if it aborted pre-commit, the
-                # next sibling claims leadership and pulls.
-                del self._pull_leaders[_sf_rid]
+        self._finish_parallel_pull_request(request, params)
 
         if params.get("do_remote_prefill"):
-            # If do_remote_prefill is still True when the request is finished,
-            # update_state_after_alloc must not have been called (the request
-            # must have been aborted before it was scheduled, e.g. via the
-            # abort_immediately path used to clean up KV-transfer requests
-            # rejected at the D-side serving layer).
-            # To avoid stranding the prefill blocks in the prefill instance,
-            # we must add empty block_ids to _reqs_need_recv so that our
-            # worker side will notify and free blocks in the prefill instance.
+            # The request finished after admission but before receive setup.
+            # Keep it alive until the empty receive notifies the producer and
+            # returns through finished_recving; freeing it here would make that
+            # completion refer to a request the scheduler no longer owns.
             self._reqs_need_recv[request.request_id] = (request, [])
             params["do_remote_prefill"] = False
-            return False, None
+            return True, None
 
         if is_d_node and not self.is_bidirectional_kv_xfer_enabled:
             return False, None

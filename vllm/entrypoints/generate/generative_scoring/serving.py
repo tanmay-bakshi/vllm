@@ -11,13 +11,13 @@ logits (task="generate").
 import asyncio
 import math
 import time
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import Mapping
 from typing import Literal
 
 from fastapi import Request
 from pydantic import Field
 
-from vllm.engine.protocol import EngineClient
+from vllm.engine.protocol import EngineClient, GenerationStream
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
     OpenAIBaseModel,
@@ -262,7 +262,7 @@ class ServingGenerativeScoring(OpenAIServing):
         )
 
         # Schedule requests for all inputs
-        generators: list[AsyncGenerator[RequestOutput, None]] = []
+        generation_tasks: list[asyncio.Task[GenerationStream]] = []
         for i, engine_input in enumerate(engine_inputs):
             request_id_item = f"{request_id}-{i}"
 
@@ -273,15 +273,38 @@ class ServingGenerativeScoring(OpenAIServing):
                 lora_request=lora_request,
             )
 
-            generator = self.engine_client.generate(
-                engine_input,
-                sampling_params,
-                request_id_item,
-                lora_request=lora_request,
-                trace_headers=trace_headers,
-                priority=request.priority,
+            generation_tasks.append(
+                asyncio.create_task(
+                    self.engine_client.generate(
+                        engine_input,
+                        sampling_params,
+                        request_id_item,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                        priority=request.priority,
+                    )
+                )
             )
-            generators.append(generator)
+
+        try:
+            generators = await asyncio.gather(*generation_tasks)
+        except BaseException:
+            for task in generation_tasks:
+                task.cancel()
+            start_results = await asyncio.gather(
+                *generation_tasks,
+                return_exceptions=True,
+            )
+            admitted_streams = [
+                result
+                for result in start_results
+                if isinstance(result, GenerationStream)
+            ]
+            await asyncio.gather(
+                *(stream.aclose() for stream in admitted_streams),
+                return_exceptions=True,
+            )
+            raise
 
         # Collect results
         result_generator = merge_async_iterators(*generators)

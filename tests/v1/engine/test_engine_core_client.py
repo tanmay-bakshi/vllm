@@ -10,11 +10,12 @@ import time
 import uuid
 from concurrent.futures import Future
 from dataclasses import dataclass
-from threading import Thread
+from threading import Lock, Thread
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import msgspec
 import pytest
 import torch
 from transformers import AutoTokenizer
@@ -27,10 +28,15 @@ from vllm.platforms import current_platform
 from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.torch_utils import set_default_torch_num_threads
-from vllm.v1.engine import EngineCoreReadyResponse, EngineCoreRequest
+from vllm.v1.engine import (
+    EngineCoreReadyResponse,
+    EngineCoreRequest,
+    EngineCoreRequestType,
+)
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.engine.core_client import (
     AsyncMPClient,
+    DPAsyncMPClient,
     DPLBAsyncMPClient,
     EngineCoreClient,
     MPClient,
@@ -64,7 +70,7 @@ _REQUEST_COUNTER = 0
 def make_request(
     params: SamplingParams, prompt_tokens_ids: list[int] | None = None
 ) -> EngineCoreRequest:
-    if not prompt_tokens_ids:
+    if prompt_tokens_ids is None or len(prompt_tokens_ids) == 0:
         prompt_tokens_ids = PROMPT_TOKENS
 
     global _REQUEST_COUNTER
@@ -198,10 +204,11 @@ def _make_pooling_request(
     )
 
 
-def test_dplb_late_interaction_sticky_routing():
+def test_dplb_late_interaction_sticky_routing() -> None:
     client = object.__new__(DPLBAsyncMPClient)
     client.client_count = 1
     client.reqs_in_flight = {}
+    client._optimistic_waiting_counts = {}
     client.core_engines = [b"\x00\x00", b"\x01\x00", b"\x02\x00"]
     client.lb_engines = [[0, 0], [0, 0], [0, 0]]
     client.eng_start_index = 0
@@ -222,10 +229,11 @@ def test_dplb_late_interaction_sticky_routing():
     assert client.reqs_in_flight["doc-req"] == doc_engine
 
 
-def test_dplb_non_late_interaction_still_uses_lb():
+def test_dplb_non_late_interaction_still_uses_lb() -> None:
     client = object.__new__(DPLBAsyncMPClient)
     client.client_count = 1
     client.reqs_in_flight = {}
+    client._optimistic_waiting_counts = {}
     client.core_engines = [b"\x00\x00", b"\x01\x00", b"\x02\x00"]
     client.lb_engines = [[2, 1], [0, 0], [1, 0]]
     client.eng_start_index = 0
@@ -235,6 +243,227 @@ def test_dplb_non_late_interaction_still_uses_lb():
 
     assert chosen_engine == client.core_engines[1]
     assert client.lb_engines[1][0] == 1
+
+
+@pytest.mark.asyncio
+async def test_async_mp_admission_callback_follows_add_submission() -> None:
+    client = object.__new__(AsyncMPClient)
+    client.client_index = 3
+    client._ensure_output_queue_task = MagicMock()
+    events: list[str] = []
+
+    async def send_input(*_args: object) -> None:
+        events.append("add-submitted")
+
+    client._send_input = send_input
+    request = make_request(SamplingParams(max_tokens=1))
+
+    await client.add_request_async(
+        request,
+        on_engine_admission=lambda: events.append("engine-admitted"),
+    )
+
+    assert events == ["add-submitted", "engine-admitted"]
+    assert request.client_index == 3
+    client._ensure_output_queue_task.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_async_mp_add_failure_preserves_serving_ownership() -> None:
+    client = object.__new__(AsyncMPClient)
+    client.client_index = 3
+    client._send_input = AsyncMock(side_effect=RuntimeError("send failed"))
+    client._ensure_output_queue_task = MagicMock()
+    admission_callback = MagicMock()
+    request = make_request(SamplingParams(max_tokens=1))
+
+    with pytest.raises(RuntimeError, match="send failed"):
+        await client.add_request_async(
+            request,
+            on_engine_admission=admission_callback,
+        )
+
+    admission_callback.assert_not_called()
+    client._ensure_output_queue_task.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_async_mp_batch_admission_waits_for_engine_ack() -> None:
+    client = object.__new__(AsyncMPClient)
+    client.client_index = 6
+    client.core_engine = b"engine"
+    client.utility_results = {}
+    client.resources = SimpleNamespace(
+        output_error=None,
+        utility_results_lock=Lock(),
+    )
+    client._ensure_output_queue_task = MagicMock()
+    client.encoder = MagicMock()
+    client.encoder.encode.return_value = (b"encoded-requests",)
+    events: list[str] = []
+    captured_message: tuple[bytes, ...] | None = None
+
+    async def send_input_message(
+        message: tuple[bytes, ...],
+        engine: bytes,
+        objects: object,
+    ) -> None:
+        nonlocal captured_message
+        assert message[0] == EngineCoreRequestType.ADD_BATCH.value
+        assert engine == b"engine"
+        captured_message = message
+        assert objects is requests
+        events.append("batch-sent")
+        client_index, call_id = msgspec.msgpack.decode(
+            message[1],
+            type=tuple[int, int],
+        )
+        assert client_index == 6
+        result = client.utility_results.pop(call_id)
+        result.set_result(None)
+        events.append("engine-ack")
+
+    requests = [
+        make_request(SamplingParams(max_tokens=1)),
+        make_request(SamplingParams(max_tokens=1)),
+    ]
+    client._send_input_message = send_input_message
+
+    await client.add_requests_async(
+        requests,
+        on_engine_admission=lambda: events.append("engine-admitted"),
+    )
+
+    assert events == ["batch-sent", "engine-ack", "engine-admitted"]
+    assert captured_message is not None
+    assert captured_message[2:] == (b"encoded-requests",)
+    client.encoder.encode.assert_called_once_with(requests)
+    assert all(request.client_index == 6 for request in requests)
+    client._ensure_output_queue_task.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_async_mp_batch_rejection_preserves_serving_ownership() -> None:
+    client = object.__new__(AsyncMPClient)
+    client.client_index = 6
+    client.core_engine = b"engine"
+    client.utility_results = {}
+    client.resources = SimpleNamespace(
+        output_error=None,
+        utility_results_lock=Lock(),
+    )
+    client._ensure_output_queue_task = MagicMock()
+    client.encoder = MagicMock()
+    client.encoder.encode.return_value = (b"encoded-requests",)
+    admission_callback = MagicMock()
+
+    async def send_input_message(
+        message: tuple[bytes, ...],
+        _engine: bytes,
+        _objects: object,
+    ) -> None:
+        _, call_id = msgspec.msgpack.decode(message[1], type=tuple[int, int])
+        result = client.utility_results.pop(call_id)
+        result.set_exception(RuntimeError("batch rejected"))
+
+    client._send_input_message = send_input_message
+    requests = [make_request(SamplingParams(max_tokens=1))]
+
+    with pytest.raises(RuntimeError, match="batch rejected"):
+        await client.add_requests_async(requests, admission_callback)
+
+    admission_callback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dp_first_request_failure_occurs_after_engine_admission() -> None:
+    client = object.__new__(DPAsyncMPClient)
+    client._ensure_stats_update_task = MagicMock()
+    client.current_wave = 11
+    client.client_index = 4
+    client.get_core_engine_for_request = MagicMock(return_value=b"engine")
+    client._add_request_submission_failed = MagicMock()
+    client._add_request_submission_succeeded = MagicMock()
+    client._send_input = AsyncMock()
+    client.engines_running = False
+    client._send_coordinator_control = AsyncMock(
+        side_effect=RuntimeError("coordinator failed")
+    )
+    client._ensure_output_queue_task = MagicMock()
+    admission_callback = MagicMock()
+    request = make_request(SamplingParams(max_tokens=1))
+
+    with pytest.raises(RuntimeError, match="coordinator failed"):
+        await client.add_request_async(
+            request,
+            on_engine_admission=admission_callback,
+        )
+
+    client._send_input.assert_awaited_once()
+    client._add_request_submission_failed.assert_not_called()
+    client._add_request_submission_succeeded.assert_called_once_with(request)
+    admission_callback.assert_called_once_with()
+    client._send_coordinator_control.assert_awaited_once()
+    first_request_message = client._send_coordinator_control.await_args.args[0]
+    assert msgspec.msgpack.decode(first_request_message) == ["FIRST_REQ", None]
+    client._ensure_output_queue_task.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_dplb_add_failure_rolls_back_optimistic_load() -> None:
+    client = object.__new__(DPLBAsyncMPClient)
+    client._ensure_stats_update_task = MagicMock()
+    client.current_wave = 0
+    client.client_index = 0
+    client.client_count = 2
+    client.reqs_in_flight = {}
+    client._optimistic_waiting_counts = {}
+    client.core_engines = [b"engine-0", b"engine-1"]
+    client.lb_engines = [[3, 0], [0, 0]]
+    client.eng_start_index = 0
+    client._send_input = AsyncMock(side_effect=RuntimeError("send failed"))
+    client.engines_running = True
+    client._ensure_output_queue_task = MagicMock()
+    request = make_request(SamplingParams(max_tokens=1))
+
+    with pytest.raises(RuntimeError, match="send failed"):
+        await client.add_request_async(request)
+
+    assert request.request_id not in client.reqs_in_flight
+    assert request.request_id not in client._optimistic_waiting_counts
+    assert client.lb_engines == [[3, 0], [0, 0]]
+    client._ensure_output_queue_task.assert_called_once_with()
+
+
+def test_dplb_atomic_batch_is_colocated_and_rolls_back_as_a_group() -> None:
+    client = object.__new__(DPLBAsyncMPClient)
+    client.client_count = 2
+    client.reqs_in_flight = {}
+    client._optimistic_waiting_counts = {}
+    client.core_engines = [b"engine-0", b"engine-1"]
+    client.lb_engines = [[3, 0], [0, 0]]
+    client.eng_start_index = 0
+    requests = [
+        make_request(SamplingParams(max_tokens=1)),
+        make_request(SamplingParams(max_tokens=1)),
+        make_request(SamplingParams(max_tokens=1)),
+    ]
+
+    chosen_engine = client.get_core_engine_for_requests(requests)
+
+    assert chosen_engine == b"engine-1"
+    assert client.lb_engines == [[3, 0], [6, 0]]
+    assert set(client.reqs_in_flight) == {request.request_id for request in requests}
+    assert set(client._optimistic_waiting_counts) == {
+        request.request_id for request in requests
+    }
+
+    for request in requests:
+        client._add_request_submission_failed(request)
+
+    assert client.lb_engines == [[3, 0], [0, 0]]
+    assert client.reqs_in_flight == {}
+    assert client._optimistic_waiting_counts == {}
 
 
 def test_apply_ready_response_syncs_block_size():

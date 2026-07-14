@@ -82,11 +82,12 @@ async def test_generate_normal_flow(mock_async_llm):
 
     # Collect outputs from generate
     outputs = []
-    async for output in mock_async_llm.generate(
+    stream = await mock_async_llm.generate(
         prompt=prompt,
         sampling_params=sampling_params,
         request_id=request_id,
-    ):
+    )
+    async for output in stream:
         outputs.append(output)
 
     assert len(outputs) == 2
@@ -160,7 +161,8 @@ async def test_generate_with_async_generator():
         yield StreamingInput(prompt=" world", sampling_params=sampling_params)
 
     outputs = []
-    async for output in llm.generate(input_generator(), sampling_params, request_id):
+    stream = await llm.generate(input_generator(), sampling_params, request_id)
+    async for output in stream:
         outputs.append(output)
 
     # Two intermediate outputs + one final output

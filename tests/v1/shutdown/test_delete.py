@@ -46,13 +46,14 @@ async def test_async_llm_delete(
     # initialization; then delete instance
     async_llm = AsyncLLM.from_engine_args(engine_args)
     if send_one_request:
-        async for _ in async_llm.generate(
+        stream = await async_llm.generate(
             "Hello my name is",
             request_id="abc",
             sampling_params=SamplingParams(
                 max_tokens=1, output_kind=RequestOutputKind.DELTA
             ),
-        ):
+        )
+        async for _ in stream:
             pass
     del async_llm
 

@@ -13,6 +13,7 @@ from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
 from vllm import envs
+from vllm.engine.protocol import GenerationStream
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse, UsageInfo
 from vllm.entrypoints.serve.utils.api_utils import sanitize_message
 from vllm.exceptions import VLLMValidationError
@@ -205,6 +206,7 @@ class RealtimeConnection:
         """
         request_id = f"rt-{self.connection_id}-{uuid4()}"
         full_text = ""
+        result_gen: GenerationStream | None = None
 
         prompt_token_ids_len: int = 0
         completion_tokens_len: int = 0
@@ -223,7 +225,7 @@ class RealtimeConnection:
             # Pass the streaming input generator to the engine
             # The engine will consume audio chunks as they arrive and
             # stream back transcription results incrementally
-            result_gen = self.serving.engine_client.generate(
+            result_gen = await self.serving.engine_client.generate(
                 prompt=streaming_input_gen,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -264,6 +266,9 @@ class RealtimeConnection:
         except Exception as e:
             logger.exception("Error in generation: %s", e)
             await self.send_error(sanitize_message(str(e)), "processing_error")
+        finally:
+            if result_gen is not None:
+                await result_gen.aclose()
 
     async def send(
         self, event: SessionCreated | TranscriptionDelta | TranscriptionDone

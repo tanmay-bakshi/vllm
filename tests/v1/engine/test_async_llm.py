@@ -81,19 +81,23 @@ async def generate(
         n=n,
         prompt_logprobs=prompt_logprobs,
     )
-    async for out in engine.generate(
+    stream = await engine.generate(
         request_id=request_id, prompt=prompt, sampling_params=sampling_params
-    ):
-        num_tokens = sum(len(output.token_ids) for output in out.outputs)
-        if output_kind == RequestOutputKind.DELTA:
-            count += num_tokens
-        else:
-            count = num_tokens
+    )
+    try:
+        async for out in stream:
+            num_tokens = sum(len(output.token_ids) for output in out.outputs)
+            if output_kind == RequestOutputKind.DELTA:
+                count += num_tokens
+            else:
+                count = num_tokens
 
-        if cancel_after is not None and count >= cancel_after:
-            return count, request_id
+            if cancel_after is not None and count >= cancel_after:
+                return count, request_id
 
-        await asyncio.sleep(0.0)
+            await asyncio.sleep(0.0)
+    finally:
+        await stream.aclose()
 
     return count, request_id
 
@@ -320,12 +324,10 @@ async def test_finished_flag(
             seed=33,
             n=n,
         )
-        outputs = [
-            out
-            async for out in engine.generate(
-                request_id="request-33", prompt=prompt, sampling_params=sampling_params
-            )
-        ]
+        stream = await engine.generate(
+            request_id="request-33", prompt=prompt, sampling_params=sampling_params
+        )
+        outputs = [out async for out in stream]
 
         # Assert only the last output has the finished flag set
         assert all(not out.finished for out in outputs[:-1])
@@ -476,23 +478,23 @@ async def test_dp_rank_argument():
         )
 
         # Test with valid DP rank.
-        async for _ in engine.generate(
+        stream = await engine.generate(
             request_id="request-34",
             prompt=TEXT_PROMPT,
             sampling_params=sampling_params,
             data_parallel_rank=0,
-        ):
+        )
+        async for _ in stream:
             pass
 
         # Test with out-of-range DP rank.
         with pytest.raises(ValueError):
-            async for _ in engine.generate(
+            await engine.generate(
                 request_id="request-35",
                 prompt=TEXT_PROMPT,
                 sampling_params=sampling_params,
                 data_parallel_rank=1,
-            ):
-                pass
+            )
 
 
 @pytest.mark.asyncio(scope="module")
@@ -665,9 +667,10 @@ async def collect_outputs(
 ) -> RequestOutput | None:
     """Helper to collect outputs and return the final one."""
     final_output: RequestOutput | None = None
-    async for output in engine.generate(
+    stream = await engine.generate(
         request_id=request_id, prompt=prompt, sampling_params=sampling_params
-    ):
+    )
+    async for output in stream:
         if not output.finished:
             outputs_list.append(output)
         final_output = output
@@ -736,11 +739,12 @@ async def test_pause_resume_basic():
 
         # Engine should still work after all cycles
         sampling_params = SamplingParams(max_tokens=5)
-        async for out in engine.generate(
+        stream = await engine.generate(
             request_id="post-cycles",
             prompt=TEXT_PROMPT,
             sampling_params=sampling_params,
-        ):
+        )
+        async for out in stream:
             pass
         assert out.finished
 
@@ -758,11 +762,12 @@ async def test_pause_abort():
         outputs: list[RequestOutput] = []
 
         async def gen():
-            async for out in engine.generate(
+            stream = await engine.generate(
                 request_id="test-abort-pause",
                 prompt=TEXT_PROMPT,
                 sampling_params=sampling_params,
-            ):
+            )
+            async for out in stream:
                 outputs.append(out)
             return outputs[-1] if outputs else None
 
@@ -791,11 +796,12 @@ async def test_pause_abort():
 
         async def gen_blocked():
             nonlocal request_completed
-            async for out in engine.generate(
+            stream = await engine.generate(
                 request_id="test-blocked",
                 prompt=TEXT_PROMPT,
                 sampling_params=SamplingParams(max_tokens=5),
-            ):
+            )
+            async for out in stream:
                 pass
             request_completed = True
             return out
@@ -836,11 +842,12 @@ async def test_pause_then_abort_queued_request():
         assert await engine.is_paused()
 
         async def gen():
-            async for out in engine.generate(
+            stream = await engine.generate(
                 request_id=request_id,
                 prompt=TEXT_PROMPT,
                 sampling_params=sampling_params,
-            ):
+            )
+            async for out in stream:
                 outputs.append(out)
             return outputs[-1] if outputs else None
 
@@ -878,11 +885,12 @@ async def test_pause_wait():
 
         async def gen():
             nonlocal request_completed
-            async for out in engine.generate(
+            stream = await engine.generate(
                 request_id="test-wait",
                 prompt=TEXT_PROMPT,
                 sampling_params=sampling_params,
-            ):
+            )
+            async for out in stream:
                 got_first_token.set()
             request_completed = True
             return out
@@ -920,11 +928,12 @@ async def test_pause_keep_single_request():
 
         async def generator_task():
             """Generate tokens and record timestamps."""
-            async for output in engine.generate(
+            stream = await engine.generate(
                 request_id="test-keep-single",
                 prompt=TEXT_PROMPT,
                 sampling_params=sampling_params,
-            ):
+            )
+            async for output in stream:
                 token_count = len(output.outputs[0].token_ids)
                 token_times.append((token_count, time.monotonic()))
             return output
@@ -981,11 +990,12 @@ async def test_pause_keep_multi_request():
         any_token_generated = asyncio.Event()
 
         async def gen_multi(request_id: str):
-            async for out in engine.generate(
+            stream = await engine.generate(
                 request_id=request_id,
                 prompt=TEXT_PROMPT,
                 sampling_params=sampling_params,
-            ):
+            )
+            async for out in stream:
                 any_token_generated.set()
             completed_requests.append(request_id)
             return out

@@ -11,17 +11,19 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.logger import init_logger
-from vllm.outputs import RequestOutput
-
-from ..base.serving import OpenAISpeechToText
-from .protocol import (
+from vllm.entrypoints.speech_to_text.base.serving import (
+    OpenAISpeechToText,
+    SpeechGenerationStream,
+)
+from vllm.entrypoints.speech_to_text.transcription.protocol import (
     TranscriptionRequest,
     TranscriptionResponse,
     TranscriptionResponseStreamChoice,
     TranscriptionResponseVerbose,
     TranscriptionStreamResponse,
 )
+from vllm.logger import init_logger
+from vllm.utils.async_utils import ManagedAsyncIterator
 
 logger = init_logger(__name__)
 
@@ -55,7 +57,7 @@ class OpenAIServingTranscription(OpenAISpeechToText):
     ) -> (
         TranscriptionResponse
         | TranscriptionResponseVerbose
-        | AsyncGenerator[str, None]
+        | ManagedAsyncIterator[str]
         | ErrorResponse
     ):
         """Transcription API similar to OpenAI's API.
@@ -78,7 +80,7 @@ class OpenAIServingTranscription(OpenAISpeechToText):
     async def transcription_stream_generator(
         self,
         request: TranscriptionRequest,
-        result_generator: list[AsyncGenerator[RequestOutput, None]],
+        result_generator: list[SpeechGenerationStream],
         request_id: str,
         request_metadata: RequestResponseMetadata,
         audio_duration_s: float,

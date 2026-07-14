@@ -83,12 +83,16 @@ async def test_run_eagle_dp(monkeypatch: pytest.MonkeyPatch, attn_backend: str):
     )
 
     async def generate_with_timeout(given_engine: AsyncLLM):
-        async for out in given_engine.generate(
+        stream = await given_engine.generate(
             request_id="test-eagle-dp", prompt=prompt, sampling_params=sampling_params
-        ):
-            token_ids = out.outputs[0].token_ids
-            assert len(token_ids) == num_expected_tokens
-            return token_ids
+        )
+        try:
+            async for out in stream:
+                token_ids = out.outputs[0].token_ids
+                assert len(token_ids) == num_expected_tokens
+                return token_ids
+        finally:
+            await stream.aclose()
 
     async def engine_create_and_generate(engine_args: AsyncEngineArgs):
         async with AsyncExitStack() as after:

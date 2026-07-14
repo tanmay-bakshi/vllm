@@ -12,9 +12,9 @@ use thiserror_ext::AsReport;
 
 use crate::error::{Error, Result};
 use crate::protocol::logprobs::MaybeWireLogprobs;
-use crate::protocol::multimodal::MmFeatures;
+use crate::protocol::multimodal::{MmFeatures, resolve_mm_features_in_place};
 use crate::protocol::stats::{PrefillStats, SchedulerStats};
-use crate::protocol::utility::UtilityOutput;
+use crate::protocol::utility::{UtilityCallId, UtilityOutput};
 
 // TODO: This module currently mixes reusable frontend-facing semantic types
 // (for example `FinishReason`, `StopReason`, `RequestOutputKind`, and future
@@ -79,6 +79,7 @@ pub enum EngineCoreRequestType {
     Abort = 1,
     StartDpWave = 2,
     Utility = 3,
+    AddBatch = 6,
 }
 
 impl EngineCoreRequestType {
@@ -94,6 +95,7 @@ impl EngineCoreRequestType {
             1 => Some(Self::Abort),
             2 => Some(Self::StartDpWave),
             3 => Some(Self::Utility),
+            6 => Some(Self::AddBatch),
             _ => None,
         }
     }
@@ -106,6 +108,7 @@ impl EngineCoreRequestType {
             Self::Abort => b"\x01",
             Self::StartDpWave => b"\x02",
             Self::Utility => b"\x03",
+            Self::AddBatch => b"\x06",
         })
     }
 }
@@ -435,11 +438,6 @@ pub struct EngineCoreRequest {
     /// structured-output backend.
     #[serde(default)]
     pub reasoning_parser_kwargs: Option<ReasoningParserKwargs>,
-    /// If `true`, the request should be added to the scheduler's waiting queue
-    /// and immediately aborted, so connector-side cleanup runs via the
-    /// standard `request_finished` hook.
-    #[serde(default)]
-    pub abort_immediately: bool,
 }
 
 impl EngineCoreRequest {
@@ -453,6 +451,47 @@ impl EngineCoreRequest {
         }
         Ok(())
     }
+
+    fn resolve_aux_frames_in_place<Frame>(&mut self, frames: &[Frame]) -> Result<()>
+    where
+        Frame: AsRef<[u8]>,
+    {
+        if let Some(mm_features) = &mut self.mm_features {
+            resolve_mm_features_in_place(mm_features, frames)?;
+        }
+        Ok(())
+    }
+}
+
+/// Correlation header for atomic multi-request admission.
+///
+/// The header occupies its own frame so the engine can report payload decode
+/// failures to the frontend that submitted the batch.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize_tuple, Deserialize_tuple)]
+pub struct EngineCoreRequestBatchHeader {
+    /// Frontend client that receives the admission acknowledgement.
+    pub client_index: u32,
+    /// Correlation identifier carried back in the acknowledgement.
+    pub call_id: UtilityCallId,
+}
+
+/// Decode one ordinary or multipart atomic request-batch payload.
+///
+/// The first frame contains the MessagePack-encoded request vector. Remaining
+/// frames contain tensor buffers referenced by index from that primary frame.
+pub fn decode_engine_core_requests<Frame>(frames: &[Frame]) -> Result<Vec<EngineCoreRequest>>
+where
+    Frame: AsRef<[u8]>,
+{
+    let first_frame = frames.first().ok_or_else(|| Error::ExtValueDecode {
+        message: "missing request batch payload frame".to_string(),
+    })?;
+
+    let mut requests: Vec<EngineCoreRequest> = decode_msgpack(first_frame.as_ref())?;
+    for request in &mut requests {
+        request.resolve_aux_frames_in_place(frames)?;
+    }
+    Ok(requests)
 }
 
 /// Engine-core output for a single request.
@@ -573,6 +612,30 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::protocol::multimodal::{MmFeatureSpec, PlaceholderRange};
+    use crate::protocol::tensor::{WireArrayData, WireNdArray};
+
+    fn request_with_mm_aux_index(index: usize) -> EngineCoreRequest {
+        EngineCoreRequest {
+            request_id: "req-mm".to_string(),
+            mm_features: Some(vec![MmFeatureSpec {
+                data: None,
+                modality: "image".to_string(),
+                identifier: "image-1".to_string(),
+                mm_position: PlaceholderRange {
+                    offset: 0,
+                    length: 2,
+                    is_embed: Some(WireNdArray {
+                        dtype: "bool".to_string(),
+                        shape: vec![2],
+                        data: WireArrayData::AuxIndex(index),
+                    }),
+                },
+                mm_hash: None,
+            }]),
+            ..EngineCoreRequest::default()
+        }
+    }
 
     #[test]
     fn engine_core_request_serializes_as_full_array() {
@@ -595,12 +658,62 @@ mod tests {
             other => panic!("expected array, got {other:?}"),
         };
 
-        assert_eq!(array.len(), 20);
+        assert_eq!(array.len(), 19);
         assert_eq!(array[0], Value::from("req-1"));
         assert_eq!(array[2], Value::Nil);
         assert_eq!(array[4], Value::Nil);
         assert_eq!(array[10], Value::Nil);
         assert_eq!(array[11], Value::from(7));
+    }
+
+    #[test]
+    fn add_batch_uses_python_wire_byte() {
+        assert_eq!(
+            EngineCoreRequestType::from_frame(b"\x06"),
+            Some(EngineCoreRequestType::AddBatch)
+        );
+        assert_eq!(EngineCoreRequestType::AddBatch.to_frame().as_ref(), b"\x06");
+    }
+
+    #[test]
+    fn engine_core_request_batch_header_roundtrips_as_ordered_tuple() {
+        let header = EngineCoreRequestBatchHeader {
+            client_index: 7,
+            call_id: u64::MAX.into(),
+        };
+
+        let encoded = encode_msgpack(&header).unwrap();
+        let value = decode_value(&encoded).unwrap();
+        let array = value.as_array().expect("batch header must be an array");
+
+        assert_eq!(array.len(), 2);
+        assert_eq!(array[0], Value::from(7));
+        assert_eq!(array[1], Value::from(u64::MAX));
+
+        let decoded: EngineCoreRequestBatchHeader = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded, header);
+    }
+
+    #[test]
+    fn request_batch_payload_resolves_aux_frames() {
+        let payload = encode_msgpack(&vec![request_with_mm_aux_index(1)]).unwrap();
+        let frames = vec![payload, vec![0, 1]];
+
+        let decoded = decode_engine_core_requests(&frames).unwrap();
+        let is_embed = decoded[0].mm_features.as_ref().unwrap()[0]
+            .mm_position
+            .is_embed
+            .as_ref()
+            .unwrap();
+        assert_eq!(is_embed.data, WireArrayData::RawView(vec![0, 1]));
+    }
+
+    #[test]
+    fn request_batch_payload_rejects_missing_aux_frame() {
+        let payload = encode_msgpack(&vec![request_with_mm_aux_index(2)]).unwrap();
+        let error = decode_engine_core_requests(&[payload, vec![0, 1]]).unwrap_err();
+
+        assert!(error.to_string().contains("aux frame index 2 out of range"));
     }
 
     #[test]

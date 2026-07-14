@@ -5,7 +5,7 @@
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from vllm.entrypoints.openai.chat_completion.batch_serving import OpenAIServingChatBatch
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -16,6 +16,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.utils.api_utils import (
+    CloseableStreamingResponse,
     load_aware_call,
     validate_json_request,
     with_cancellation,
@@ -71,7 +72,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             headers=metrics_header(metrics_header_format),
         )
 
-    return StreamingResponse(content=generator, media_type="text/event-stream")
+    return CloseableStreamingResponse(content=generator, media_type="text/event-stream")
 
 
 @router.post(

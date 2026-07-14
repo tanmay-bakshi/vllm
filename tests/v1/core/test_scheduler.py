@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -4372,6 +4372,114 @@ def test_abort_request_finished_recving():
     # verify request is deleted
     assert request.request_id not in scheduler.requests
     assert not scheduler.finished_recving_kv_req_ids
+
+
+def test_late_kv_terminal_for_released_request_is_idempotent():
+    scheduler = create_scheduler(use_kv_connector=True)
+    request_id = "already-released"
+    scheduler.finished_recving_kv_req_ids.add(request_id)
+    scheduler.failed_recving_kv_req_ids.add(request_id)
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={request_id},
+            finished_sending={request_id},
+        )
+    )
+
+    assert request_id not in scheduler.finished_recving_kv_req_ids
+    assert request_id not in scheduler.failed_recving_kv_req_ids
+
+
+def test_atomic_request_batch_commits_before_connector_admission() -> None:
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=3)
+    connector = MagicMock()
+
+    def observe_committed_batch(_request: Request) -> None:
+        assert all(request.request_id in scheduler.requests for request in requests)
+
+    connector.on_new_request.side_effect = observe_committed_batch
+    scheduler.connector = connector
+
+    scheduler.commit_requests(requests)
+    assert connector.on_new_request.call_count == 0
+    assert set(scheduler.requests) == {request.request_id for request in requests}
+    assert scheduler.admit_committed_requests(requests)
+    assert connector.on_new_request.call_count == len(requests)
+
+
+def test_atomic_request_batch_aborts_every_member_on_connector_error() -> None:
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=3)
+    connector = MagicMock()
+    connector.on_new_request.side_effect = [None, RuntimeError("admission failed")]
+    connector.request_finished.return_value = (False, None)
+    scheduler.connector = connector
+
+    scheduler.commit_requests(requests)
+    assert scheduler.admit_committed_requests(requests) is False
+    assert all(request.is_finished() for request in requests)
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
+def test_failed_block_cleanup_does_not_publish_completion_proof() -> None:
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    request.status = RequestStatus.FINISHED_ABORTED
+    scheduler._free_blocks = MagicMock(side_effect=RuntimeError("block cleanup failed"))
+
+    with pytest.raises(RuntimeError, match="block cleanup failed"):
+        scheduler._free_request(request)
+
+    assert scheduler.has_completed_request_cleanup(request) is False
+
+
+def test_maintenance_only_schedule_publishes_cleanup_without_compute() -> None:
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    scheduler.finished_req_ids.add("released-request")
+
+    output = scheduler.schedule(maintenance_only=True)
+
+    assert output.total_num_scheduled_tokens == 0
+    assert output.num_scheduled_tokens == {}
+    assert output.finished_req_ids == {"released-request"}
+    assert request.request_id in scheduler.requests
+    assert request.status == RequestStatus.WAITING
+
+
+def test_kv_offer_ownership_requires_exact_complete_identity() -> None:
+    scheduler = create_scheduler(use_kv_connector=True)
+    request = create_requests(num_requests=1)[0]
+    request.kv_transfer_params = {
+        "do_remote_prefill": True,
+        "remote_engine_id": "producer-engine",
+        "remote_request_id": "producer-request",
+        "p2d_offer_generation": 7,
+    }
+    scheduler.add_request(request)
+
+    assert scheduler.owns_kv_transfer_offer(dict(request.kv_transfer_params))
+    request.kv_transfer_params["do_remote_prefill"] = False
+    assert scheduler.owns_kv_transfer_offer(dict(request.kv_transfer_params))
+    assert not scheduler.owns_kv_transfer_offer({})
+    assert not scheduler.owns_kv_transfer_offer(
+        {
+            "remote_engine_id": "producer-engine",
+            "remote_request_id": "producer-request",
+            "p2d_offer_generation": True,
+        }
+    )
+    assert not scheduler.owns_kv_transfer_offer(
+        {
+            "remote_engine_id": "producer-engine",
+            "remote_request_id": "other-request",
+            "p2d_offer_generation": 7,
+        }
+    )
 
 
 def test_delayed_kv_connector_free_keeps_scheduler_active():

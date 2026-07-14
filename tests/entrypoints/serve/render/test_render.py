@@ -94,6 +94,99 @@ async def test_chat_completion_render_basic(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("endpoint", "request_body", "returns_list"),
+    [
+        (
+            "/v1/completions/render",
+            {"prompt": "Canonical completion transport"},
+            True,
+        ),
+        (
+            "/v1/chat/completions/render",
+            {"messages": [{"role": "user", "content": "Canonical chat transport"}]},
+            False,
+        ),
+    ],
+)
+async def test_render_emits_generate_request_without_kv_contract(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    request_body: dict[str, object],
+    returns_list: bool,
+) -> None:
+    response = await client.post(
+        endpoint,
+        json={
+            "model": MODEL_NAME,
+            **request_body,
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    generate_request = data[0] if returns_list else data
+    assert generate_request["kv_transfer_params"] is None
+    extra_args = generate_request["sampling_params"].get("extra_args")
+    assert extra_args is None or "kv_transfer_params" not in extra_args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("endpoint", "request_body"),
+    [
+        ("/v1/completions/render", {"prompt": "completion"}),
+        (
+            "/v1/chat/completions/render",
+            {"messages": [{"role": "user", "content": "chat"}]},
+        ),
+    ],
+)
+@pytest.mark.parametrize("transfer_flag", ["do_remote_decode", "do_remote_prefill"])
+async def test_render_rejects_kv_contract(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    request_body: dict[str, object],
+    transfer_flag: str,
+) -> None:
+    response = await client.post(
+        endpoint,
+        json={
+            "model": MODEL_NAME,
+            "kv_transfer_params": {
+                transfer_flag: True,
+                "remote_request_id": "producer-request",
+            },
+            **request_body,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "kv_transfer_params must be attached to GenerateRequest after rendering"
+    )
+
+
+@pytest.mark.asyncio
+async def test_completion_render_rejects_beam_search(
+    client: httpx.AsyncClient,
+) -> None:
+    response = await client.post(
+        "/v1/completions/render",
+        json={
+            "model": MODEL_NAME,
+            "prompt": "beam search",
+            "use_beam_search": True,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "Beam search is not supported by the render endpoint"
+    )
+
+
+@pytest.mark.asyncio
 async def test_completion_render_multiple_prompts(client):
     """Test completion render with multiple prompts."""
     response = await client.post(

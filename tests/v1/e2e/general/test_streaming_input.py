@@ -19,7 +19,7 @@ import pytest
 import pytest_asyncio
 
 from vllm import SamplingParams
-from vllm.engine.protocol import StreamingInput
+from vllm.engine.protocol import GenerationStream, StreamingInput
 from vllm.outputs import RequestOutput
 from vllm.platforms import current_platform
 from vllm.sampling_params import RequestOutputKind
@@ -66,15 +66,18 @@ def get_sampling_params(max_tokens: int = 20) -> SamplingParams:
 
 
 async def collect_outputs(
-    output_gen: AsyncGenerator[RequestOutput, None],
+    output_gen: GenerationStream,
 ) -> tuple[list[RequestOutput], str]:
     """Collect all outputs from a generate call, return outputs and full text."""
     outputs: list[RequestOutput] = []
     full_text = ""
-    async for output in output_gen:
-        outputs.append(output)
-        if output.outputs and output.outputs[0].text:
-            full_text += output.outputs[0].text
+    try:
+        async for output in output_gen:
+            outputs.append(output)
+            if output.outputs and output.outputs[0].text:
+                full_text += output.outputs[0].text
+    finally:
+        await output_gen.aclose()
     return outputs, full_text
 
 
@@ -96,7 +99,7 @@ async def test_streaming_input_bunched(engine: AsyncLLM):
         yield StreamingInput(prompt=" to code in Python")
 
     outputs, full_text = await collect_outputs(
-        engine.generate(
+        await engine.generate(
             bunched_input_generator(),
             sampling_params,
             request_id,
@@ -162,11 +165,12 @@ async def test_streaming_input_spaced(engine: AsyncLLM):
     outputs: list[RequestOutput] = []
     full_text = ""
 
-    async for output in engine.generate(
+    stream = await engine.generate(
         spaced_input_generator(),
         sampling_params,
         request_id,
-    ):
+    )
+    async for output in stream:
         outputs.append(output)
         if output.outputs and output.outputs[0].text:
             full_text += output.outputs[0].text
@@ -204,7 +208,7 @@ async def test_streaming_input_output_equivalence(engine: AsyncLLM):
             yield StreamingInput(prompt=prompt)
 
     _, bunched_text = await collect_outputs(
-        engine.generate(bunched_gen(), sampling_params, "equiv_bunched")
+        await engine.generate(bunched_gen(), sampling_params, "equiv_bunched")
     )
 
     # Test spaced inputs (same prompts, but with delays)
@@ -214,7 +218,7 @@ async def test_streaming_input_output_equivalence(engine: AsyncLLM):
             await asyncio.sleep(0.3)
 
     _, spaced_text = await collect_outputs(
-        engine.generate(spaced_gen(), sampling_params, "equiv_spaced")
+        await engine.generate(spaced_gen(), sampling_params, "equiv_spaced")
     )
 
     # Both should produce the same output since we use temperature=0
@@ -255,7 +259,9 @@ async def test_streaming_input_cancel_output_stream(engine: AsyncLLM):
             raise
 
     outputs_received = 0
-    output_gen = engine.generate(slow_input_generator(), sampling_params, request_id)
+    output_gen = await engine.generate(
+        slow_input_generator(), sampling_params, request_id
+    )
 
     # Collect a few outputs then cancel
     try:
@@ -304,7 +310,7 @@ async def test_streaming_input_close_signals_completion(engine: AsyncLLM):
         input_generator_finished = True
 
     outputs, _ = await collect_outputs(
-        engine.generate(limited_input_generator(), sampling_params, request_id)
+        await engine.generate(limited_input_generator(), sampling_params, request_id)
     )
 
     # Verify the input generator completed
@@ -350,7 +356,9 @@ async def test_streaming_input_abort_queued_inputs(engine: AsyncLLM):
             raise
 
     outputs_received = 0
-    output_gen = engine.generate(many_inputs_generator(), sampling_params, request_id)
+    output_gen = await engine.generate(
+        many_inputs_generator(), sampling_params, request_id
+    )
 
     try:
         async for output in output_gen:
@@ -401,10 +409,9 @@ async def test_streaming_input_error_propagation(engine: AsyncLLM):
 
     # Note: The current implementation catches exceptions and puts them
     # in the queue, so we should get the error when iterating outputs
+    stream = await engine.generate(error_input_generator(), sampling_params, request_id)
     with pytest.raises(InputError, match="Simulated input error"):
-        async for _ in engine.generate(
-            error_input_generator(), sampling_params, request_id
-        ):
+        async for _ in stream:
             pass
 
     # Give time for cleanup
@@ -438,7 +445,7 @@ async def test_streaming_input_multiple_concurrent_sessions(engine: AsyncLLM):
                 await asyncio.sleep(0.1)
 
         _, text = await collect_outputs(
-            engine.generate(input_gen(), sampling_params, request_id)
+            await engine.generate(input_gen(), sampling_params, request_id)
         )
         return request_id, text
 
@@ -477,7 +484,7 @@ async def test_streaming_input_per_chunk_sampling_params(engine: AsyncLLM):
         )
 
     outputs, full_text = await collect_outputs(
-        engine.generate(variable_params_generator(), base_params, request_id)
+        await engine.generate(variable_params_generator(), base_params, request_id)
     )
 
     assert len(outputs) > 0, "Should have received outputs"
@@ -502,7 +509,8 @@ async def test_streaming_input_empty_generator(engine: AsyncLLM):
         yield  # Make it a generator
 
     outputs: list[RequestOutput] = []
-    async for output in engine.generate(empty_generator(), sampling_params, request_id):
+    stream = await engine.generate(empty_generator(), sampling_params, request_id)
+    async for output in stream:
         outputs.append(output)
 
     # Should still get a finished marker
@@ -524,7 +532,7 @@ async def test_streaming_input_single_chunk(engine: AsyncLLM):
         yield StreamingInput(prompt="What color is the sky? The sky is")
 
     outputs, full_text = await collect_outputs(
-        engine.generate(single_chunk_generator(), sampling_params, request_id)
+        await engine.generate(single_chunk_generator(), sampling_params, request_id)
     )
 
     assert len(outputs) > 0
@@ -545,7 +553,7 @@ async def test_streaming_input_reuse_request_id(engine: AsyncLLM):
         yield StreamingInput(prompt="First session")
 
     _, text1 = await collect_outputs(
-        engine.generate(gen1(), sampling_params, request_id)
+        await engine.generate(gen1(), sampling_params, request_id)
     )
 
     # Second session with same ID
@@ -553,7 +561,7 @@ async def test_streaming_input_reuse_request_id(engine: AsyncLLM):
         yield StreamingInput(prompt="Second session")
 
     _, text2 = await collect_outputs(
-        engine.generate(gen2(), sampling_params, request_id)
+        await engine.generate(gen2(), sampling_params, request_id)
     )
 
     assert len(text1) > 0
@@ -573,22 +581,19 @@ async def test_streaming_input_validation_errors(engine: AsyncLLM):
     # Test n > 1 is rejected
     with pytest.raises(ValueError, match="Input streaming not currently supported"):
         params_n2 = SamplingParams(max_tokens=10, n=2)
-        async for _ in engine.generate(dummy_generator(), params_n2, "test_n2"):
-            pass
+        await engine.generate(dummy_generator(), params_n2, "test_n2")
 
     # Test FINAL_ONLY is rejected
     with pytest.raises(ValueError, match="Input streaming not currently supported"):
         params_final = SamplingParams(
             max_tokens=10, output_kind=RequestOutputKind.FINAL_ONLY
         )
-        async for _ in engine.generate(dummy_generator(), params_final, "test_final"):
-            pass
+        await engine.generate(dummy_generator(), params_final, "test_final")
 
     # Test stop strings are rejected
     with pytest.raises(ValueError, match="Input streaming not currently supported"):
         params_stop = SamplingParams(max_tokens=10, stop=["stop"])
-        async for _ in engine.generate(dummy_generator(), params_stop, "test_stop"):
-            pass
+        await engine.generate(dummy_generator(), params_stop, "test_stop")
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -624,9 +629,10 @@ async def test_streaming_input_delayed_generator_exit(engine: AsyncLLM):
     outputs: list[RequestOutput] = []
     full_text = ""
 
-    async for output in engine.generate(
+    stream = await engine.generate(
         delayed_exit_input_generator(), sampling_params, request_id
-    ):
+    )
+    async for output in stream:
         outputs.append(output)
         if output.outputs and output.outputs[0].text:
             full_text += output.outputs[0].text

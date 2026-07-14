@@ -245,11 +245,12 @@ async def test_abort_during_final_step(async_scheduling: bool):
                 outputs = []
 
                 async def generate():
-                    async for output in engine.generate(
+                    stream = await engine.generate(
                         request_id=request_id,
                         prompt=TEXT_PROMPT,
                         sampling_params=sampling_params,
-                    ):
+                    )
+                    async for output in stream:
                         outputs.append(output)
 
                 gen_task = asyncio.create_task(generate())

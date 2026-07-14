@@ -166,11 +166,12 @@ async def test_voxtral_realtime_generator(audio_assets, tokenizer, async_engine)
 
         request_id = f"session-{i}"
 
-        async for resp in async_engine.generate(
+        stream = await async_engine.generate(
             prompt=buffer.get_input_stream(),
             sampling_params=sampling_params,
             request_id=request_id,
-        ):
+        )
+        async for resp in stream:
             tokens = resp.outputs[0].token_ids[-1:]
             output_tokens.extend(tokens)
             await buffer.append_tokens(tokens)

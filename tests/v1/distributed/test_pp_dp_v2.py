@@ -71,9 +71,10 @@ async def _generate(engine: AsyncLLM, prompt: str, max_tokens: int) -> int:
     )
     request_id = f"req-{id(prompt):x}-{max_tokens}"
     total = 0
-    async for out in engine.generate(
+    stream = await engine.generate(
         request_id=request_id, prompt=prompt, sampling_params=sampling_params
-    ):
+    )
+    async for out in stream:
         total += len(out.outputs[0].token_ids)
     return total
 
@@ -128,14 +129,18 @@ async def test_pp_dp_v2_abort_mid_decode():
             request_id = f"abort-req-{i}"
             count = 0
             cancel_at = 4 if i % 2 == 0 else 64
-            async for out in engine.generate(
+            stream = await engine.generate(
                 request_id=request_id,
                 prompt=f"{PROMPT} {i}",
                 sampling_params=sampling_params,
-            ):
-                count += len(out.outputs[0].token_ids)
-                if count >= cancel_at:
-                    break
+            )
+            try:
+                async for out in stream:
+                    count += len(out.outputs[0].token_ids)
+                    if count >= cancel_at:
+                        break
+            finally:
+                await stream.aclose()
             return count, i
 
         results = await asyncio.gather(*[_maybe_cancel(i) for i in range(32)])

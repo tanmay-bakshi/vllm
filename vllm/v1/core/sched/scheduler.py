@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import time
+import traceback
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -111,6 +112,7 @@ class Scheduler(SchedulerInterface):
         # Token-provenance tracer (VLLM_GEMMA4_TOKEN_TRACE=<path>):
         # per-request per-step drafted vs generated token ids.
         import os as _os_tt
+
         _tt_path = _os_tt.environ.get("VLLM_GEMMA4_TOKEN_TRACE", "")
         self._tok_trace = open(_tt_path, "a", buffering=1) if _tt_path else None
 
@@ -180,6 +182,7 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        self._completed_request_cleanup: dict[str, Request] = {}
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -426,7 +429,12 @@ class Scheduler(SchedulerInterface):
                 max_seq_len = seq_len
         return max_seq_len
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+    def schedule(
+        self,
+        throttle_prefills: bool = False,
+        *,
+        maintenance_only: bool = False,
+    ) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -447,8 +455,7 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
-        if self._pause_state == PauseState.PAUSED_ALL:
-            # Do not schedule any requests when paused.
+        if self._pause_state == PauseState.PAUSED_ALL or maintenance_only:
             token_budget = 0
 
         # Encoder-related.
@@ -1191,6 +1198,7 @@ class Scheduler(SchedulerInterface):
             "Only running requests can be preempted"
         )
         import os as _os
+
         if _os.environ.get("VLLM_GEMMA4_SP_NO_RECOMPUTE", "0") == "1":
             # F2b single-plane global KV: a preempted request would
             # re-prefill locally through the stock path, which cannot
@@ -1231,13 +1239,16 @@ class Scheduler(SchedulerInterface):
         request.num_preemptions += 1
         logger.info(
             "[preempt] victim=%s n_preempt=%d discard_frame=%d tokens_at_preempt=%d",
-            request.request_id, request.num_preemptions,
-            request.async_tokens_to_discard, request.num_tokens,
+            request.request_id,
+            request.num_preemptions,
+            request.async_tokens_to_discard,
+            request.num_tokens,
         )
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
         import os as _os_pa
+
         if (
             self.connector is not None
             and _os_pa.environ.get("VLLM_GEMMA4_PREEMPT_ABORT", "0") == "1"
@@ -1303,6 +1314,7 @@ class Scheduler(SchedulerInterface):
         # NOTE: We shouldn't do self.finished_req_ids.clear() here because
         # it will also affect the scheduler output.
         self.finished_req_ids = set()
+        self._completed_request_cleanup = {}
 
     def _update_request_as_session(
         self, session: Request, update: StreamingUpdate
@@ -1715,6 +1727,7 @@ class Scheduler(SchedulerInterface):
 
             if self._tok_trace is not None and generated_token_ids:
                 import time as _t_tt
+
                 try:
                     self._tok_trace.write(
                         f"{_t_tt.monotonic():.3f} {req_id} "
@@ -1886,8 +1899,7 @@ class Scheduler(SchedulerInterface):
             abort_ids = [
                 req_id
                 for req_id in self._preempt_abort_req_ids
-                if req_id in self.requests
-                and not self.requests[req_id].is_finished()
+                if req_id in self.requests and not self.requests[req_id].is_finished()
             ]
             self._preempt_abort_req_ids.clear()
             if abort_ids:
@@ -2160,6 +2172,129 @@ class Scheduler(SchedulerInterface):
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
+    def validate_add_requests(self, requests: list[Request]) -> None:
+        """Validate a fresh request group without mutating scheduler state.
+
+        :param requests: Requests proposed for one ownership transaction.
+        :raises ValueError: If the group is empty, contains duplicate IDs, or
+            aliases an existing scheduler request.
+        """
+        if len(requests) == 0:
+            raise ValueError("request batch must not be empty")
+
+        request_ids = [request.request_id for request in requests]
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("request batch contains duplicate request IDs")
+        if any(request_id in self.requests for request_id in request_ids):
+            raise ValueError("request batch aliases an existing request")
+
+    def commit_requests(self, requests: list[Request]) -> None:
+        """Atomically commit a group before connector side effects.
+
+        All request IDs enter ``self.requests`` before queue mutation begins.
+        Queue insertion is rolled back without invoking the connector if any
+        member fails, so the method either returns with complete scheduler
+        ownership or raises with no admitted member.
+
+        :param requests: Fresh requests sharing one admission transaction.
+        :raises ValueError: If validation fails before scheduler mutation.
+        """
+        self.validate_add_requests(requests)
+        try:
+            for request in requests:
+                if request.resumable:
+                    request.streaming_queue = deque()
+                self._completed_request_cleanup.pop(request.request_id, None)
+                self.requests[request.request_id] = request
+            for request in requests:
+                self._enqueue_waiting_request(request)
+        except Exception:
+            logger.error(
+                "Rolling back failed scheduler commit for request batch %s\n%s",
+                [request.request_id for request in requests],
+                traceback.format_exc(),
+            )
+            self.waiting.remove_requests(requests)
+            self.skipped_waiting.remove_requests(requests)
+            for request in requests:
+                self.requests.pop(request.request_id, None)
+            raise
+
+    def admit_committed_requests(self, requests: list[Request]) -> bool:
+        """Run connector admission after the scheduler commit boundary.
+
+        If connector admission fails, the complete scheduler-owned group is
+        aborted so every remote-prefill child emits an ordinary terminal proof.
+
+        :param requests: Requests committed by :meth:`commit_requests`.
+        :returns: Whether connector admission completed without an error.
+        :raises RuntimeError: If any request is not owned by this scheduler.
+        """
+        request_ids = [request.request_id for request in requests]
+        if any(
+            self.requests.get(request.request_id) is not request for request in requests
+        ):
+            raise RuntimeError("connector admission requires a committed request batch")
+
+        try:
+            if self.connector is not None:
+                for request in requests:
+                    self.connector.on_new_request(request)
+        except Exception:
+            logger.error(
+                "Connector admission failed for committed request batch %s\n%s",
+                request_ids,
+                traceback.format_exc(),
+            )
+            self.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+            return False
+
+        if self.log_stats:
+            for request in requests:
+                request.record_event(EngineCoreEventType.QUEUED)
+        return True
+
+    def has_completed_request_cleanup(self, request: Request) -> bool:
+        """Return whether terminal connector cleanup completed for a request.
+
+        :param request: Claimed request whose terminal state is queried.
+        :returns: Whether ``_free_request`` completed its cleanup handoff.
+        """
+        return self._completed_request_cleanup.get(request.request_id) is request
+
+    def owns_kv_transfer_offer(self, kv_transfer_params: Mapping[str, object]) -> bool:
+        """Return whether any admitted request owns a remote KV offer.
+
+        :param kv_transfer_params: Remote offer identity and transport metadata.
+        :returns: Whether an admitted request owns the same offer.
+        """
+        remote_engine_id = kv_transfer_params.get("remote_engine_id")
+        remote_request_id = kv_transfer_params.get("remote_request_id")
+        offer_generation = kv_transfer_params.get("p2d_offer_generation")
+        if (
+            type(remote_engine_id) is not str
+            or len(remote_engine_id) == 0
+            or type(remote_request_id) is not str
+            or len(remote_request_id) == 0
+            or (
+                offer_generation is not None
+                and (type(offer_generation) is not int or offer_generation < 0)
+            )
+        ):
+            return False
+
+        for request in self.requests.values():
+            owned_params = request.kv_transfer_params
+            if owned_params is None:
+                continue
+            if (
+                owned_params.get("remote_engine_id") == remote_engine_id
+                and owned_params.get("remote_request_id") == remote_request_id
+                and owned_params.get("p2d_offer_generation") == offer_generation
+            ):
+                return True
+        return False
+
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
     ) -> list[tuple[str, int]]:
@@ -2239,6 +2374,7 @@ class Scheduler(SchedulerInterface):
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
+        self._completed_request_cleanup[request_id] = request
 
         return kv_xfer_params
 
@@ -2318,6 +2454,15 @@ class Scheduler(SchedulerInterface):
             self.has_unfinished_requests()
             or self.has_finished_requests()
             or (self.connector is not None and self.connector.has_pending_push_work())
+        )
+
+    def has_maintenance_work(self) -> bool:
+        """Return whether connector cleanup can progress without model execution.
+
+        :returns: Whether a maintenance-only scheduler iteration is useful.
+        """
+        return self.has_finished_requests() or (
+            self.connector is not None and self.connector.has_pending_push_work()
         )
 
     def reset_prefix_cache(
@@ -2614,17 +2759,30 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            req = self.requests[req_id]
+            req = self.requests.get(req_id)
+            if req is None:
+                logger.warning(
+                    "Ignoring late KV receive completion for unknown request %s",
+                    req_id,
+                )
+                self.finished_recving_kv_req_ids.discard(req_id)
+                self.failed_recving_kv_req_ids.discard(req_id)
+                continue
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
             else:
                 assert RequestStatus.is_finished(req.status)
-                self._free_blocks(self.requests[req_id])
+                self._free_blocks(req)
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            self._free_blocks(self.requests[req_id])
+            req = self.requests.get(req_id)
+            if req is None:
+                logger.warning(
+                    "Ignoring late KV send completion for unknown request %s",
+                    req_id,
+                )
+                continue
+            self._free_blocks(req)
 
     def _update_requests_with_invalid_blocks(
         self,

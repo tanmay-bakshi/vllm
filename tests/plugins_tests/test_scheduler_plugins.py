@@ -5,12 +5,18 @@ import pytest
 
 from vllm.engine.arg_utils import EngineArgs
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine.llm_engine import LLMEngine
 
 
 class DummyV1Scheduler(Scheduler):
-    def schedule(self, throttle_prefills: bool = False):
+    def schedule(
+        self,
+        throttle_prefills: bool = False,
+        *,
+        maintenance_only: bool = False,
+    ) -> SchedulerOutput:
         raise Exception("Exception raised by DummyV1Scheduler")
 
 

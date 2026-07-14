@@ -1,14 +1,66 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import AsyncIterator
+from typing import Any
+
 import pytest
+from starlette.requests import ClientDisconnect
 
 from vllm.entrypoints.openai.engine.protocol import StreamOptions
 from vllm.entrypoints.serve.utils.api_utils import (
+    CloseableStreamingResponse,
     get_max_tokens,
     sanitize_message,
     should_include_usage,
 )
+from vllm.utils.async_utils import ManagedAsyncIterator
+
+
+class _CloseRecorder:
+    """Record asynchronous closure at the response lifecycle boundary."""
+
+    close_count: int
+
+    def __init__(self) -> None:
+        """Create an open recorder."""
+        self.close_count = 0
+
+    async def aclose(self) -> None:
+        self.close_count += 1
+
+
+@pytest.mark.asyncio
+async def test_closeable_streaming_response_closes_before_first_body_poll() -> None:
+    owner = _CloseRecorder()
+    content_polled = False
+
+    async def content() -> AsyncIterator[str]:
+        nonlocal content_polled
+        content_polled = True
+        yield "unused"
+
+    managed_content = ManagedAsyncIterator(content(), (owner,))
+    response = CloseableStreamingResponse(
+        content=managed_content,
+        media_type="text/event-stream",
+    )
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.disconnect"}
+
+    async def fail_response_start(_message: dict[str, Any]) -> None:
+        raise OSError("client disconnected before response start")
+
+    with pytest.raises(ClientDisconnect):
+        await response(
+            {"type": "http", "asgi": {"spec_version": "2.4"}},
+            receive,
+            fail_response_start,
+        )
+
+    assert content_polled is False
+    assert owner.close_count == 1
 
 
 def test_sanitize_message():

@@ -102,6 +102,59 @@ pub enum MmKwargValue {
     List(Vec<MmKwargValue>),
 }
 
+fn resolve_kwarg_value_in_place<Frame>(
+    value: &mut MmKwargValue,
+    frames: &[Frame],
+    field: &str,
+) -> crate::error::Result<()>
+where
+    Frame: AsRef<[u8]>,
+{
+    match value {
+        MmKwargValue::Tensor(tensor) => tensor.resolve_aux_frame_in_place(frames, field),
+        MmKwargValue::List(values) => {
+            for (index, value) in values.iter_mut().enumerate() {
+                resolve_kwarg_value_in_place(value, frames, &format!("{field}[{index}]"))?;
+            }
+            Ok(())
+        }
+        MmKwargValue::Int(_) | MmKwargValue::Float(_) => Ok(()),
+    }
+}
+
+pub(super) fn resolve_mm_features_in_place<Frame>(
+    features: &mut MmFeatures,
+    frames: &[Frame],
+) -> crate::error::Result<()>
+where
+    Frame: AsRef<[u8]>,
+{
+    for (feature_index, feature) in features.iter_mut().enumerate() {
+        let feature_field = format!("mm_features[{feature_index}]");
+        if let Some(is_embed) = &mut feature.mm_position.is_embed {
+            is_embed.resolve_aux_frame_in_place(
+                frames,
+                &format!("{feature_field}.mm_position.is_embed"),
+            )?;
+        }
+
+        let Some(data) = &mut feature.data else {
+            continue;
+        };
+        for (name, element) in data {
+            let Some(value) = &mut element.data else {
+                continue;
+            };
+            resolve_kwarg_value_in_place(
+                value,
+                frames,
+                &format!("{feature_field}.data[{name:?}]"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Defines how to interpret tensor data belonging to a keyword argument for
 /// `MultiModalKwargsItems`, and vice versa.
 ///

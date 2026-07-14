@@ -321,22 +321,17 @@ def test_prompt_less_than_block_size():
     assert len(scheduler_output.scheduled_new_reqs) == 0
 
 
-def test_abort_immediately_remote_prefill_enqueues_empty_recv():
-    """A remote-prefill request added with abort_immediately=True should
-    be added to the scheduler's waiting queue then immediately aborted, so the
-    NIXL connector's request_finished hook enqueues an empty recv to notify
-    the prefill instance to free its blocks."""
-    from vllm.v1.request import RequestStatus
-
+def test_admitted_remote_prefill_abort_waits_for_empty_recv_completion():
+    """An admitted abort remains owned until its empty receive completes."""
     scheduler = create_scheduler(create_vllm_config())
 
     request = create_request(request_id=42, num_tokens=10, do_remote_prefill=True)
     assert request.kv_transfer_params is not None
     assert request.kv_transfer_params["do_remote_prefill"] is True
 
-    # Mimic the EngineCore.add_request path for an abort-immediately req.
     scheduler.add_request(request)
     scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+    assert request.request_id in scheduler.requests
 
     scheduler_output = scheduler.schedule()
     meta = scheduler_output.kv_connector_metadata
@@ -347,6 +342,15 @@ def test_abort_immediately_remote_prefill_enqueues_empty_recv():
     assert req_meta.remote.request_id == f"prefill-{42}"
     # do_remote_prefill is consumed by request_finished to prevent re-issuing.
     assert request.kv_transfer_params["do_remote_prefill"] is False
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_sending=None,
+            finished_recving={request.request_id},
+            invalid_block_ids=set(),
+        )
+    )
+    assert request.request_id not in scheduler.requests
 
 
 @patch(
@@ -2987,6 +2991,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
                 expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
             )
 
+
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
@@ -3076,9 +3081,7 @@ def test_mla_broadcast_proof_uses_remote_request_id(dist_init: object) -> None:
     # any captured `send_notif` here is a broadcast.
     send_notif_calls: list[tuple[str, bytes]] = []
     worker.nixl_wrapper.send_notif = (  # type: ignore[method-assign]
-        lambda agent_name, notif_msg: send_notif_calls.append(
-            (agent_name, notif_msg)
-        )
+        lambda agent_name, notif_msg: send_notif_calls.append((agent_name, notif_msg))
     )
     worker._read_blocks = MagicMock()  # type: ignore[method-assign]
 
@@ -3098,8 +3101,7 @@ def test_mla_broadcast_proof_uses_remote_request_id(dist_init: object) -> None:
 
     # Broadcast goes to ranks {1, 2, 3} only, never to the read target.
     expected_recipients = {
-        worker._remote_agents[remote_engine_id][r]
-        for r in range(1, prefill_tp_size)
+        worker._remote_agents[remote_engine_id][r] for r in range(1, prefill_tp_size)
     }
     assert {agent for agent, _ in send_notif_calls} == expected_recipients
 

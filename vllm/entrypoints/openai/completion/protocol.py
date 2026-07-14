@@ -182,7 +182,10 @@ class CompletionRequest(OpenAIBaseModel):
 
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None,
-        description="KVTransfer parameters used for disaggregated serving.",
+        description=(
+            "KV-transfer parameters for direct generation. Render-only "
+            "coordinators attach them to GenerateRequest after rendering."
+        ),
     )
 
     vllm_xargs: dict[str, str | int | float] | None = Field(

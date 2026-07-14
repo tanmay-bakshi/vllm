@@ -1,15 +1,21 @@
 # NIXL push-mode KV transfer
 
+!!! warning "Gemma 4 correctness scope"
+    The authoritative Gemma 4 F9 ownership work and campaign cover pull mode.
+    Push retains a separate completion contract and is not certified by a
+    clean pull result. Do not infer pull-mode child/rank authority,
+    cancellation quorum, or campaign coverage for push.
+
 The default NIXL connector is **pull-based**: the decode (D) instance
 reads KV blocks from the prefill (P) instance via `NIXL READ` after
 prefill completes. `NixlPushConnector` adds a **push-based** alternative
 in which P writes the KV blocks directly into D's pre-allocated memory
 via `NIXL WRITE`.
 
-This document describes the threading, queues, and scheduling
-interactions specific to the push design. The pull-mode design is
-unchanged; the push connector reuses the same handshake, NIXL agent
-setup, and metadata path wherever possible.
+This document describes the threading, queues, and scheduling interactions
+specific to the push design. The push connector shares handshake, NIXL agent,
+and metadata machinery with pull mode, but its completion and ownership
+contract is distinct.
 
 ## High-level flow
 
@@ -173,10 +179,17 @@ handshake (`remote_physical_blocks_per_logical`). This matches the
 pull-mode contract — schedulers ship logical ids, workers expand to
 physical at submission.
 
-The completion notif sent from P to D after a WRITE is the existing
-`<request_id>:<tp_size>` format used in pull mode (here ``request_id``
-is D's own request id, taken from the registration), so the D-side
-accounting code is unchanged.
+The completion notification sent from P to D after a WRITE uses the
+push-specific `<request_id>:<tp_size>` format. Here, ``request_id`` is D's own
+request ID from the registration.
+
+Pull mode no longer uses this legacy string as its release authority. Pull
+completion is a typed proof bound to producer and decoder request IDs, logical
+child index, decoder rank, decoder TP size, and `expected_consumers`. Pull
+source release waits for the exact producer-owned proof set or an exact
+pre-admission cancellation quorum. Push must be evaluated against the same
+ownership invariant before it can enter the Gemma F9 campaign's claim
+boundary.
 
 ## Scheduler-side responsibilities
 

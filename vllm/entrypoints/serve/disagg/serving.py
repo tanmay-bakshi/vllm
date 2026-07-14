@@ -7,13 +7,14 @@ import io
 import time
 from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
+from typing import Any
 
 import msgspec
 import numpy as np
 import pybase64 as base64
 from fastapi import Request
 
-from vllm.engine.protocol import EngineClient
+from vllm.engine.protocol import EngineClient, GenerationStream
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -26,7 +27,12 @@ from vllm.entrypoints.openai.engine.protocol import (
     RequestResponseMetadata,
     UsageInfo,
 )
-from vllm.entrypoints.openai.engine.serving import OpenAIServing, clamp_prompt_logprobs
+from vllm.entrypoints.openai.engine.serving import (
+    OpenAIServing,
+    _KVTransferAdmission,
+    _validate_kv_transfer_request_options,
+    clamp_prompt_logprobs,
+)
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.disagg.mm_serde import decode_mm_kwargs_item
 from vllm.entrypoints.serve.disagg.protocol import (
@@ -49,6 +55,7 @@ from vllm.multimodal.inputs import (
 from vllm.outputs import RequestOutput
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.utils.async_utils import ManagedAsyncIterator
 from vllm.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
@@ -101,7 +108,29 @@ class ServingTokens(OpenAIServing):
         self,
         request: GenerateRequest,
         raw_request: Request | None = None,
-    ) -> GenerateResponse | ErrorResponse | AsyncGenerator[str, None]:
+    ) -> GenerateResponse | ErrorResponse | ManagedAsyncIterator[str]:
+        kv_transfer_params = request.kv_transfer_params
+        admission = self._create_kv_transfer_admission(kv_transfer_params)
+        return await self._with_kv_transfer_rejection_cleanup(
+            self._serve_tokens(
+                request,
+                kv_transfer_params,
+                admission,
+                raw_request,
+            ),
+            request.request_id,
+            kv_transfer_params,
+            raw_request,
+            admission,
+        )
+
+    async def _serve_tokens(
+        self,
+        request: GenerateRequest,
+        kv_transfer_params: dict[str, Any] | None,
+        admission: _KVTransferAdmission,
+        raw_request: Request | None = None,
+    ) -> GenerateResponse | ErrorResponse | ManagedAsyncIterator[str]:
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -112,6 +141,15 @@ class ServingTokens(OpenAIServing):
         # success status before we actually start generating text :).
         if self.engine_client.errored:
             raise self.engine_client.dead_error
+
+        kv_transfer_error = _validate_kv_transfer_request_options(
+            kv_transfer_params,
+            use_beam_search=False,
+            stream=request.stream is True,
+            n=request.sampling_params.n,
+        )
+        if kv_transfer_error is not None:
+            return self.create_error_response(kv_transfer_error)
 
         lora_request = None
         lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
@@ -126,7 +164,23 @@ class ServingTokens(OpenAIServing):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
-        sampling_params = request.sampling_params
+        sampling_params = request.sampling_params.clone()
+        if (
+            sampling_params.extra_args is not None
+            and "kv_transfer_params" in sampling_params.extra_args
+        ):
+            return self.create_error_response(
+                "kv_transfer_params must be provided through the top-level "
+                "GenerateRequest field"
+            )
+        if kv_transfer_params is not None:
+            extra_args = (
+                {}
+                if sampling_params.extra_args is None
+                else dict(sampling_params.extra_args)
+            )
+            extra_args["kv_transfer_params"] = kv_transfer_params
+            sampling_params.extra_args = extra_args
         max_num_seqs = self.engine_client.vllm_config.scheduler_config.max_num_seqs
         if sampling_params.n > max_num_seqs:
             return self.create_error_response(
@@ -175,9 +229,6 @@ class ServingTokens(OpenAIServing):
                 skip_mm_cache=True,
             )
 
-        # Schedule the request and get the result generator.
-        result_generator: AsyncGenerator[RequestOutput, None] | None = None
-
         # Apply server-side ``max_tokens`` defaulting when the client did
         # not set it, matching the OpenAI-compat endpoints. ``SamplingParams``
         # defaults ``max_tokens`` to 16, which would otherwise silently cap
@@ -212,7 +263,7 @@ class ServingTokens(OpenAIServing):
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
 
-        result_generator = self.engine_client.generate(
+        result_generator = await self.engine_client.generate(
             engine_input,
             sampling_params,
             request_id,
@@ -220,40 +271,51 @@ class ServingTokens(OpenAIServing):
             trace_headers=trace_headers,
             priority=request.priority,
             data_parallel_rank=data_parallel_rank,
+            on_engine_admission=admission.callback,
         )
 
         assert result_generator is not None
 
         if request.stream:
-            return self.serve_tokens_stream_generator(
-                request,
-                result_generator,
-                request_id,
-                model_name,
-                request_metadata,
+            return ManagedAsyncIterator(
+                self.serve_tokens_stream_generator(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    request_id,
+                    model_name,
+                    request_metadata,
+                ),
+                (result_generator,),
             )
 
         return await self.serve_tokens_full_generator(
-            request, result_generator, request_id, model_name, request_metadata
+            request,
+            sampling_params,
+            result_generator,
+            request_id,
+            model_name,
+            request_metadata,
         )
 
     async def serve_tokens_full_generator(
         self,
         request: GenerateRequest,
-        result_generator: AsyncGenerator[RequestOutput, None],
+        sampling_params: SamplingParams,
+        result_generator: GenerationStream,
         request_id: str,
         model_name: str,
         request_metadata: RequestResponseMetadata,
     ) -> ErrorResponse | GenerateResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
-        sampling_params: SamplingParams = request.sampling_params
-
         try:
             async for res in result_generator:
                 final_res = res
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        finally:
+            await result_generator.aclose()
 
         assert final_res is not None
 
@@ -352,7 +414,8 @@ class ServingTokens(OpenAIServing):
     async def serve_tokens_stream_generator(
         self,
         request: GenerateRequest,
-        result_generator: AsyncGenerator[RequestOutput, None],
+        sampling_params: SamplingParams,
+        result_generator: GenerationStream,
         request_id: str,
         model_name: str,
         request_metadata: RequestResponseMetadata,
@@ -361,8 +424,6 @@ class ServingTokens(OpenAIServing):
         num_generated_tokens: list[int] = []
         first_iteration = True
         num_cached_tokens = None
-        sampling_params: SamplingParams = request.sampling_params
-
         include_usage, include_continuous_usage = should_include_usage(
             request.stream_options, False
         )

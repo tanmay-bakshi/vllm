@@ -4,7 +4,7 @@
 import asyncio
 import io
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import Any, Final, cast
@@ -13,7 +13,7 @@ import numpy as np
 import pybase64 as base64
 from fastapi import Request
 
-from vllm.engine.protocol import EngineClient
+from vllm.engine.protocol import EngineClient, GenerationStream
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
     ConversationMessage,
@@ -43,6 +43,8 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
+    _KVTransferAdmission,
+    _validate_kv_transfer_request_options,
     clamp_prompt_logprobs,
     format_token_id_placeholder,
 )
@@ -62,6 +64,7 @@ from vllm.renderers import ChatParams
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.utils.async_utils import ManagedAsyncIterator
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tool_parser
 
@@ -230,7 +233,7 @@ class OpenAIServingChat(OpenAIServing):
         self,
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
-    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+    ) -> ManagedAsyncIterator[str] | ChatCompletionResponse | ErrorResponse:
         """
         Chat Completion API similar to OpenAI's API.
 
@@ -238,15 +241,30 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
+        admission = self._create_kv_transfer_admission(request.kv_transfer_params)
         return await self._with_kv_transfer_rejection_cleanup(
-            self._create_chat_completion(request, raw_request), request, raw_request
+            self._create_chat_completion(request, admission, raw_request),
+            request.request_id,
+            request.kv_transfer_params,
+            raw_request,
+            admission,
         )
 
     async def _create_chat_completion(
         self,
         request: ChatCompletionRequest,
+        admission: _KVTransferAdmission,
         raw_request: Request | None = None,
-    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+    ) -> ManagedAsyncIterator[str] | ChatCompletionResponse | ErrorResponse:
+        kv_transfer_error = _validate_kv_transfer_request_options(
+            request.kv_transfer_params,
+            use_beam_search=request.use_beam_search,
+            stream=request.stream,
+            n=request.n if request.n is not None else 1,
+        )
+        if kv_transfer_error is not None:
+            return self.create_error_response(kv_transfer_error)
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -264,6 +282,20 @@ class OpenAIServingChat(OpenAIServing):
             return result
 
         conversation, engine_inputs = result
+        if (
+            request.kv_transfer_params is not None
+            and request.kv_transfer_params.get("do_remote_prefill") is True
+            and len(engine_inputs) != 1
+        ):
+            return self.create_error_response(
+                "A remote-prefill offer requires exactly one chat prompt"
+            )
+        if len(engine_inputs) != 1:
+            return self.create_error_response(
+                "Chat completion rendering did not produce exactly one prompt",
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
         request_id = (
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
@@ -282,7 +314,7 @@ class OpenAIServingChat(OpenAIServing):
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
-        generators: list[AsyncGenerator[RequestOutput, None]] = []
+        generators: list[GenerationStream | AsyncGenerator[RequestOutput, None]] = []
         mm_token_counts: dict[str, int] | None = None
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
@@ -350,7 +382,7 @@ class OpenAIServingChat(OpenAIServing):
                 else:
                     reasoning_ended = None
 
-                generator = self.engine_client.generate(
+                generator = await self.engine_client.generate(
                     engine_input,
                     sampling_params,
                     sub_request_id,
@@ -364,6 +396,7 @@ class OpenAIServingChat(OpenAIServing):
                     }
                     if parser is not None and parser.reasoning_parser is not None
                     else None,
+                    on_engine_admission=admission.callback,
                 )
 
             generators.append(generator)
@@ -372,16 +405,19 @@ class OpenAIServingChat(OpenAIServing):
         (result_generator,) = generators
 
         if request.stream:
-            return self.chat_completion_stream_generator(
-                request,
-                result_generator,
-                request_id,
-                model_name,
-                conversation,
-                tokenizer,
-                request_metadata,
-                chat_template_kwargs=chat_template_kwargs,
-                mm_token_counts=mm_token_counts,
+            return ManagedAsyncIterator(
+                self.chat_completion_stream_generator(
+                    request,
+                    result_generator,
+                    request_id,
+                    model_name,
+                    conversation,
+                    tokenizer,
+                    request_metadata,
+                    chat_template_kwargs=chat_template_kwargs,
+                    mm_token_counts=mm_token_counts,
+                ),
+                (result_generator,),
             )
 
         return await self.chat_completion_full_generator(
@@ -404,7 +440,7 @@ class OpenAIServingChat(OpenAIServing):
     async def chat_completion_stream_generator(
         self,
         request: ChatCompletionRequest,
-        result_generator: AsyncIterator[RequestOutput],
+        result_generator: GenerationStream | AsyncGenerator[RequestOutput, None],
         request_id: str,
         model_name: str,
         conversation: list[ConversationMessage],
@@ -798,13 +834,15 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        finally:
+            await result_generator.aclose()
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
 
     async def chat_completion_full_generator(
         self,
         request: ChatCompletionRequest,
-        result_generator: AsyncIterator[RequestOutput],
+        result_generator: GenerationStream | AsyncGenerator[RequestOutput, None],
         request_id: str,
         model_name: str,
         conversation: list[ConversationMessage],
@@ -821,6 +859,8 @@ class OpenAIServingChat(OpenAIServing):
                 final_res = res
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        finally:
+            await result_generator.aclose()
 
         if final_res is None:
             return self.create_error_response(

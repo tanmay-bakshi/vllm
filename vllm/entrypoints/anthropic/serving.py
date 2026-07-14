@@ -49,6 +49,7 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.utils.api_utils import sanitize_message
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.renderers.online_renderer import OnlineRenderer
+from vllm.utils.async_utils import ManagedAsyncIterator
 
 logger = logging.getLogger(__name__)
 
@@ -591,7 +592,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         self,
         request: AnthropicMessagesRequest,
         raw_request: Request | None = None,
-    ) -> AsyncGenerator[str, None] | AnthropicMessagesResponse | ErrorResponse:
+    ) -> ManagedAsyncIterator[str] | AnthropicMessagesResponse | ErrorResponse:
         """
         Messages API similar to Anthropic's API.
 
@@ -614,7 +615,10 @@ class AnthropicServingMessages(OpenAIServingChat):
         elif isinstance(generator, ChatCompletionResponse):
             return self.messages_full_converter(generator)
 
-        return self.message_stream_converter(generator)
+        return ManagedAsyncIterator(
+            self.message_stream_converter(generator),
+            (generator,),
+        )
 
     def messages_full_converter(
         self,
@@ -677,7 +681,7 @@ class AnthropicServingMessages(OpenAIServingChat):
 
     async def message_stream_converter(
         self,
-        generator: AsyncGenerator[str, None],
+        generator: ManagedAsyncIterator[str],
     ) -> AsyncGenerator[str, None]:
         try:
 

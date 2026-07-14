@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash as _, Hasher as _};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,10 +12,11 @@ use tokio::task::yield_now;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use vllm_engine_core_client::protocol::utility::{
-    EngineCoreUtilityRequest, UtilityOutput, UtilityResultEnvelope,
+    EngineCoreUtilityRequest, UtilityCallId, UtilityOutput, UtilityResultEnvelope,
 };
 use vllm_engine_core_client::protocol::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
+    EngineCoreRequestBatchHeader,
 };
 
 use super::Opt;
@@ -109,9 +110,38 @@ fn utility_response(
     })
 }
 
+/// Produce the acknowledgement for one atomic request batch.
+fn batch_admission_response(
+    engine_index: u32,
+    call_id: UtilityCallId,
+    failure_message: Option<String>,
+) -> EngineCoreOutputs {
+    let result = failure_message
+        .is_none()
+        .then(|| UtilityResultEnvelope::without_type_info(Value::Nil));
+    EngineCoreOutputs {
+        engine_index,
+        utility_output: Some(UtilityOutput {
+            call_id,
+            failure_message,
+            result,
+        }),
+        timestamp: now_secs(),
+        ..Default::default()
+    }
+}
+
 /// Message sent from the frontend to the mock engine task to drive the engine loop.
 pub(crate) enum EngineInput {
     Request(Box<EngineCoreRequest>),
+    RequestBatch {
+        header: EngineCoreRequestBatchHeader,
+        requests: Vec<EngineCoreRequest>,
+    },
+    RequestBatchDecodeFailed {
+        header: EngineCoreRequestBatchHeader,
+        failure_message: String,
+    },
     Abort(Vec<String>),
     Utility(EngineCoreUtilityRequest),
     StartDpWave,
@@ -206,45 +236,124 @@ struct Engine {
 }
 
 impl Engine {
+    /// Validate every ownership invariant before mutating batch state.
+    fn validate_request_batch(
+        &self,
+        client_index: u32,
+        requests: &[EngineCoreRequest],
+    ) -> std::result::Result<(), String> {
+        if requests.is_empty() {
+            return Err("request batch must not be empty".to_string());
+        }
+
+        let mut request_ids = HashSet::with_capacity(requests.len());
+        for request in requests {
+            if request.client_index != client_index {
+                return Err(format!(
+                    "request {} has client index {}, expected {}",
+                    request.request_id, request.client_index, client_index
+                ));
+            }
+            if !request_ids.insert(request.request_id.as_str()) {
+                return Err(format!(
+                    "request batch contains duplicate request id {}",
+                    request.request_id
+                ));
+            }
+            if self.active_requests.contains_key(&request.request_id) {
+                return Err(format!(
+                    "request batch aliases active request {}",
+                    request.request_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Admit one already-validated request and return any immediate terminal output.
+    fn handle_request(&mut self, request: Box<EngineCoreRequest>) -> Option<EngineOutput> {
+        let request_id = request.request_id.clone();
+        let client_index = request.client_index;
+
+        if self.active_requests.contains_key(&request_id) {
+            warn!(
+                engine_index = self.engine_index,
+                request_id, "duplicate mock request id"
+            );
+            return Some(EngineOutput {
+                client_index,
+                outputs: empty_finish_outputs(
+                    self.engine_index,
+                    request_id,
+                    EngineCoreFinishReason::Error,
+                ),
+            });
+        }
+
+        match ActiveRequest::new(self.engine_index, request, &self.opt) {
+            Ok(request) => {
+                self.active_requests.insert(request_id, request);
+                None
+            }
+            Err(finish_reason) => Some(EngineOutput {
+                client_index,
+                outputs: empty_finish_outputs(self.engine_index, request_id, finish_reason),
+            }),
+        }
+    }
+
     /// Drain one frontend request message received on the input DEALER socket.
     fn handle_input(&mut self, input: EngineInput) -> Result<Vec<EngineOutput>> {
         let mut outputs = Vec::new();
 
         match input {
             EngineInput::Request(request) => {
-                let request_id = request.request_id.clone();
-                let client_index = request.client_index;
+                if let Some(output) = self.handle_request(request) {
+                    outputs.push(output);
+                }
+            }
 
-                if self.active_requests.contains_key(&request_id) {
-                    warn!(
-                        engine_index = self.engine_index,
-                        request_id, "duplicate mock request id"
-                    );
-                    return Ok(vec![EngineOutput {
-                        client_index,
-                        outputs: empty_finish_outputs(
+            EngineInput::RequestBatch { header, requests } => {
+                if let Err(failure_message) =
+                    self.validate_request_batch(header.client_index, &requests)
+                {
+                    outputs.push(EngineOutput {
+                        client_index: header.client_index,
+                        outputs: batch_admission_response(
                             self.engine_index,
-                            request_id,
-                            EngineCoreFinishReason::Error,
+                            header.call_id,
+                            Some(failure_message),
                         ),
-                    }]);
+                    });
+                    return Ok(outputs);
                 }
 
-                match ActiveRequest::new(self.engine_index, request, &self.opt) {
-                    Ok(request) => {
-                        self.active_requests.insert(request_id, request);
-                    }
-                    Err(finish_reason) => {
-                        return Ok(vec![EngineOutput {
-                            client_index,
-                            outputs: empty_finish_outputs(
-                                self.engine_index,
-                                request_id,
-                                finish_reason,
-                            ),
-                        }]);
+                let mut immediate_outputs = Vec::new();
+                for request in requests {
+                    if let Some(output) = self.handle_request(Box::new(request)) {
+                        immediate_outputs.push(output);
                     }
                 }
+
+                outputs.push(EngineOutput {
+                    client_index: header.client_index,
+                    outputs: batch_admission_response(self.engine_index, header.call_id, None),
+                });
+                outputs.extend(immediate_outputs);
+            }
+
+            EngineInput::RequestBatchDecodeFailed {
+                header,
+                failure_message,
+            } => {
+                outputs.push(EngineOutput {
+                    client_index: header.client_index,
+                    outputs: batch_admission_response(
+                        self.engine_index,
+                        header.call_id,
+                        Some(failure_message),
+                    ),
+                });
             }
 
             EngineInput::Abort(request_ids) => {
@@ -413,4 +522,136 @@ pub(crate) async fn run_engine_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vllm_engine_core_client::protocol::EngineCoreSamplingParams;
+
+    fn test_engine() -> Engine {
+        Engine {
+            engine_index: 0,
+            opt: Opt {
+                handshake_address: "unused".to_string(),
+                engine_count: 1,
+                output_token_chunk_size: 1,
+                vocab_size: 32_000,
+                seed: 0,
+                log_requests: false,
+            },
+            active_requests: HashMap::new(),
+        }
+    }
+
+    fn request(request_id: &str, client_index: u32, max_tokens: u32) -> EngineCoreRequest {
+        EngineCoreRequest {
+            request_id: request_id.to_string(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            sampling_params: Some(EngineCoreSamplingParams {
+                max_tokens,
+                ..EngineCoreSamplingParams::for_test()
+            }),
+            client_index,
+            ..EngineCoreRequest::default()
+        }
+    }
+
+    fn header(call_id: u64) -> EngineCoreRequestBatchHeader {
+        EngineCoreRequestBatchHeader {
+            client_index: 7,
+            call_id: call_id.into(),
+        }
+    }
+
+    #[test]
+    fn accepted_batch_ack_precedes_ordered_immediate_outputs() {
+        let mut engine = test_engine();
+        let outputs = engine
+            .handle_input(EngineInput::RequestBatch {
+                header: header(42),
+                requests: vec![request("req-1", 7, 0), request("req-2", 7, 0)],
+            })
+            .unwrap();
+
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0].client_index, 7);
+        let acknowledgement = outputs[0].outputs.utility_output.clone().unwrap();
+        assert_eq!(acknowledgement.call_id, 42);
+        acknowledgement.into_typed_result::<()>("add_batch").unwrap();
+        assert_eq!(outputs[1].outputs.outputs[0].request_id, "req-1");
+        assert_eq!(outputs[2].outputs.outputs[0].request_id, "req-2");
+    }
+
+    #[test]
+    fn later_batch_validation_failure_admits_no_requests() {
+        let mut engine = test_engine();
+        engine
+            .handle_input(EngineInput::Request(Box::new(request("active", 7, 4))))
+            .unwrap();
+
+        let outputs = engine
+            .handle_input(EngineInput::RequestBatch {
+                header: header(43),
+                requests: vec![request("must-not-admit", 7, 4), request("active", 7, 4)],
+            })
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        let acknowledgement = outputs[0].outputs.utility_output.as_ref().unwrap();
+        assert_eq!(acknowledgement.call_id, 43);
+        assert!(
+            acknowledgement
+                .failure_message
+                .as_deref()
+                .unwrap()
+                .contains("aliases active request active")
+        );
+        assert_eq!(engine.active_requests.len(), 1);
+        assert!(engine.active_requests.contains_key("active"));
+        assert!(!engine.active_requests.contains_key("must-not-admit"));
+    }
+
+    #[test]
+    fn batch_rejects_mismatched_child_client_index() {
+        let mut engine = test_engine();
+        let outputs = engine
+            .handle_input(EngineInput::RequestBatch {
+                header: header(44),
+                requests: vec![request("wrong-client", 8, 4)],
+            })
+            .unwrap();
+
+        let acknowledgement = outputs[0].outputs.utility_output.as_ref().unwrap();
+        assert!(
+            acknowledgement
+                .failure_message
+                .as_deref()
+                .unwrap()
+                .contains("has client index 8, expected 7")
+        );
+        assert!(engine.active_requests.is_empty());
+    }
+
+    #[test]
+    fn batch_payload_decode_failure_is_correlated_and_admits_nothing() {
+        let mut engine = test_engine();
+        let outputs = engine
+            .handle_input(EngineInput::RequestBatchDecodeFailed {
+                header: header(45),
+                failure_message: "malformed request vector".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].client_index, 7);
+        let acknowledgement = outputs[0].outputs.utility_output.as_ref().unwrap();
+        assert_eq!(acknowledgement.call_id, 45);
+        assert_eq!(
+            acknowledgement.failure_message.as_deref(),
+            Some("malformed request vector")
+        );
+        assert!(acknowledgement.result.is_none());
+        assert!(engine.active_requests.is_empty());
+    }
 }

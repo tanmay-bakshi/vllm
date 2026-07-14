@@ -4,6 +4,7 @@ import asyncio
 import io
 import math
 import time
+import traceback
 import zlib
 from collections.abc import AsyncGenerator, Callable, Set
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +16,7 @@ from fastapi import Request
 from transformers import PreTrainedTokenizerBase
 
 import vllm.envs as envs
-from vllm.engine.protocol import EngineClient
+from vllm.engine.protocol import EngineClient, GenerationStream
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     ErrorResponse,
@@ -39,7 +40,11 @@ from vllm.renderers.inputs import DictPrompt, EncoderDecoderDictPrompt
 from vllm.renderers.inputs.preprocess import parse_enc_dec_prompt, parse_model_prompt
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import get_tokenizer
-from vllm.utils.async_utils import make_async_with_semaphore, merge_async_iterators
+from vllm.utils.async_utils import (
+    ManagedAsyncIterator,
+    make_async_with_semaphore,
+    merge_async_iterators,
+)
 
 from ..transcription.protocol import (
     TranscriptionResponse,
@@ -61,6 +66,9 @@ SpeechToTextResponseVerbose: TypeAlias = (
     TranscriptionResponseVerbose | TranslationResponseVerbose
 )
 SpeechToTextSegment: TypeAlias = TranscriptionSegment | TranslationSegment
+SpeechGenerationStream: TypeAlias = (
+    AsyncGenerator[RequestOutput, None] | GenerationStream
+)
 T = TypeVar("T", bound=SpeechToTextResponse)
 V = TypeVar("V", bound=SpeechToTextResponseVerbose)
 S = TypeVar("S", bound=SpeechToTextSegment)
@@ -223,23 +231,22 @@ class OpenAISpeechToText(OpenAIServing):
             allowed_token_ids=allowed_token_ids,
         )
 
-        result_generator = self.engine_client.generate(
+        result_generator = await self.engine_client.generate(
             prompt,
             sampling_params,
             request_id,
         )
 
+        final_output: RequestOutput | None = None
         try:
-            final_output: RequestOutput
             async for final_output in result_generator:
                 if final_output.finished:
                     break
-        except asyncio.CancelledError:
-            await asyncio.gather(
-                self.engine_client.abort(request_id),
-                return_exceptions=True,
-            )
-            raise
+        finally:
+            await result_generator.aclose()
+
+        if final_output is None:
+            raise RuntimeError("Language detection completed without an output")
 
         token_ids = list(final_output.outputs[0].token_ids)
         lang = self.model_cls.parse_language_detection_output(
@@ -417,7 +424,7 @@ class OpenAISpeechToText(OpenAIServing):
         raw_request: Request,
         response_class: type[ResponseType],
         stream_generator_method: Callable[..., AsyncGenerator[str, None]],
-    ) -> T | V | AsyncGenerator[str, None] | ErrorResponse:
+    ) -> T | V | ManagedAsyncIterator[str] | ErrorResponse:
         """Base method for speech-to-text operations like transcription and
         translation."""
         if request.stream and request.use_beam_search:
@@ -470,9 +477,7 @@ class OpenAISpeechToText(OpenAIServing):
             request_id=request_id,
         )
 
-        # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
-        list_result_generator: list[AsyncGenerator[RequestOutput, None]] | None = None
 
         input_len = (
             OpenAISpeechToText._get_decoder_prompt_len(engine_inputs)
@@ -508,72 +513,106 @@ class OpenAISpeechToText(OpenAIServing):
             request_id if len(engine_inputs) == 1 else f"{request_id}-{idx}"
             for idx in range(len(engine_inputs))
         ]
-        list_result_generator = []
-        try:
-            for request_id_item, engine_input in zip(engine_request_ids, engine_inputs):
-                self._log_inputs(
-                    request_id_item,
-                    engine_input,
+        trace_headers = (
+            None
+            if raw_request is None
+            else await self._get_trace_headers(raw_request.headers)
+        )
+        for request_id_item, engine_input in zip(engine_request_ids, engine_inputs):
+            self._log_inputs(
+                request_id_item,
+                engine_input,
+                params=sampling_params,
+                lora_request=lora_request,
+            )
+
+        result_generators: list[SpeechGenerationStream]
+        if isinstance(sampling_params, BeamSearchParams):
+            result_generators = [
+                self.beam_search(
+                    prompt=engine_input,
                     params=sampling_params,
+                    request_id=request_id_item,
                     lora_request=lora_request,
+                    trace_headers=trace_headers,
                 )
-
-                trace_headers = (
-                    None
-                    if raw_request is None
-                    else await self._get_trace_headers(raw_request.headers)
+                for request_id_item, engine_input in zip(
+                    engine_request_ids, engine_inputs
                 )
-
-                if isinstance(sampling_params, BeamSearchParams):
-                    generator = self.beam_search(
-                        prompt=engine_input,
-                        params=sampling_params,
-                        request_id=request_id_item,
-                        lora_request=lora_request,
-                        trace_headers=trace_headers,
-                    )
-                else:
-                    generator = self.engine_client.generate(
+            ]
+        elif len(engine_inputs) == 1:
+            result_generators = [
+                await self.engine_client.generate(
+                    engine_inputs[0],
+                    sampling_params,
+                    engine_request_ids[0],
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                )
+            ]
+        else:
+            generation_tasks = [
+                asyncio.create_task(
+                    self.engine_client.generate(
                         engine_input,
                         sampling_params,
                         request_id_item,
                         lora_request=lora_request,
                         trace_headers=trace_headers,
                     )
-
-                list_result_generator.append(generator)
-        except asyncio.CancelledError:
-            logger.info(
-                "Request %s cancelled; aborting %d transcription engine request(s).",
-                request_id,
-                len(engine_request_ids),
-            )
-            await asyncio.gather(
-                self.engine_client.abort(engine_request_ids),
-                return_exceptions=True,
-            )
-            raise
+                )
+                for request_id_item, engine_input in zip(
+                    engine_request_ids, engine_inputs
+                )
+            ]
+            try:
+                result_generators = await asyncio.gather(*generation_tasks)
+            except BaseException as exc:
+                admission_traceback = traceback.format_exc()
+                for task in generation_tasks:
+                    task.cancel()
+                start_results = await asyncio.gather(
+                    *generation_tasks,
+                    return_exceptions=True,
+                )
+                admitted_streams = [
+                    result
+                    for result in start_results
+                    if isinstance(result, GenerationStream)
+                ]
+                await asyncio.gather(
+                    *(stream.aclose() for stream in admitted_streams),
+                    return_exceptions=True,
+                )
+                if not isinstance(exc, asyncio.CancelledError):
+                    logger.error(
+                        "Failed while admitting transcription chunks\n%s",
+                        admission_traceback,
+                    )
+                raise
 
         separator = asr_inter_chunk_separator(
             request.language, self.model_cls.no_space_languages
         )
 
         if request.stream:
-            return stream_generator_method(
-                request,
-                list_result_generator,
-                request_id,
-                request_metadata,
-                duration_s,
-                separator,
+            return ManagedAsyncIterator(
+                stream_generator_method(
+                    request,
+                    result_generators,
+                    request_id,
+                    request_metadata,
+                    duration_s,
+                    separator,
+                ),
+                tuple(result_generators),
             )
-        # Non-streaming response.
+
         try:
-            assert list_result_generator is not None
             chunk_segment_parts: list[list[SpeechToTextSegment]] = [
-                [] for _ in list_result_generator
+                [] for _ in result_generators
             ]
-            chunk_text_parts: list[list[str]] = [[] for _ in list_result_generator]
+            chunk_text_parts: list[list[str]] = [[] for _ in result_generators]
             segments_types: dict[str, type[SpeechToTextSegment]] = {
                 "transcribe": TranscriptionSegment,
                 "translate": TranslationSegment,
@@ -581,10 +620,10 @@ class OpenAISpeechToText(OpenAIServing):
             segment_class: type[SpeechToTextSegment] = segments_types[self.task_type]
             chunk_size_in_s = self.asr_config.max_audio_clip_s
             if chunk_size_in_s is None:
-                assert len(list_result_generator) == 1, (
+                assert len(result_generators) == 1, (
                     "`max_audio_clip_s` is set to None, audio cannot be chunked"
                 )
-            result_generator = merge_async_iterators(*list_result_generator)
+            result_generator = merge_async_iterators(*result_generators)
             async for idx, op in result_generator:
                 start_time = (
                     float(idx * chunk_size_in_s) if chunk_size_in_s is not None else 0.0
@@ -615,10 +654,8 @@ class OpenAISpeechToText(OpenAIServing):
             text = separator.join(text_parts)
             if self.task_type == "transcribe":
                 final_response: ResponseType
-                # add usage in TranscriptionResponse.
                 usage = {
                     "type": "duration",
-                    # rounded up as per openAI specs
                     "seconds": int(math.ceil(duration_s)),
                 }
                 if request.response_format != "verbose_json":
@@ -635,20 +672,18 @@ class OpenAISpeechToText(OpenAIServing):
                             segments=total_segments,
                         ),
                     )
+            elif request.response_format != "verbose_json":
+                final_response = cast(T, TranslationResponse(text=text))
             else:
-                # no usage in response for translation task
-                if request.response_format != "verbose_json":
-                    final_response = cast(T, TranslationResponse(text=text))
-                else:
-                    final_response = cast(
-                        V,
-                        TranslationResponseVerbose(
-                            text=text,
-                            language=request.language,
-                            duration=str(duration_s),
-                            segments=total_segments,
-                        ),
-                    )
+                final_response = cast(
+                    V,
+                    TranslationResponseVerbose(
+                        text=text,
+                        language=request.language,
+                        duration=str(duration_s),
+                        segments=total_segments,
+                    ),
+                )
             return final_response
         except asyncio.CancelledError:
             logger.info(
@@ -665,7 +700,7 @@ class OpenAISpeechToText(OpenAIServing):
     async def _speech_to_text_stream_generator(
         self,
         request: SpeechToTextRequest,
-        list_result_generator: list[AsyncGenerator[RequestOutput, None]],
+        list_result_generator: list[SpeechGenerationStream],
         request_id: str,
         request_metadata: RequestResponseMetadata,
         audio_duration_s: float,

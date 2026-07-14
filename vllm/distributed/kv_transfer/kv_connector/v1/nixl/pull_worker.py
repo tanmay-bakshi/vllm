@@ -6,25 +6,31 @@ import os
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 import numpy as np
+import zmq
 
 from vllm.distributed.kv_transfer.integrity import IntegrityIdentity
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    PULL_OFFER_CANCELLATION_CONTROL_PREFIX,
     PULL_READ_COMPLETE_PREFIX,
     NixlConnectorMetadata,
     ProducerLease,
+    PullOfferCancellationAck,
+    PullOfferCancellationControl,
+    PullOfferCancelled,
     PullReadComplete,
     ReqMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
 from vllm.distributed.kv_transfer.nixl_localization import (
     LocalizationError,
     NixlEventRecord,
@@ -35,6 +41,7 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     validate_source_contract_structure,
 )
 from vllm.logger import init_logger
+from vllm.utils.network_utils import make_zmq_path
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -43,22 +50,45 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _MAX_BUFFERED_PULL_COMPLETIONS_PER_REQUEST = 65_536
+_MAX_CANCELLED_REMOTE_OFFERS = 65_536
+_OFFER_CANCELLATION_TIMEOUT_MS = 1_000
+PullContractTerminalMode = Literal["read_complete", "offer_cancelled"]
 
 
 @dataclass
 class PullCompletionState:
-    """Exact decoder read obligations for one producer-side lease.
+    """Exact terminal-proof obligations for one producer-side lease.
 
     :ivar expected_consumers: Logical parallel-sampling consumer count.
     :ivar consumer_tp_size: Decoder tensor-parallel size.
-    :ivar expected_acknowledgements: Exact child/rank proofs required locally.
-    :ivar acknowledgements: Valid proofs observed so far.
+    :ivar expected_read_completions: Exact child/rank read proofs required locally.
+    :ivar expected_offer_cancellations: Exact decoder-rank cancellation proofs.
+    :ivar read_completions: Valid child/rank read proofs observed so far.
+    :ivar offer_cancellations: Valid whole-offer cancellation proofs observed.
+    :ivar has_mixed_terminal_proofs: Whether both terminal modes were observed.
     """
 
     expected_consumers: int
     consumer_tp_size: int
-    expected_acknowledgements: frozenset[tuple[int, int]]
-    acknowledgements: set[tuple[int, int]] = field(default_factory=set)
+    expected_read_completions: frozenset[tuple[int, int]]
+    expected_offer_cancellations: frozenset[int]
+    read_completions: set[tuple[int, int]] = field(default_factory=set)
+    offer_cancellations: set[int] = field(default_factory=set)
+    has_mixed_terminal_proofs: bool = False
+
+
+@dataclass(frozen=True)
+class CompletedPullContract:
+    """A released producer contract retained for idempotency checks.
+
+    :ivar expected_consumers: Logical parallel-sampling consumer count.
+    :ivar consumer_tp_size: Decoder tensor-parallel size.
+    :ivar terminal_mode: Proof mode that authorized the release.
+    """
+
+    expected_consumers: int
+    consumer_tp_size: int
+    terminal_mode: PullContractTerminalMode
 
 
 def _parallel_consumer_index(request_id: str, expected_consumers: int) -> int:
@@ -129,7 +159,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         super().__init__(vllm_config, engine_id, kv_cache_config)
         self._pull_completion_states: dict[str, PullCompletionState] = {}
         self._buffered_pull_completions: dict[str, set[PullReadComplete]] = {}
-        self._completed_pull_contracts: dict[str, tuple[int, int]] = {}
+        self._buffered_offer_cancellations: dict[str, set[PullOfferCancelled]] = {}
+        self._pending_offer_cancellations: list[PullOfferCancelled] = []
+        self._completed_pull_contracts: dict[str, CompletedPullContract] = {}
+        self._cancelled_remote_offers: set[tuple[str, str]] = set()
         if self._phase_separate_transfer_decode and not self.coalesce_pull:
             raise ValueError("phase_separate_transfer_decode requires coalesced pull")
         if self._phase_separate_transfer_decode and not self._no_stock_dma():
@@ -192,6 +225,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         for req_id in metadata.reqs_not_processed:
             self._reqs_to_process.discard(req_id)
             self._buffered_pull_completions.pop(req_id, None)
+            self._buffered_offer_cancellations.pop(req_id, None)
             pre_read_plan = self._localization_pre_read_plans.get(req_id)
             producer_engine_id: str | None = None
             producer_request_id: str | None = None
@@ -218,6 +252,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 self._install_pull_completion_state(req_id, lease)
                 self._reqs_to_send[req_id] = lease.deadline
 
+        self._pending_offer_cancellations.extend(
+            metadata.offer_cancellations_by_rank.get(self.tp_rank, ())
+        )
+
         self._drain_transfer_phase()
         self._localization_capture_pre_read(metadata.scheduled_request_ids)
         self._record_transfer_decode_boundary()
@@ -239,17 +277,19 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             self.world_size,
             lease.consumer_tp_size,
         )
-        obligations = frozenset(
+        read_completions = frozenset(
             (consumer_index, consumer_rank)
             for consumer_index in range(lease.expected_consumers)
             for consumer_rank in consumer_ranks
         )
+        offer_cancellations = frozenset(consumer_ranks)
         existing = self._pull_completion_states.get(request_id)
         if existing is not None:
             if (
                 existing.expected_consumers != lease.expected_consumers
                 or existing.consumer_tp_size != lease.consumer_tp_size
-                or existing.expected_acknowledgements != obligations
+                or existing.expected_read_completions != read_completions
+                or existing.expected_offer_cancellations != offer_cancellations
             ):
                 raise RuntimeError(
                     f"request {request_id} changed its producer completion contract"
@@ -258,11 +298,292 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         self._pull_completion_states[request_id] = PullCompletionState(
             expected_consumers=lease.expected_consumers,
             consumer_tp_size=lease.consumer_tp_size,
-            expected_acknowledgements=obligations,
+            expected_read_completions=read_completions,
+            expected_offer_cancellations=offer_cancellations,
         )
 
-    def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
-        assert meta.remote is not None and self.transfer_topo is not None
+    def request_rejected_before_admission(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        """Cancel a producer offer that this decoder never admitted.
+
+        The serving request identifier and reason are local diagnostics. The
+        producer receives only an exact rank proof over its immutable offer.
+
+        :param request_id: Decoder serving request rejected before admission.
+        :param kv_transfer_params: Producer-authored transfer contract.
+        :param reason: Local rejection reason.
+        :returns: Whether the producer control plane accepted the proof.
+        """
+        try:
+            (
+                producer_engine_id,
+                producer_request_id,
+                producer_host,
+                producer_port,
+                expected_consumers,
+                target_ranks,
+            ) = self._offer_cancellation_contract(kv_transfer_params)
+        except ValueError:
+            logger.error(
+                "Cannot cancel rejected request %s because its producer offer "
+                "contract is invalid\n%s",
+                request_id,
+                traceback.format_exc(),
+            )
+            return False
+
+        active_children = self._active_children_for_offer(
+            producer_engine_id,
+            producer_request_id,
+        )
+        has_completed_read = (
+            producer_request_id in self._rid_completion_counts
+            or producer_request_id in self._released_rids
+        )
+        if len(active_children) > 0 or has_completed_read:
+            logger.error(
+                "Refusing whole-offer cancellation for rejected request %s: "
+                "producer offer %s/%s has decoder read state (active=%s, "
+                "completed=%s)",
+                request_id,
+                producer_engine_id,
+                producer_request_id,
+                active_children,
+                has_completed_read,
+            )
+            return False
+
+        proof = PullOfferCancelled(
+            producer_request_id=producer_request_id,
+            consumer_rank=self.tp_rank,
+            consumer_tp_size=self.world_size,
+            expected_consumers=expected_consumers,
+        )
+        if self._fence_remote_offer(producer_engine_id, producer_request_id) is False:
+            return False
+        logger.info(
+            "Cancelling producer offer %s/%s after pre-admission rejection of "
+            "decoder request %s: %s",
+            producer_engine_id,
+            producer_request_id,
+            request_id,
+            reason,
+        )
+
+        return self._send_offer_cancellation_control(
+            proof,
+            producer_engine_id,
+            producer_host,
+            producer_port,
+            target_ranks,
+        )
+
+    def _offer_cancellation_contract(
+        self,
+        params: dict[str, Any],
+    ) -> tuple[str, str, str, int, int, tuple[int, ...]]:
+        """Validate and materialize one producer offer cancellation contract.
+
+        :param params: Producer-authored transfer parameters.
+        :returns: Producer address, immutable contract, and local target ranks.
+        :raises ValueError: If the offer cannot be cancelled exactly.
+        """
+        if params.get("do_remote_prefill") is not True:
+            raise ValueError("request is not an unconsumed remote-prefill offer")
+        producer_engine_id = params.get("remote_engine_id")
+        producer_request_id = params.get("remote_request_id")
+        producer_host = params.get("remote_host")
+        producer_port = params.get("remote_port")
+        producer_tp_size = params.get("tp_size")
+        expected_consumers = params.get("expected_consumers")
+        consumer_tp_size = params.get("consumer_tp_size")
+        for field_name, value in (
+            ("remote_engine_id", producer_engine_id),
+            ("remote_request_id", producer_request_id),
+            ("remote_host", producer_host),
+        ):
+            if type(value) is not str or len(value) == 0:
+                raise ValueError(f"{field_name} must be a non-empty string")
+        if type(producer_port) is not int or producer_port < 1:
+            raise ValueError("remote_port must be a positive integer")
+        if type(producer_tp_size) is not int or producer_tp_size < 1:
+            raise ValueError("tp_size must be a positive integer")
+        if type(expected_consumers) is not int or expected_consumers < 1:
+            raise ValueError("expected_consumers must be a positive integer")
+        if type(consumer_tp_size) is not int or consumer_tp_size < 1:
+            raise ValueError("consumer_tp_size must be a positive integer")
+        if consumer_tp_size != self.world_size:
+            raise ValueError(
+                "producer consumer_tp_size differs from the local decoder topology"
+            )
+        if self.tp_rank < 0 or self.tp_rank >= self.world_size:
+            raise ValueError("local decoder rank is outside its topology")
+
+        target_ranks = tuple(
+            producer_rank
+            for producer_rank in range(producer_tp_size)
+            if self.tp_rank
+            in _consumer_ranks_for_producer(
+                producer_rank,
+                producer_tp_size,
+                self.world_size,
+            )
+        )
+        if len(target_ranks) == 0:
+            raise ValueError("decoder rank has no producer cancellation target")
+        assert isinstance(producer_engine_id, str)
+        assert isinstance(producer_request_id, str)
+        assert isinstance(producer_host, str)
+        assert isinstance(producer_port, int)
+        assert isinstance(producer_tp_size, int)
+        assert isinstance(expected_consumers, int)
+        return (
+            producer_engine_id,
+            producer_request_id,
+            producer_host,
+            producer_port,
+            expected_consumers,
+            target_ranks,
+        )
+
+    def _active_children_for_offer(
+        self,
+        producer_engine_id: str,
+        producer_request_id: str,
+    ) -> tuple[str, ...]:
+        """Return every admitted or in-flight child for a producer offer.
+
+        :param producer_engine_id: Producer engine identity.
+        :param producer_request_id: Producer request identity.
+        :returns: Matching decoder child identifiers.
+        """
+        return tuple(
+            child_request_id
+            for child_request_id, meta in self._recving_metadata.items()
+            if meta.remote is not None
+            and meta.remote.engine_id == producer_engine_id
+            and meta.remote.request_id == producer_request_id
+        )
+
+    def _fence_remote_offer(
+        self,
+        producer_engine_id: str,
+        producer_request_id: str,
+    ) -> bool:
+        """Fence a cancelled offer against every later decoder read.
+
+        :param producer_engine_id: Producer engine identity.
+        :param producer_request_id: Producer request identity.
+        :returns: Whether the permanent local fence is installed.
+        """
+        key = (producer_engine_id, producer_request_id)
+        if key in self._cancelled_remote_offers:
+            return True
+        if len(self._cancelled_remote_offers) >= _MAX_CANCELLED_REMOTE_OFFERS:
+            logger.error(
+                "Cannot cancel producer offer %s/%s because the permanent local "
+                "fence table is full; producer source pages remain pinned",
+                producer_engine_id,
+                producer_request_id,
+            )
+            return False
+        self._cancelled_remote_offers.add(key)
+        return True
+
+    def _send_offer_cancellation_control(
+        self,
+        proof: PullOfferCancelled,
+        producer_engine_id: str,
+        producer_host: str,
+        producer_port: int,
+        producer_ranks: tuple[int, ...],
+    ) -> bool:
+        """Queue a cancellation proof through the producer control plane.
+
+        :param proof: Typed whole-offer cancellation proof.
+        :param producer_engine_id: Producer engine identity.
+        :param producer_host: Producer side-channel host.
+        :param producer_port: Producer side-channel port.
+        :param producer_ranks: Exact producer ranks covered by this proof.
+        :returns: Whether the complete proof was atomically queued.
+        """
+        control = PullOfferCancellationControl(
+            producer_ranks=producer_ranks,
+            proof=proof,
+        )
+        message = PULL_OFFER_CANCELLATION_CONTROL_PREFIX + msgspec.msgpack.encode(
+            control
+        )
+        path = make_zmq_path("tcp", producer_host, producer_port)
+        try:
+            with zmq_ctx(zmq.REQ, path) as socket:
+                socket.setsockopt(zmq.IMMEDIATE, 1)
+                socket.setsockopt(zmq.SNDTIMEO, _OFFER_CANCELLATION_TIMEOUT_MS)
+                socket.setsockopt(zmq.RCVTIMEO, _OFFER_CANCELLATION_TIMEOUT_MS)
+                socket.send(message)
+                response = socket.recv()
+        except zmq.ZMQError as error:
+            stacktrace = traceback.format_exc()
+            self._log_failure(
+                failure_type="offer_cancellation_control_failed",
+                req_id=None,
+                error=error,
+                remote_engine_id=producer_engine_id,
+                remote_request_id=proof.producer_request_id,
+                remote_host=producer_host,
+                remote_port=producer_port,
+                stacktrace=stacktrace,
+            )
+            self.xfer_stats.record_failed_notification()
+            return False
+
+        try:
+            ack = msgspec.msgpack.decode(response, type=PullOfferCancellationAck)
+        except (msgspec.DecodeError, msgspec.ValidationError):
+            logger.error(
+                "Producer %s returned a malformed cancellation acknowledgement for "
+                "offer %s; source pages remain pinned\n%s",
+                producer_engine_id,
+                proof.producer_request_id,
+                traceback.format_exc(),
+            )
+            self.xfer_stats.record_failed_notification()
+            return False
+
+        if (
+            ack.producer_request_id != proof.producer_request_id
+            or ack.producer_ranks != producer_ranks
+            or ack.accepted is False
+        ):
+            logger.error(
+                "Producer %s rejected cancellation control for offer %s and "
+                "ranks %s; source pages remain pinned",
+                producer_engine_id,
+                proof.producer_request_id,
+                producer_ranks,
+            )
+            self.xfer_stats.record_failed_notification()
+            return False
+        return True
+
+    def _read_blocks_for_req(self, req_id: str, meta: ReqMeta) -> None:
+        assert meta.remote is not None
+        remote_offer = (meta.remote.engine_id, meta.remote.request_id)
+        if remote_offer in self._cancelled_remote_offers:
+            logger.error(
+                "Refusing pull for %s because producer offer %s/%s was "
+                "cancelled before admission",
+                req_id,
+                meta.remote.engine_id,
+                meta.remote.request_id,
+            )
+            self._handle_failed_transfer(req_id, None)
+            return
+        assert self.transfer_topo is not None
         localization_enabled = self._localization_config.enabled_for(req_id)
         engine_id = meta.remote.engine_id
         try:
@@ -1402,19 +1723,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         self._recving_transfers.setdefault(request_id, [])
 
     def _get_new_notifs(self) -> set[str]:
-        """Apply heartbeats and exact decoder read-completion proofs.
+        """Apply heartbeats and exact decoder terminal proofs.
 
         :returns: Producer requests whose complete immutable obligation set
             has been satisfied.
         """
         notified_req_ids: set[str] = set()
-        for req_id in tuple(self._buffered_pull_completions):
-            if req_id not in self._pull_completion_states:
-                continue
-            proofs = self._buffered_pull_completions.pop(req_id)
-            for proof in proofs:
-                if self._record_pull_completion(proof, allow_buffer=False):
-                    notified_req_ids.add(req_id)
+        read_proofs: list[PullReadComplete] = []
+        cancellation_proofs: list[PullOfferCancelled] = (
+            self._pending_offer_cancellations
+        )
+        self._pending_offer_cancellations = []
 
         for notifs in self.nixl_wrapper.get_new_notifs().values():
             for notif in notifs:
@@ -1426,23 +1745,46 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         continue
                     self._handle_heartbeat(heartbeat_payload)
                     continue
-                if notif.startswith(PULL_READ_COMPLETE_PREFIX) is False:
-                    logger.error("Ignoring unknown NIXL pull notification")
+                if notif.startswith(PULL_READ_COMPLETE_PREFIX):
+                    try:
+                        read_proofs.append(
+                            msgspec.msgpack.decode(
+                                notif[len(PULL_READ_COMPLETE_PREFIX) :],
+                                type=PullReadComplete,
+                            )
+                        )
+                    except (msgspec.DecodeError, msgspec.ValidationError):
+                        logger.error(
+                            "Ignoring malformed NIXL pull completion proof\n%s",
+                            traceback.format_exc(),
+                        )
                     continue
-                try:
-                    proof = msgspec.msgpack.decode(
-                        notif[len(PULL_READ_COMPLETE_PREFIX) :],
-                        type=PullReadComplete,
-                    )
-                except (msgspec.DecodeError, msgspec.ValidationError):
-                    logger.error(
-                        "Ignoring malformed NIXL pull completion proof\n%s",
-                        traceback.format_exc(),
-                    )
-                    continue
+                logger.error("Ignoring unknown NIXL pull notification")
 
-                if self._record_pull_completion(proof, allow_buffer=True):
-                    notified_req_ids.add(proof.producer_request_id)
+        for req_id in tuple(self._buffered_pull_completions):
+            if req_id not in self._pull_completion_states:
+                continue
+            read_proofs.extend(self._buffered_pull_completions.pop(req_id))
+        for req_id in tuple(self._buffered_offer_cancellations):
+            if req_id not in self._pull_completion_states:
+                continue
+            cancellation_proofs.extend(self._buffered_offer_cancellations.pop(req_id))
+
+        read_request_ids = {proof.producer_request_id for proof in read_proofs}
+        cancellation_request_ids = {
+            proof.producer_request_id for proof in cancellation_proofs
+        }
+        for req_id in read_request_ids.intersection(cancellation_request_ids):
+            state = self._pull_completion_states.get(req_id)
+            if state is not None:
+                self._mark_pull_contract_conflicted(req_id, state)
+
+        for proof in read_proofs:
+            if self._record_pull_completion(proof, allow_buffer=True):
+                notified_req_ids.add(proof.producer_request_id)
+        for proof in cancellation_proofs:
+            if self._record_offer_cancellation(proof, allow_buffer=True):
+                notified_req_ids.add(proof.producer_request_id)
         return notified_req_ids
 
     def _record_pull_completion(
@@ -1464,7 +1806,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             completed_contract = self._completed_pull_contracts.get(req_id)
             if completed_contract is not None:
                 try:
-                    self._completion_identity(proof, *completed_contract)
+                    self._completion_identity(
+                        proof,
+                        completed_contract.expected_consumers,
+                        completed_contract.consumer_tp_size,
+                    )
                 except ValueError:
                     logger.error(
                         "Conflicting duplicate completion proof for released "
@@ -1472,6 +1818,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         req_id,
                         traceback.format_exc(),
                     )
+                else:
+                    if completed_contract.terminal_mode == "offer_cancelled":
+                        logger.error(
+                            "Read proof arrived after cancellation released producer "
+                            "request %s; decoder protocol invariants were violated",
+                            req_id,
+                        )
                 return False
             if allow_buffer and req_id in self._reqs_to_process:
                 pending = self._buffered_pull_completions.setdefault(req_id, set())
@@ -1502,28 +1855,198 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
         except ValueError:
             logger.error(
-                "Ignoring conflicting completion proof for producer request "
-                "%s\n%s",
+                "Ignoring conflicting completion proof for producer request %s\n%s",
                 req_id,
                 traceback.format_exc(),
             )
             return False
-        if identity not in state.expected_acknowledgements:
+        if identity not in state.expected_read_completions:
             logger.error(
                 "Ignoring completion proof %s outside producer request %s obligations",
                 identity,
                 req_id,
             )
             return False
-        state.acknowledgements.add(identity)
-        if state.acknowledgements != state.expected_acknowledgements:
+        if len(state.offer_cancellations) > 0:
+            self._mark_pull_contract_conflicted(req_id, state)
+        state.read_completions.add(identity)
+        if (
+            state.has_mixed_terminal_proofs
+            or state.read_completions != state.expected_read_completions
+        ):
+            return False
+        return self._complete_pull_contract(req_id, state, "read_complete")
+
+    def _record_offer_cancellation(
+        self,
+        proof: PullOfferCancelled,
+        *,
+        allow_buffer: bool,
+    ) -> bool:
+        """Apply one whole-offer proof or retain it for its contract.
+
+        :param proof: Decoder-rank proof that no consumer was admitted.
+        :param allow_buffer: Whether an owned pre-contract request may retain
+            this proof for a later worker step.
+        :returns: Whether the exact cancellation quorum released the offer.
+        """
+        req_id = proof.producer_request_id
+        state = self._pull_completion_states.get(req_id)
+        if state is None:
+            completed_contract = self._completed_pull_contracts.get(req_id)
+            if completed_contract is not None:
+                try:
+                    consumer_rank = self._offer_cancellation_rank(
+                        proof,
+                        completed_contract.expected_consumers,
+                        completed_contract.consumer_tp_size,
+                    )
+                    expected_ranks = frozenset(
+                        _consumer_ranks_for_producer(
+                            self.tp_rank,
+                            self.world_size,
+                            completed_contract.consumer_tp_size,
+                        )
+                    )
+                    if consumer_rank not in expected_ranks:
+                        raise ValueError(
+                            "decoder rank is outside this producer's obligations"
+                        )
+                except ValueError:
+                    logger.error(
+                        "Conflicting duplicate cancellation proof for released "
+                        "producer request %s\n%s",
+                        req_id,
+                        traceback.format_exc(),
+                    )
+                else:
+                    if completed_contract.terminal_mode == "read_complete":
+                        logger.error(
+                            "Cancellation proof arrived after reads released producer "
+                            "request %s; decoder protocol invariants were violated",
+                            req_id,
+                        )
+                return False
+            if allow_buffer and req_id in self._reqs_to_process:
+                pending = self._buffered_offer_cancellations.setdefault(req_id, set())
+                if (
+                    proof not in pending
+                    and len(pending) >= _MAX_BUFFERED_PULL_COMPLETIONS_PER_REQUEST
+                ):
+                    logger.error(
+                        "Ignoring excess pre-contract cancellation proof for producer "
+                        "request %s; source pages remain pinned",
+                        req_id,
+                    )
+                    return False
+                pending.add(proof)
+                return False
+            logger.error(
+                "A decode worker cancelled an unowned producer request %s; "
+                "no source ownership was released",
+                req_id,
+            )
             return False
 
-        self._localization_capture_source_post(req_id)
+        try:
+            consumer_rank = self._offer_cancellation_rank(
+                proof,
+                state.expected_consumers,
+                state.consumer_tp_size,
+            )
+        except ValueError:
+            logger.error(
+                "Ignoring conflicting cancellation proof for producer request %s\n%s",
+                req_id,
+                traceback.format_exc(),
+            )
+            return False
+        if consumer_rank not in state.expected_offer_cancellations:
+            logger.error(
+                "Ignoring cancellation proof from decoder rank %d outside producer "
+                "request %s obligations",
+                consumer_rank,
+                req_id,
+            )
+            return False
+        if len(state.read_completions) > 0:
+            self._mark_pull_contract_conflicted(req_id, state)
+        state.offer_cancellations.add(consumer_rank)
+        if (
+            state.has_mixed_terminal_proofs
+            or state.offer_cancellations != state.expected_offer_cancellations
+        ):
+            return False
+        return self._complete_pull_contract(req_id, state, "offer_cancelled")
+
+    def _offer_cancellation_rank(
+        self,
+        proof: PullOfferCancelled,
+        expected_consumers: int,
+        consumer_tp_size: int,
+    ) -> int:
+        """Validate a cancellation proof against an immutable contract.
+
+        :param proof: Decoder-authored whole-offer cancellation proof.
+        :param expected_consumers: Producer-owned logical consumer count.
+        :param consumer_tp_size: Producer-owned decoder TP size.
+        :returns: Decoder rank making the cancellation assertion.
+        :raises ValueError: If any consumer claim conflicts with the contract.
+        """
+        if proof.expected_consumers != expected_consumers:
+            raise ValueError("decoder logical consumer count changed")
+        if proof.consumer_tp_size != consumer_tp_size:
+            raise ValueError("decoder tensor-parallel size changed")
+        if proof.consumer_rank < 0 or proof.consumer_rank >= consumer_tp_size:
+            raise ValueError("decoder tensor-parallel rank is outside its world")
+        return proof.consumer_rank
+
+    def _mark_pull_contract_conflicted(
+        self,
+        req_id: str,
+        state: PullCompletionState,
+    ) -> None:
+        """Permanently pin a contract that received both terminal modes.
+
+        :param req_id: Producer request identifier.
+        :param state: Active producer completion contract.
+        """
+        if state.has_mixed_terminal_proofs is False:
+            logger.error(
+                "Producer request %s received both read and whole-offer "
+                "cancellation proofs; source pages remain pinned",
+                req_id,
+            )
+        state.has_mixed_terminal_proofs = True
+
+    def _complete_pull_contract(
+        self,
+        req_id: str,
+        state: PullCompletionState,
+        terminal_mode: PullContractTerminalMode,
+    ) -> bool:
+        """Release a producer lease after one exact terminal proof set.
+
+        :param req_id: Producer request identifier.
+        :param state: Satisfied immutable producer contract.
+        :param terminal_mode: Proof mode authorizing release.
+        :returns: Always true after the release is committed.
+        :raises RuntimeError: If worker ownership state is inconsistent.
+        """
+        if req_id not in self._reqs_to_process:
+            raise RuntimeError(
+                f"producer request {req_id} completed without an ownership pin"
+            )
+        if terminal_mode == "read_complete":
+            self._localization_capture_source_post(req_id)
+        else:
+            self._localization_source_rosters.pop(req_id, None)
+
         del self._pull_completion_states[req_id]
-        self._completed_pull_contracts[req_id] = (
-            state.expected_consumers,
-            state.consumer_tp_size,
+        self._completed_pull_contracts[req_id] = CompletedPullContract(
+            expected_consumers=state.expected_consumers,
+            consumer_tp_size=state.consumer_tp_size,
+            terminal_mode=terminal_mode,
         )
         if len(self._completed_pull_contracts) > 8192:
             for completed_req_id in list(self._completed_pull_contracts)[:2048]:
@@ -1569,4 +2092,4 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         state = self._pull_completion_states.get(req_id)
         if state is None:
             return 0
-        return len(state.acknowledgements)
+        return len(state.read_completions) + len(state.offer_cancellations)

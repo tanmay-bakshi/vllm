@@ -80,11 +80,17 @@ class ServingRender(BaseServing):
         self,
         request: ChatCompletionRequest,
     ) -> GenerateRequest | ErrorResponse:
-        """Validate the model and preprocess a chat completion request.
+        """Validate and preprocess a chat completion request.
 
-        This is the authoritative implementation used directly by the
-        GPU-less render server and delegated to by OpenAIServingChat.
+        The render server does not own KV-transfer resources. Coordinators
+        attach KV-transfer metadata to the returned ``GenerateRequest`` after
+        rendering.
         """
+        if request.kv_transfer_params is not None:
+            return self.create_error_response(
+                "kv_transfer_params must be attached to GenerateRequest after rendering"
+            )
+
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -168,19 +174,30 @@ class ServingRender(BaseServing):
         self,
         request: CompletionRequest,
     ) -> list[GenerateRequest] | ErrorResponse:
-        """Validate the model and preprocess a completion request.
+        """Validate and preprocess a completion request.
 
-        This is the authoritative implementation used directly by the
-        GPU-less render server and delegated to by OpenAIServingCompletion.
+        The render server does not own KV-transfer resources. Coordinators
+        attach KV-transfer metadata to the returned ``GenerateRequest`` after
+        rendering.
         """
+        if request.kv_transfer_params is not None:
+            return self.create_error_response(
+                "kv_transfer_params must be attached to GenerateRequest after rendering"
+            )
+
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             return error_check_ret
+        if request.use_beam_search:
+            return self.create_error_response(
+                "Beam search is not supported by the render endpoint"
+            )
         result = await self.online_renderer.render_completion(
             request, skip_mm_cache=True
         )
         if isinstance(result, ErrorResponse):
             return result
+
         generate_requests: list[GenerateRequest] = []
         for engine_input in result:
             prompt_components = extract_prompt_components(

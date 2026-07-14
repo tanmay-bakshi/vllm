@@ -16,12 +16,14 @@ reuse.
 A producer request remains in `_reqs_to_process` while any consumer may still
 read its block roster. The scheduler releases the request's pages only after the
 worker reports it in `finished_sending`, which requires the entire exact
-completion-proof set for that producer rank.
+terminal-proof set for that producer rank: either all child/rank read
+completions or the decoder-rank cancellation quorum.
 
-The producer owns the completion contract. It records both the number of
-logical decoder children (the original request's `n`) and the decoder
-tensor-parallel size before offering any blocks. Each producer rank derives its
-immutable proof set as the Cartesian product of:
+The producer owns the completion contract. Under the required serving
+contract, the producer leg has an effective `n` of one. Before offering blocks,
+the coordinator supplies a positive `expected_consumers` count for the logical
+decoder children and the decoder tensor-parallel size. Each producer rank
+derives its immutable proof set as the Cartesian product of:
 
 - every logical child index; and
 - every decoder rank that can address that producer rank under the configured
@@ -32,20 +34,52 @@ group of decoder ranks. When producer TP is larger, each producer rank owns the
 single decoder rank to which it maps. The TP sizes must divide evenly in either
 direction.
 
-The producer lifecycle is:
+Producer source ownership and decoder admission ownership are linked but
+concurrent state machines. The producer owns its source pages before the offer
+is returned to serving. Decoder serving ownership determines which component
+may choose the offer's terminal path; it does not own the producer pages.
+
+## Producer source lifecycle
 
 1. **Owned with a deadline.** The request is present in `_reqs_to_process` and
-   `_reqs_to_send`. Heartbeats may extend its deadline.
+   `_reqs_to_send` before the offer leaves the producer. Heartbeats may extend
+   its deadline.
 2. **Overdue but owned.** The deadline elapsed, so `_reqs_to_send` is removed
-   and the overdue metric is recorded once. `_reqs_to_process`, the partial
-   proof set, source rosters, and KV pages remain intact.
-3. **Completed.** Every exact child/rank obligation has a valid proof. The
-   worker removes `_reqs_to_process`, reports `finished_sending`, and the
+   and the overdue metric is recorded once. `_reqs_to_process`, partial
+   terminal proofs, source rosters, and KV pages remain intact.
+3. **Read-completed.** Every exact child/rank read obligation has a valid
+   completion proof.
+4. **Cancelled before decoder admission.** Every expected decoder rank has
+   supplied one typed whole-offer cancellation proof and no rank has reported
+   read ownership.
+5. **Released.** Exactly one valid terminal proof set is complete:
+   all child/rank read completions or the decoder-rank cancellation quorum.
+   The worker removes `_reqs_to_process`, reports `finished_sending`, and the
    scheduler may reuse the pages.
 
-This state machine fails closed. A dead or unreachable consumer can retain
-capacity, but it cannot turn a stale block address into apparently successful
-inference.
+Mixed, missing, or conflicting terminal modes retain producer ownership. A
+dead or unreachable consumer can retain capacity, but it cannot turn a stale
+block address into apparently successful inference.
+
+## Decoder admission ownership
+
+1. **Serving-owned offer.** The coordinator attaches one producer offer after
+   rendering. EngineCore has not acknowledged scheduler commit, so serving
+   owns the decision to admit or reject it.
+2. **Pre-admission rejection.** Every D worker verifies that it has no local
+   read state and queues a typed whole-offer cancellation proof to the exact
+   producer rank. The synchronous acknowledgement proves the cancellation was
+   queued, not that producer pages were already released.
+3. **EngineCore-owned offer.** EngineCore validates and atomically commits
+   every decoder child, then acknowledges admission. Scheduler and connector
+   cleanup are EngineCore-owned from this point. Serving must not submit
+   pre-admission cleanup after acknowledgement.
+
+Producer workers consume queued cancellation proofs during connector
+maintenance and release asynchronously only after observing the exact
+decoder-rank quorum. Once any decoder read state exists, cancellation is
+refused and only the exact child/rank read-completion set can release the
+source.
 
 ## Decoder ownership tracking
 
@@ -87,9 +121,10 @@ to overdue retention and waits for completion proof.
 
 ## Completion and release
 
-The producer returns its logical-child count and decoder TP size with the block
-offer. A decoder must match that contract to its local TP world and derive its
-stable child index from the decoder request lineage before it can read.
+The producer returns `expected_consumers` and decoder TP size with the block
+offer. A decoder must match that contract to its local TP world, require its
+effective `n` to equal `expected_consumers`, and derive each stable child index
+from decoder request lineage before it can read.
 
 Each completion notification is a typed proof containing the producer and
 decoder request IDs, child index, decoder rank, decoder TP size, and logical
@@ -118,6 +153,32 @@ require a request-scoped revoke followed by an acknowledgement that queued and
 in-flight reads are quiescent. Freeing after an unacknowledged notification or
 a fixed grace period does not satisfy the ownership invariant.
 
+## Pull request-shape boundary
+
+The intended pull contract is:
+
+| Leg | Required contract |
+| --- | --- |
+| Producer with `do_remote_decode` | effective `n=1` and non-streaming |
+| Consumer with `do_remote_prefill` | effective `n` equals positive `expected_consumers`; streaming is allowed |
+| Any KV request with beam search | rejected before ownership transfer |
+| Completion KV request with prompt fanout | rejected before ownership transfer |
+| Standalone render endpoint with KV metadata | rejected; the coordinator attaches one contract after singleton rendering |
+
+Chat Completions, Completions, and the disaggregated Generate API enforce the
+directional sampling rules above. Standalone render rejects direct KV metadata
+and beam search. Enforcement is not complete in the current dirty candidate:
+
+- the Responses API does not call the directional validator;
+- a KV dictionary is not required to contain exactly one of
+  `do_remote_decode` and `do_remote_prefill`;
+- completion derender warns and drops mismatched response contracts instead of
+  failing closed.
+
+These are release blockers recorded in the active Gemma 4 handoff. Until they
+are fixed, the table is the required contract rather than a claim that every
+frontend enforces it. Multi-prompt KV accounting is unsupported.
+
 ## Failure behavior
 
 If a decoder, router, or network path disappears before completion, producer
@@ -126,9 +187,15 @@ consumer path and recycle or repair the affected service instance. Restarting an
 instance destroys its allocator and transport session together, so no surviving
 consumer can retain a valid address into that old allocation.
 
-Bidirectional transfer follows the same rule. `decoder_kv_blocks_ttl` supplies a
-liveness deadline for decoder-resident pages, but an elapsed deadline alone does
-not authorize reuse while a later prefiller may still hold their block roster.
+Bidirectional transfer follows the same no-timeout-release invariant.
+`decoder_kv_blocks_ttl` supplies a liveness deadline for decoder-resident pages,
+but an elapsed deadline alone does not authorize reuse while a later prefiller
+may still hold their block roster.
+
+The exact typed child/rank completion and cancellation contract in this
+document describes pull mode. The push connector has a separate wire and
+accounting protocol. Push is outside the Gemma F9 evidence boundary until it is
+upgraded and tested against the same ownership guarantees.
 
 ## Configuration
 

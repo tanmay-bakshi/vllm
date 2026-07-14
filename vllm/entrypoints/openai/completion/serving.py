@@ -4,7 +4,7 @@
 import asyncio
 import io
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
 from typing import cast
 
@@ -12,7 +12,7 @@ import numpy as np
 import pybase64 as base64
 from fastapi import Request
 
-from vllm.engine.protocol import EngineClient
+from vllm.engine.protocol import EngineClient, GenerationStream
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionLogProbs,
     CompletionRequest,
@@ -30,6 +30,8 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
+    _KVTransferAdmission,
+    _validate_kv_transfer_request_options,
     clamp_prompt_logprobs,
     format_token_id_placeholder,
 )
@@ -44,7 +46,7 @@ from vllm.outputs import RequestOutput
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
-from vllm.utils.async_utils import merge_async_iterators
+from vllm.utils.async_utils import ManagedAsyncIterator, merge_async_iterators
 from vllm.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
@@ -110,7 +112,7 @@ class OpenAIServingCompletion(OpenAIServing):
         self,
         request: CompletionRequest,
         raw_request: Request | None = None,
-    ) -> AsyncGenerator[str, None] | CompletionResponse | ErrorResponse:
+    ) -> ManagedAsyncIterator[str] | CompletionResponse | ErrorResponse:
         """Completion API similar to OpenAI's API.
 
         See https://platform.openai.com/docs/api-reference/completions/create
@@ -120,15 +122,30 @@ class OpenAIServingCompletion(OpenAIServing):
             - suffix (the language models we currently support do not support
             suffix)
         """
+        admission = self._create_kv_transfer_admission(request.kv_transfer_params)
         return await self._with_kv_transfer_rejection_cleanup(
-            self._create_completion(request, raw_request), request, raw_request
+            self._create_completion(request, admission, raw_request),
+            request.request_id,
+            request.kv_transfer_params,
+            raw_request,
+            admission,
         )
 
     async def _create_completion(
         self,
         request: CompletionRequest,
+        admission: _KVTransferAdmission,
         raw_request: Request | None = None,
-    ) -> AsyncGenerator[str, None] | CompletionResponse | ErrorResponse:
+    ) -> ManagedAsyncIterator[str] | CompletionResponse | ErrorResponse:
+        kv_transfer_error = _validate_kv_transfer_request_options(
+            request.kv_transfer_params,
+            use_beam_search=request.use_beam_search,
+            stream=request.stream,
+            n=request.n if request.n is not None else 1,
+        )
+        if kv_transfer_error is not None:
+            return self.create_error_response(kv_transfer_error)
+
         if request.stream and request.use_beam_search:
             return self.create_error_response(
                 "Streaming is not currently supported with beam search"
@@ -139,6 +156,10 @@ class OpenAIServingCompletion(OpenAIServing):
             return result
 
         engine_inputs = result
+        if request.kv_transfer_params is not None and len(engine_inputs) != 1:
+            return self.create_error_response(
+                "A KV-transfer request requires exactly one completion prompt"
+            )
 
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
         created_time = int(time.time())
@@ -154,7 +175,14 @@ class OpenAIServingCompletion(OpenAIServing):
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
-        generators: list[AsyncGenerator[RequestOutput, None]] = []
+        trace_headers = (
+            None
+            if raw_request is None
+            else await self._get_trace_headers(raw_request.headers)
+        )
+        generation_specs: list[
+            tuple[EngineInput, SamplingParams | BeamSearchParams, str]
+        ] = []
         for i, engine_input in enumerate(engine_inputs):
             max_tokens = get_max_tokens(
                 max_model_len,
@@ -185,14 +213,16 @@ class OpenAIServingCompletion(OpenAIServing):
                 lora_request=lora_request,
             )
 
-            trace_headers = (
-                None
-                if raw_request is None
-                else await self._get_trace_headers(raw_request.headers)
-            )
+            generation_specs.append((engine_input, sampling_params, request_id_item))
 
+        generators: list[
+            GenerationStream | AsyncGenerator[RequestOutput, None] | None
+        ] = [None] * len(generation_specs)
+        failures: list[BaseException] = []
+        if len(generation_specs) == 1:
+            engine_input, sampling_params, request_id_item = generation_specs[0]
             if isinstance(sampling_params, BeamSearchParams):
-                generator = self.beam_search(
+                generators[0] = self.beam_search(
                     prompt=engine_input,
                     request_id=request_id,
                     params=sampling_params,
@@ -200,7 +230,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     trace_headers=trace_headers,
                 )
             else:
-                generator = self.engine_client.generate(
+                generators[0] = await self.engine_client.generate(
                     engine_input,
                     sampling_params,
                     request_id_item,
@@ -208,9 +238,110 @@ class OpenAIServingCompletion(OpenAIServing):
                     trace_headers=trace_headers,
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
+                    on_engine_admission=admission.callback,
                 )
+        else:
+            generation_tasks: list[tuple[int, asyncio.Task[GenerationStream]]] = []
+            try:
+                for index, (
+                    engine_input,
+                    sampling_params,
+                    request_id_item,
+                ) in enumerate(generation_specs):
+                    if isinstance(sampling_params, BeamSearchParams):
+                        generators[index] = self.beam_search(
+                            prompt=engine_input,
+                            request_id=request_id,
+                            params=sampling_params,
+                            lora_request=lora_request,
+                            trace_headers=trace_headers,
+                        )
+                        continue
 
-            generators.append(generator)
+                    task = asyncio.create_task(
+                        self.engine_client.generate(
+                            engine_input,
+                            sampling_params,
+                            request_id_item,
+                            lora_request=lora_request,
+                            trace_headers=trace_headers,
+                            priority=request.priority,
+                            data_parallel_rank=data_parallel_rank,
+                            on_engine_admission=admission.callback,
+                        )
+                    )
+                    generation_tasks.append((index, task))
+            except Exception:
+                logger.exception("Failed while preparing completion admissions.")
+                for _, task in generation_tasks:
+                    task.cancel()
+                task_results = await asyncio.gather(
+                    *(task for _, task in generation_tasks),
+                    return_exceptions=True,
+                )
+                admitted = [
+                    generator for generator in generators if generator is not None
+                ]
+                admitted.extend(
+                    result
+                    for result in task_results
+                    if isinstance(result, GenerationStream)
+                )
+                await asyncio.gather(
+                    *(generator.aclose() for generator in admitted),
+                    return_exceptions=True,
+                )
+                raise
+
+            try:
+                task_results = await asyncio.gather(
+                    *(task for _, task in generation_tasks),
+                    return_exceptions=True,
+                )
+            except asyncio.CancelledError:
+                for _, task in generation_tasks:
+                    task.cancel()
+                task_results = await asyncio.gather(
+                    *(task for _, task in generation_tasks),
+                    return_exceptions=True,
+                )
+                admitted = [
+                    generator for generator in generators if generator is not None
+                ]
+                admitted.extend(
+                    result
+                    for result in task_results
+                    if isinstance(result, GenerationStream)
+                )
+                await asyncio.gather(
+                    *(generator.aclose() for generator in admitted),
+                    return_exceptions=True,
+                )
+                raise
+
+            for (index, _), result in zip(generation_tasks, task_results, strict=True):
+                if isinstance(result, BaseException):
+                    failures.append(result)
+                else:
+                    generators[index] = result
+
+        admitted_generators = [
+            generator for generator in generators if generator is not None
+        ]
+        if len(failures) > 0:
+            await asyncio.gather(
+                *(generator.aclose() for generator in admitted_generators),
+                return_exceptions=True,
+            )
+            raise failures[0]
+        if len(admitted_generators) != len(engine_inputs):
+            await asyncio.gather(
+                *(generator.aclose() for generator in admitted_generators),
+                return_exceptions=True,
+            )
+            raise RuntimeError("completion admission did not resolve every prompt")
+
+        generators = admitted_generators
 
         result_generator = merge_async_iterators(*generators)
 
@@ -221,16 +352,19 @@ class OpenAIServingCompletion(OpenAIServing):
         tokenizer = self.renderer.tokenizer
 
         if request.stream:
-            return self.completion_stream_generator(
-                request,
-                engine_inputs,
-                result_generator,
-                request_id,
-                created_time,
-                model_name,
-                num_prompts=num_prompts,
-                tokenizer=tokenizer,
-                request_metadata=request_metadata,
+            return ManagedAsyncIterator(
+                self.completion_stream_generator(
+                    request,
+                    engine_inputs,
+                    result_generator,
+                    request_id,
+                    created_time,
+                    model_name,
+                    num_prompts=num_prompts,
+                    tokenizer=tokenizer,
+                    request_metadata=request_metadata,
+                ),
+                tuple(generators),
             )
 
         # Non-streaming response
@@ -261,6 +395,8 @@ class OpenAIServingCompletion(OpenAIServing):
             )
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        finally:
+            await result_generator.aclose()
 
         # When user requests streaming but we don't stream, we still need to
         # return a streaming response with a single event.
@@ -271,7 +407,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 yield f"data: {response_json}\n\n"
                 yield "data: [DONE]\n\n"
 
-            return fake_stream_generator()
+            return ManagedAsyncIterator(fake_stream_generator(), ())
 
         return response
 
@@ -279,7 +415,7 @@ class OpenAIServingCompletion(OpenAIServing):
         self,
         request: CompletionRequest,
         engine_inputs: list[EngineInput],
-        result_generator: AsyncIterator[tuple[int, RequestOutput]],
+        result_generator: AsyncGenerator[tuple[int, RequestOutput], None],
         request_id: str,
         created_time: int,
         model_name: str,
@@ -470,6 +606,8 @@ class OpenAIServingCompletion(OpenAIServing):
             logger.exception("Error in completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        finally:
+            await result_generator.aclose()
         yield "data: [DONE]\n\n"
 
     def request_output_to_completion_response(

@@ -416,6 +416,21 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             c.on_new_request(request)
 
+    def request_rejected_before_admission(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        for connector in self._connectors:
+            if connector.request_rejected_before_admission(
+                request_id,
+                kv_transfer_params,
+                reason,
+            ):
+                return True
+        return False
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> MultiKVConnectorMetadata:

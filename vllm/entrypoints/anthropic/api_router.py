@@ -5,7 +5,7 @@
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from vllm.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -18,6 +18,7 @@ from vllm.entrypoints.anthropic.protocol import (
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.utils.api_utils import (
+    CloseableStreamingResponse,
     load_aware_call,
     sanitize_message,
     validate_json_request,
@@ -89,7 +90,7 @@ async def create_messages(request: AnthropicMessagesRequest, raw_request: Reques
         logger.debug("Anthropic Messages Response: %s", resp)
         return JSONResponse(content=resp)
 
-    return StreamingResponse(content=generator, media_type="text/event-stream")
+    return CloseableStreamingResponse(content=generator, media_type="text/event-stream")
 
 
 @router.post(

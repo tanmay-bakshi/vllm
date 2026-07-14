@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import queue
 import tempfile
 from collections import defaultdict
 from collections.abc import Callable
@@ -504,6 +505,10 @@ def make_nixl_scheduler(
     sched = object.__new__(NixlConnectorScheduler)
     sched._has_mamba = has_mamba
     sched._is_hma_required = is_hma_required
+    sched._parallel_pull_single_flight_enabled = True
+    sched._parallel_pull_publication_granularity = 16
+    sched._parallel_pull_flights = {}
+    sched._offer_cancellation_queue = queue.Queue()
 
     if heartbeat:
         sched._heartbeat_by_engine = {}
@@ -518,8 +523,6 @@ def make_nixl_scheduler(
         sched._reqs_not_processed = set()
         sched._reqs_need_save = {}
         sched._audit_finished_reqs = set()
-        sched._pull_single_flight = False
-        sched._pull_leaders = {}
         sched.use_host_buffer = False
         sched.engine_id = "test-engine"
         sched.side_channel_host = "localhost"
@@ -557,6 +560,7 @@ def make_nixl_push_scheduler(
     sched._reqs_in_batch = set()
     sched._reqs_not_processed = set()
     sched._reqs_need_save = {}
+    sched._offer_cancellation_queue = queue.Queue()
     sched._kv_lease_duration = 30
     sched.decoder_kv_blocks_ttl = decoder_kv_blocks_ttl
     sched.use_host_buffer = False

@@ -9,6 +9,10 @@ import torch.nn as nn
 
 import vllm.ir
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -98,6 +102,27 @@ class WorkerBase:
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
         raise NotImplementedError
+
+    def notify_kv_transfer_request_rejected(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        """Send connector control for an unconsumed remote-prefill offer.
+
+        :param request_id: Serving-layer request identifier.
+        :param kv_transfer_params: Immutable remote-prefill offer.
+        :param reason: Diagnostic rejection reason.
+        :returns: Whether the worker connector accepted the operation.
+        """
+        if has_kv_transfer_group() is False:
+            return False
+        return get_kv_transfer_group().request_rejected_before_admission(
+            request_id,
+            kv_transfer_params,
+            reason,
+        )
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Prepare model for execution through compilation/warmup.
