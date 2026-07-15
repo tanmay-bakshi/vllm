@@ -59,6 +59,9 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.dynamic.dflash_policy import (
+    DFlashAdaptiveVerificationPolicy,
+)
 from vllm.v1.spec_decode.dynamic.utils import (
     DynamicSDSchedule,
     build_dynamic_sd_schedule_lookup,
@@ -245,10 +248,16 @@ class Scheduler(SchedulerInterface):
 
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
+        self.use_dflash = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
         self.dynamic_sd_seq_len_schedule: DynamicSDSchedule | None = None
+        self.dflash_adaptive_verification_policy: (
+            DFlashAdaptiveVerificationPolicy | None
+        ) = None
+        self.dflash_drafter_max_model_len: int | None = None
+        self.dflash_drafter_query_len = 0
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -263,16 +272,33 @@ class Scheduler(SchedulerInterface):
                         field_name="num_speculative_tokens_per_seq_len",
                     )
                 )
+            if speculative_config.dflash_adaptive_verification is not None:
+                self.dflash_adaptive_verification_policy = (
+                    DFlashAdaptiveVerificationPolicy(
+                        speculative_config.dflash_adaptive_verification,
+                        max_batch_size=self.scheduler_config.max_num_seqs,
+                        max_sequence_length=self.max_model_len,
+                    )
+                )
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.use_dflash():
+                self.use_dflash = True
                 # DFlash requires an extra lookahead slot since it uses in-fill-style
                 # decoding instead of standard next-token sampling, so it has a query
                 # for the last sampled token plus queries for each draft token.
                 self.num_lookahead_tokens = self.num_spec_tokens + 1
+                self.dflash_drafter_query_len = self.num_lookahead_tokens
+                draft_model_config = speculative_config.draft_model_config
+                self.dflash_drafter_max_model_len = (
+                    draft_model_config.max_model_len
+                    if draft_model_config is not None
+                    and draft_model_config.max_model_len is not None
+                    else self.max_model_len
+                )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -415,24 +441,86 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = num_new_tokens // block_size * block_size
         return num_new_tokens
 
-    def _max_scheduled_decode_seq_len(
-        self, num_scheduled_tokens: dict[str, int]
-    ) -> int:
-        """Largest sequence length among decoding requests scheduled this step.
+    def _scheduled_decode_operating_point(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        decode_req_ids: set[str] | None = None,
+    ) -> tuple[int, int]:
+        """Return the decode batch size and longest scheduled sequence.
 
-        Prefill chunks are skipped since they do not run speculative decoding;
-        the result drives the sequence-length Dynamic SD schedule and is 0 when
-        no decoding request is scheduled.
+        When an explicit cohort is supplied, only those target-verification
+        rows define the operating point. Otherwise, every row that reaches its
+        sampling frontier is included, including a final prefill that will
+        produce a proposal after this target pass.
+
+        :param num_scheduled_tokens: Scheduled token count by request ID.
+        :param decode_req_ids: Explicit target-verification cohort, when known.
+        :returns: Decode-eligible request count and longest ending sequence.
         """
+        batch_size = 0
         max_seq_len = 0
         for req_id, scheduled in num_scheduled_tokens.items():
             request = self.requests[req_id]
-            if request.is_prefill_chunk:
+            if decode_req_ids is not None and req_id not in decode_req_ids:
                 continue
             seq_len = request.num_computed_tokens + scheduled
+            if decode_req_ids is None:
+                sampling_frontier = request.num_tokens + request.num_output_placeholders
+                if seq_len < sampling_frontier:
+                    continue
+            batch_size += 1
             if seq_len > max_seq_len:
                 max_seq_len = seq_len
-        return max_seq_len
+        return batch_size, max_seq_len
+
+    def _max_dflash_proposal_sequence_length(
+        self, num_scheduled_tokens: dict[str, int]
+    ) -> int:
+        """Return the longest row in DFlash's padded proposal batch.
+
+        DFlash retains every target row while constructing the drafter batch,
+        including incomplete prefill rows whose sampled outputs are discarded.
+        Its context-window guard must therefore cover every scheduled row.
+
+        :param num_scheduled_tokens: Scheduled token count by request ID.
+        :returns: Longest ending sequence in the actual drafter batch.
+        """
+        return max(
+            (
+                self.requests[req_id].num_computed_tokens + scheduled
+                for req_id, scheduled in num_scheduled_tokens.items()
+            ),
+            default=0,
+        )
+
+    @staticmethod
+    def _truncate_dflash_target_batch(
+        query_len: int,
+        num_scheduled_tokens: dict[str, int],
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+    ) -> int:
+        """Truncate an already scheduled DFlash batch to one target width.
+
+        :param query_len: Target query length retained for every decode row.
+        :param num_scheduled_tokens: Mutable scheduled token counts by request.
+        :param scheduled_spec_decode_tokens: Mutable draft prefixes by request.
+        :returns: Number of target tokens returned to the scheduling budget.
+        """
+        target_draft_len = query_len - 1
+        refunded_tokens = 0
+        for req_id, draft_token_ids in list(scheduled_spec_decode_tokens.items()):
+            if len(draft_token_ids) <= target_draft_len:
+                continue
+            refund = len(draft_token_ids) - target_draft_len
+            num_scheduled_tokens[req_id] -= refund
+            refunded_tokens += refund
+            if target_draft_len == 0:
+                del scheduled_spec_decode_tokens[req_id]
+            else:
+                scheduled_spec_decode_tokens[req_id] = draft_token_ids[
+                    :target_draft_len
+                ]
+        return refunded_tokens
 
     def schedule(
         self,
@@ -468,6 +556,9 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        dflash_padded_request_ids: set[str] = set()
+        dflash_cohort_req_ids: set[str] = set()
+        dflash_target_query_len: int | None = None
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
 
@@ -520,18 +611,74 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            dflash_decode_query_len: int | None = None
+            dflash_num_padding_tokens: int | None = None
+            if self.use_dflash and not request.is_prefill_chunk:
+                target_headroom = (
+                    self.max_model_len
+                    - request.num_computed_tokens
+                    - self.num_sampled_tokens_per_step
+                )
+                if len(request.spec_token_ids) > 0 and num_new_tokens > target_headroom:
+                    num_new_tokens = (
+                        request.num_tokens
+                        + request.num_output_placeholders
+                        - request.num_computed_tokens
+                    )
 
-            # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens,
-                self.max_model_len
-                - request.num_computed_tokens
-                - self.num_sampled_tokens_per_step,
-            )
+                if dflash_target_query_len is None:
+                    if (
+                        num_new_tokens > target_headroom
+                        or num_new_tokens > token_budget
+                    ):
+                        req_index += 1
+                        continue
+                    dflash_target_query_len = num_new_tokens
+                elif num_new_tokens > dflash_target_query_len:
+                    num_new_tokens = dflash_target_query_len
+                elif num_new_tokens < dflash_target_query_len:
+                    if (
+                        num_new_tokens == 1
+                        and dflash_target_query_len <= target_headroom
+                    ):
+                        dflash_num_padding_tokens = dflash_target_query_len - 1
+                        num_new_tokens = dflash_target_query_len
+                    else:
+                        token_budget += self._truncate_dflash_target_batch(
+                            num_new_tokens,
+                            num_scheduled_tokens,
+                            scheduled_spec_decode_tokens,
+                        )
+                        dflash_target_query_len = num_new_tokens
+
+                if (
+                    num_new_tokens != dflash_target_query_len
+                    or num_new_tokens > target_headroom
+                    or num_new_tokens > token_budget
+                ):
+                    req_index += 1
+                    continue
+                dflash_decode_query_len = num_new_tokens
+            else:
+                if (
+                    0
+                    < self.scheduler_config.long_prefill_token_threshold
+                    < num_new_tokens
+                ):
+                    num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+                num_new_tokens = min(num_new_tokens, token_budget)
+
+                # Make sure the input position does not exceed the max model len.
+                # This is necessary when using spec decoding.
+                num_new_tokens = min(
+                    num_new_tokens,
+                    self.max_model_len
+                    - request.num_computed_tokens
+                    - self.num_sampled_tokens_per_step,
+                )
+
+            if num_new_tokens < 0:
+                num_new_tokens = 0
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -555,6 +702,13 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
+
+            if (
+                dflash_decode_query_len is not None
+                and num_new_tokens != dflash_decode_query_len
+            ):
+                req_index += 1
+                continue
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -601,6 +755,10 @@ class Scheduler(SchedulerInterface):
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            dflash_cohort_req_ids.discard(preempted_req_id)
+                            dflash_padded_request_ids.discard(preempted_req_id)
+                            if len(dflash_cohort_req_ids) == 0:
+                                dflash_target_query_len = dflash_decode_query_len
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req_id, None
                             )
@@ -632,11 +790,18 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if dflash_decode_query_len is not None:
+                dflash_cohort_req_ids.add(request_id)
             token_budget -= num_new_tokens
             req_index += 1
 
             # Speculative decode related.
-            if request.spec_token_ids:
+            if dflash_num_padding_tokens is not None:
+                scheduled_spec_decode_tokens[request_id] = [-1] * (
+                    dflash_num_padding_tokens
+                )
+                dflash_padded_request_ids.add(request_id)
+            elif len(request.spec_token_ids) > 0:
                 num_scheduled_spec_tokens = (
                     num_new_tokens
                     + request.num_computed_tokens
@@ -835,6 +1000,7 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+                dflash_waiting_query_len: int | None = None
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -851,9 +1017,33 @@ class Scheduler(SchedulerInterface):
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
 
+                    if (
+                        self.use_dflash
+                        and num_new_tokens == 1
+                        and not prefill_scheduled
+                    ):
+                        if dflash_target_query_len is None:
+                            dflash_target_query_len = 1
+                        elif dflash_target_query_len > 1:
+                            if (
+                                num_computed_tokens + dflash_target_query_len
+                                > self.max_model_len
+                            ):
+                                token_budget += self._truncate_dflash_target_batch(
+                                    1,
+                                    num_scheduled_tokens,
+                                    scheduled_spec_decode_tokens,
+                                )
+                                dflash_target_query_len = 1
+                            elif dflash_target_query_len > token_budget:
+                                break
+                            else:
+                                num_new_tokens = dflash_target_query_len
+                                pad_spec_decode = True
+                        dflash_waiting_query_len = num_new_tokens
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
-                    if (
+                    elif (
                         (
                             self.num_spec_tokens > 0
                             and self.dynamic_sd_lookup is None
@@ -917,6 +1107,12 @@ class Scheduler(SchedulerInterface):
                     )
                     if num_new_tokens == 0:
                         break
+
+                if (
+                    dflash_waiting_query_len is not None
+                    and num_new_tokens != dflash_waiting_query_len
+                ):
+                    break
 
                 # Async receive performs no model work. Speculative lookahead is
                 # allocated when the request is rescheduled after the transfer.
@@ -1028,13 +1224,20 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if dflash_waiting_query_len is not None:
+                    dflash_cohort_req_ids.add(request_id)
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
-                    scheduled_spec_decode_tokens[request_id] = [
-                        -1
-                    ] * self.num_spec_tokens
+                    padding_width = (
+                        dflash_waiting_query_len - 1
+                        if dflash_waiting_query_len is not None
+                        else self.num_spec_tokens
+                    )
+                    scheduled_spec_decode_tokens[request_id] = [-1] * padding_width
+                    if self.use_dflash:
+                        dflash_padded_request_ids.add(request_id)
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
@@ -1062,6 +1265,28 @@ class Scheduler(SchedulerInterface):
             # record whether it was capacity-bound.
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
+
+        dflash_verification_query_len = 0
+        if self.use_dflash:
+            if self.scheduler_config.async_scheduling:
+                scheduled_req_ids = num_scheduled_tokens.keys()
+                for request in self.running:
+                    if (
+                        request.request_id not in scheduled_req_ids
+                        and len(request.spec_token_ids) > 0
+                    ):
+                        request.spec_token_ids = []
+
+            decode_query_lens = {
+                num_scheduled_tokens[req_id] for req_id in dflash_cohort_req_ids
+            }
+            if len(decode_query_lens) > 1:
+                raise RuntimeError(
+                    "DFlash target batches must use one query length; got "
+                    f"{sorted(decode_query_lens)}."
+                )
+            if len(decode_query_lens) == 1:
+                dflash_verification_query_len = next(iter(decode_query_lens))
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1130,20 +1355,68 @@ class Scheduler(SchedulerInterface):
         # batch size and/or the longest scheduled sequence, taking the smaller K
         # when both schedules apply.
         num_spec_tokens_to_schedule = self.num_spec_tokens
-        if len(num_scheduled_tokens) > 0:
+        scheduled_batch_size = len(num_scheduled_tokens)
+        decode_batch_size, max_decode_seq_len = self._scheduled_decode_operating_point(
+            num_scheduled_tokens,
+            dflash_cohort_req_ids if self.use_dflash else None,
+        )
+        max_dflash_proposal_seq_len = (
+            self._max_dflash_proposal_sequence_length(num_scheduled_tokens)
+            if self.use_dflash
+            else 0
+        )
+        dflash_proposal_fits = not self.use_dflash or (
+            max_dflash_proposal_seq_len > 0
+            and (
+                self.dflash_drafter_max_model_len is None
+                or max_dflash_proposal_seq_len + self.dflash_drafter_query_len
+                <= self.dflash_drafter_max_model_len
+            )
+        )
+        if scheduled_batch_size > 0:
             if self.dynamic_sd_lookup is not None:
                 num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                    len(num_scheduled_tokens)
+                    scheduled_batch_size
                 ]
             if self.dynamic_sd_seq_len_schedule is not None:
                 num_spec_tokens_to_schedule = min(
                     num_spec_tokens_to_schedule,
                     resolve_dynamic_sd_num_speculative_tokens(
                         self.dynamic_sd_seq_len_schedule,
-                        self._max_scheduled_decode_seq_len(num_scheduled_tokens),
+                        max_decode_seq_len,
                         self.num_spec_tokens,
                     ),
                 )
+            if (
+                self.dflash_adaptive_verification_policy is not None
+                and decode_batch_size > 0
+                and dflash_proposal_fits
+            ):
+                num_spec_tokens_to_schedule = (
+                    self.dflash_adaptive_verification_policy.select_query_len(
+                        batch_size=decode_batch_size,
+                        sequence_length=max_decode_seq_len,
+                        max_query_len=num_spec_tokens_to_schedule + 1,
+                    )
+                    - 1
+                )
+            if not dflash_proposal_fits:
+                num_spec_tokens_to_schedule = 0
+
+        dflash_num_valid_draft_tokens = None
+        if self.use_dflash:
+            dflash_num_valid_draft_tokens = {
+                req_id: (
+                    0
+                    if req_id in dflash_padded_request_ids
+                    else (
+                        len(draft_token_ids)
+                        if self.scheduler_config.async_scheduling
+                        else sum(token_id >= 0 for token_id in draft_token_ids)
+                    )
+                )
+                for req_id, draft_token_ids in scheduled_spec_decode_tokens.items()
+            }
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -1162,6 +1435,14 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            dflash_verification_query_len=dflash_verification_query_len,
+            dflash_verification_batch_size=decode_batch_size,
+            dflash_verification_max_sequence_length=max_decode_seq_len,
+            dflash_proposal_max_sequence_length=max_dflash_proposal_seq_len,
+            dflash_num_valid_draft_tokens=dflash_num_valid_draft_tokens,
+            dflash_padded_request_ids=(
+                dflash_padded_request_ids if self.use_dflash else None
+            ),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1684,6 +1965,8 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        dflash_acceptance_observations: list[tuple[int, int]] = []
+        dflash_observation_query_len: int | None = None
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1728,6 +2011,31 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
+                valid_draft_counts = scheduler_output.dflash_num_valid_draft_tokens
+                num_valid_draft_tokens = (
+                    valid_draft_counts.get(req_id, num_draft_tokens)
+                    if valid_draft_counts is not None
+                    else None
+                )
+                if (
+                    self.dflash_adaptive_verification_policy is not None
+                    and num_valid_draft_tokens is not None
+                    and num_valid_draft_tokens > 0
+                ):
+                    query_len = num_draft_tokens + 1
+                    if dflash_observation_query_len is None:
+                        dflash_observation_query_len = query_len
+                    elif dflash_observation_query_len != query_len:
+                        raise RuntimeError(
+                            "DFlash acceptance observations came from mixed "
+                            "target query lengths."
+                        )
+                    dflash_acceptance_observations.append(
+                        (
+                            min(num_accepted, num_valid_draft_tokens),
+                            num_valid_draft_tokens,
+                        )
+                    )
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -1745,6 +2053,7 @@ class Scheduler(SchedulerInterface):
                     num_accepted_tokens=num_accepted,
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
+                    num_valid_draft_tokens=num_valid_draft_tokens,
                 )
 
             if self._tok_trace is not None and len(generated_token_ids) > 0:
@@ -1895,6 +2204,18 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        if len(dflash_acceptance_observations) > 0:
+            assert self.dflash_adaptive_verification_policy is not None
+            assert dflash_observation_query_len is not None
+            self.dflash_adaptive_verification_policy.observe_batch(
+                batch_size=scheduler_output.dflash_verification_batch_size,
+                sequence_length=(
+                    scheduler_output.dflash_verification_max_sequence_length
+                ),
+                query_len=dflash_observation_query_len,
+                accepted_and_observed_draft_tokens=dflash_acceptance_observations,
+            )
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
@@ -2143,8 +2464,13 @@ class Scheduler(SchedulerInterface):
 
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
+                original_num_spec_tokens = len(spec_token_ids)
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+                if self.use_dflash:
+                    spec_token_ids.extend(
+                        [-1] * (original_num_spec_tokens - len(spec_token_ids))
+                    )
             request.spec_token_ids = spec_token_ids
 
     def update_draft_token_ids_in_output(
@@ -2180,6 +2506,14 @@ class Scheduler(SchedulerInterface):
             if num_invalid_tokens:
                 spec_token_ids.extend([-1] * num_invalid_tokens)
                 num_invalid_spec_tokens[req_id] = num_invalid_tokens
+
+            if self.use_dflash:
+                valid_draft_counts = scheduler_output.dflash_num_valid_draft_tokens
+                assert valid_draft_counts is not None
+                valid_draft_counts[req_id] = min(
+                    valid_draft_counts.get(req_id, orig_num_spec_tokens),
+                    orig_num_spec_tokens - num_invalid_tokens,
+                )
 
             sched_spec_tokens[req_id] = spec_token_ids
 
@@ -2636,13 +2970,19 @@ class Scheduler(SchedulerInterface):
         num_accepted_tokens: int,
         num_invalid_spec_tokens: dict[str, int] | None,
         request_id: str,
+        num_valid_draft_tokens: int | None = None,
     ) -> SpecDecodingStats | None:
-        if not self.log_stats or not num_draft_tokens:
-            return None
+        if not self.log_stats or num_draft_tokens == 0:
+            return spec_decoding_stats
+        if num_valid_draft_tokens is not None:
+            num_draft_tokens = num_valid_draft_tokens
+            num_accepted_tokens = min(num_accepted_tokens, num_draft_tokens)
+        elif num_invalid_spec_tokens:
+            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
+        if num_draft_tokens == 0:
+            return spec_decoding_stats
         if spec_decoding_stats is None:
             spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
-        if num_invalid_spec_tokens:
-            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
         spec_decoding_stats.observe_draft(
             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
         )

@@ -20,6 +20,36 @@ from vllm.v1.spec_decode.utils import (
 logger = init_logger(__name__)
 
 
+def make_empty_dflash_proposal(num_requests: int, device: torch.device) -> torch.Tensor:
+    """Represent the absence of a DFlash proposal without guessing token IDs.
+
+    :param num_requests: Number of request rows in the proposal batch.
+    :param device: Device that owns the proposal state.
+    :returns: An integer tensor with one empty draft row per request.
+    """
+    return torch.empty((num_requests, 0), dtype=torch.int32, device=device)
+
+
+def select_dflash_verification_prefix(
+    draft_tensor: torch.Tensor, num_speculative_tokens: int
+) -> torch.Tensor:
+    """Expose a target-width prefix without compacting the fixed draft block.
+
+    :param draft_tensor: Request-major tensor whose second dimension is the
+        complete trained DFlash draft block.
+    :param num_speculative_tokens: Prefix width sent to target verification.
+    :returns: A view with target width and the original full-block row stride.
+    """
+    if draft_tensor.ndim < 2:
+        raise ValueError("DFlash draft tensors must have at least two dimensions")
+    if not 0 <= num_speculative_tokens <= draft_tensor.shape[1]:
+        raise ValueError(
+            f"DFlash verification prefix {num_speculative_tokens} exceeds "
+            f"draft width {draft_tensor.shape[1]}."
+        )
+    return draft_tensor[:, :num_speculative_tokens]
+
+
 class DFlashProposer(SpecDecodeBaseProposer):
     def __init__(
         self,
@@ -35,6 +65,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             pass_hidden_states_to_model=True,
             runner=runner,
         )
+        self.draft_block_num_speculative_tokens = self.num_speculative_tokens
 
         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
@@ -111,6 +142,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
         # DFlash cross-attention: context K/V from target hidden states,
         # Q from query embeddings (bonus + mask tokens).
+        if self.num_speculative_tokens != self.draft_block_num_speculative_tokens:
+            raise RuntimeError(
+                "DFlash must generate its complete trained draft block; adaptive "
+                "verification may only truncate the prefix sent to the target."
+            )
         batch_size = cad.batch_size()
         num_context = target_token_ids.shape[0]
         num_query_per_req = 1 + self.num_speculative_tokens

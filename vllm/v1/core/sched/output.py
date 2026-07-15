@@ -244,6 +244,22 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Decode operating point represented by this output. These values remain
+    # attached to the pass so async scheduling cannot attribute its acceptance
+    # observations to a newer request state.
+    dflash_verification_query_len: int = 0
+    dflash_verification_batch_size: int = 0
+    dflash_verification_max_sequence_length: int = 0
+    # Longest row in DFlash's actual padded proposal batch. Unlike the
+    # verification cohort, this includes every scheduled prefill row.
+    dflash_proposal_max_sequence_length: int = 0
+    # Real draft positions by request. Uniform target batches may contain
+    # invalid padding for q1 admissions; those positions are not observations.
+    dflash_num_valid_draft_tokens: dict[str, int] | None = None
+    # Requests whose scheduled draft width contains no proposal. Their target
+    # input is embedding-safe padding and rejection metadata is all -1.
+    dflash_padded_request_ids: set[str] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

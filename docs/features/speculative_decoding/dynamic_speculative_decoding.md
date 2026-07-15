@@ -69,10 +69,75 @@ VLLM_USE_V2_MODEL_RUNNER=0 vllm serve meta-llama/Llama-3.1-8B-Instruct \
 
 ```
 
+### Cost-aware DFlash target verification
+
+DFlash adaptive verification does not shorten the draft-model input. The
+drafter always executes its complete trained block of 16 queries and produces
+15 draft tokens. The scheduler exposes only a prefix of 3, 7, 11, or 15 draft
+tokens to the next target pass, producing target query lengths 4, 8, 12, or 16.
+
+`dflash_adaptive_verification.costs` is an offline measured table. Each
+calibrated batch-size and sequence-length rectangle must contain one total round
+cost for every target query length, and calibrated rectangles must not overlap.
+An operating point outside those rectangles uses `fallback_query_len` (16 by
+default), capped by the active static schedule. This leaves unmeasured or
+unreachable regions conservative without inventing costs. Incomplete prefill
+chunks do not contribute to the decode batch size. A round cost includes target
+verification, the fixed 16-query draft pass, and sampling. At runtime, the
+policy updates conditional per-position acceptance hazards once per executed
+batch, with rejected tails treated as censored rather than failed observations.
+Invalid target padding is excluded. The policy chooses the prefix with the
+highest expected accepted output tokens per millisecond. A switching threshold
+prevents oscillation, and periodic full-block probes keep acceptance estimates
+for the tail current.
+
+Every DFlash target verification cohort uses one supported query length. A row
+without a proposal can join an existing cohort through explicit invalid
+padding, which is excluded from acceptance statistics. DFlash's padded proposal
+pass still retains every scheduled row, including incomplete prefills, so its
+context-window guard uses the longest row in the complete padded drafter batch.
+
+The ordinary one-query decode graph remains available when the fixed DFlash
+window no longer fits near the drafter model's sequence-length limit. In that
+case no proposal is emitted. Invalid target positions remain `-1` in rejection
+metadata; their clamped embedding input is a non-observable implementation
+detail rather than a draft-token guess.
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=0 vllm serve TARGET_MODEL \
+  --speculative-config '{
+    "method": "dflash",
+    "model": "DFLASH_MODEL",
+    "num_speculative_tokens": 15,
+    "dflash_adaptive_verification": {
+      "costs": [
+        {"batch_size_range":[1,32],"sequence_length_range":[1,131072],"query_len":4,"round_cost_ms":3.0},
+        {"batch_size_range":[1,32],"sequence_length_range":[1,131072],"query_len":8,"round_cost_ms":4.0},
+        {"batch_size_range":[1,32],"sequence_length_range":[1,131072],"query_len":12,"round_cost_ms":5.0},
+        {"batch_size_range":[1,32],"sequence_length_range":[1,131072],"query_len":16,"round_cost_ms":6.0}
+      ],
+      "fallback_query_len": 16,
+      "initial_acceptance_rates": [0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.15,0.1,0.08,0.06,0.04,0.02,0.01]
+    }
+  }'
+```
+
+The numbers above demonstrate the schema only. Production costs and acceptance
+priors must come from the deployment's matched workload and hardware.
+
+For low-overhead calibration, set
+`VLLM_DFLASH_CALIBRATION_LOG_INTERVAL` to a positive number of completed target
+passes, such as 32. The EngineCore then emits one JSON summary per interval,
+with points keyed by the query length actually executed (`q`) and verification
+batch size (`r`), the minimum and maximum ending sequence lengths, and counts
+of non-verification and invalid-padding rows. The default value is zero, which
+does not invoke the calibration logger. Timed calibration should use this
+aggregate instead of per-iteration logging, since writing one line per pass
+perturbs the cadence being measured.
+
 ## Limitations
 
-* only tested with Eagle and Eagle-3. Other SD methods may or may not work out of the box
 * only usable with Model Runner V1
-* not compatible with full cuda graph so we force piece-wise cuda graph with this feature
-
-We are working on enabling it on MRv2 with full cuda graph support.
+* Eagle and Eagle-3 dynamic drafting use piecewise CUDA graphs
+* DFlash target-only adaptive verification supports full decode CUDA graphs for
+  query lengths 4, 8, 12, and 16

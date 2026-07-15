@@ -69,6 +69,92 @@ SpeculativeMethod = Literal[
 ]
 RejectionSampleMethod = Literal["standard", "synthetic"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
+DFlashTargetQueryLen = Literal[4, 8, 12, 16]
+
+
+@config
+class DFlashVerificationCost:
+    """Measured round cost for one adaptive DFlash operating point.
+
+    :ivar batch_size_range: Inclusive decode batch-size range.
+    :ivar sequence_length_range: Inclusive longest-sequence-length range.
+    :ivar query_len: Number of target verification queries per request.
+    :ivar round_cost_ms: Measured target, fixed-draft, and sampling round cost.
+    """
+
+    batch_size_range: tuple[int, int]
+    sequence_length_range: tuple[int, int]
+    query_len: DFlashTargetQueryLen
+    round_cost_ms: float = Field(gt=0.0)
+
+    @model_validator(mode="after")
+    def _verify_ranges(self) -> Self:
+        batch_start, batch_end = self.batch_size_range
+        sequence_start, sequence_end = self.sequence_length_range
+        if batch_start <= 0 or batch_start > batch_end:
+            raise ValueError(
+                "batch_size_range must be a positive inclusive range, got "
+                f"{self.batch_size_range}."
+            )
+        if sequence_start <= 0 or sequence_start > sequence_end:
+            raise ValueError(
+                "sequence_length_range must be a positive inclusive range, got "
+                f"{self.sequence_length_range}."
+            )
+        return self
+
+
+@config
+class DFlashAdaptiveVerificationConfig:
+    """Cost-aware target-prefix policy for a fixed-block DFlash drafter.
+
+    :ivar costs: Offline measured round costs for each calibrated runtime tier
+        and query length.
+    :ivar fallback_query_len: Target query length used outside the calibrated
+        cost surface.
+    :ivar initial_acceptance_rates: Initial unconditional acceptance probability
+        for each of the 15 draft positions.
+    :ivar acceptance_ema_alpha: Weight assigned to each new acceptance outcome.
+    :ivar switch_threshold: Minimum relative utility gain required to change
+        query length.
+    :ivar exploration_interval: Policy decisions between full-block probes used
+        to refresh acceptance estimates for positions outside the active prefix.
+    """
+
+    costs: list[DFlashVerificationCost] = Field(min_length=4)
+    initial_acceptance_rates: list[float] = Field(min_length=15, max_length=15)
+    fallback_query_len: DFlashTargetQueryLen = 16
+    acceptance_ema_alpha: float = Field(default=0.05, gt=0.0, le=1.0)
+    switch_threshold: float = Field(default=0.03, ge=0.0)
+    exploration_interval: int = Field(default=256, ge=1)
+
+    @model_validator(mode="after")
+    def _verify_policy(self) -> Self:
+        rates = self.initial_acceptance_rates
+        if any(rate < 0.0 or rate > 1.0 for rate in rates):
+            raise ValueError("initial_acceptance_rates entries must be in [0, 1].")
+        if any(rates[index] > rates[index - 1] for index in range(1, len(rates))):
+            raise ValueError("initial_acceptance_rates must be non-increasing.")
+
+        costs_by_tier: dict[tuple[tuple[int, int], tuple[int, int]], set[int]] = {}
+        for cost in self.costs:
+            tier = (cost.batch_size_range, cost.sequence_length_range)
+            query_lens = costs_by_tier.setdefault(tier, set())
+            if cost.query_len in query_lens:
+                raise ValueError(
+                    f"Duplicate DFlash cost for tier {tier} and query length "
+                    f"{cost.query_len}."
+                )
+            query_lens.add(cost.query_len)
+
+        expected_query_lens = {4, 8, 12, 16}
+        for tier, query_lens in costs_by_tier.items():
+            if query_lens != expected_query_lens:
+                raise ValueError(
+                    f"DFlash cost tier {tier} must define query lengths "
+                    f"{sorted(expected_query_lens)}, got {sorted(query_lens)}."
+                )
+        return self
 
 
 @config
@@ -174,6 +260,8 @@ class SpeculativeConfig:
     speculative-token count wins so long contexts and large batches both shrink
     the verification length.
     """
+    dflash_adaptive_verification: DFlashAdaptiveVerificationConfig | None = None
+    """Cost-aware adaptive target verification for a fixed 16-query DFlash block."""
 
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -1041,6 +1129,25 @@ class SpeculativeConfig:
                 f"than zero ({self.num_speculative_tokens})."
             )
 
+        if self.dflash_adaptive_verification is not None and not self.use_dflash():
+            raise ValueError(
+                "dflash_adaptive_verification requires speculative method 'dflash'."
+            )
+
+        if self.use_dflash() and self.uses_dynamic_speculative_decoding():
+            if self.num_speculative_tokens != 15:
+                raise ValueError(
+                    "Adaptive DFlash verification requires a 15-token draft "
+                    "block so target query lengths 4, 8, 12, and 16 remain "
+                    "prefixes of the trained 16-query DFlash block."
+                )
+            invalid_query_lens = set(self.target_query_lens()) - {4, 8, 12, 16}
+            if len(invalid_query_lens) > 0:
+                raise ValueError(
+                    "DFlash adaptive verification only supports target query "
+                    f"lengths 4, 8, 12, and 16, got {sorted(invalid_query_lens)}."
+                )
+
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
@@ -1125,7 +1232,35 @@ class SpeculativeConfig:
         return (
             self.num_speculative_tokens_per_batch_size is not None
             or self.num_speculative_tokens_per_seq_len is not None
+            or self.dflash_adaptive_verification is not None
         )
+
+    def target_query_lens(self) -> tuple[int, ...]:
+        """Return every target query length selected by this configuration.
+
+        A target verification query contains the sampled root token followed
+        by the configured number of draft tokens. Dynamic schedules select a
+        draft prefix, so their values contribute additional query lengths.
+
+        :returns: Sorted unique target query lengths.
+        """
+        assert self.num_speculative_tokens is not None
+        num_speculative_tokens = {self.num_speculative_tokens}
+        schedules = (
+            self.num_speculative_tokens_per_batch_size,
+            self.num_speculative_tokens_per_seq_len,
+        )
+        for schedule in schedules:
+            if schedule is None:
+                continue
+            num_speculative_tokens.update(
+                min(entry[2], self.num_speculative_tokens) for entry in schedule
+            )
+        if self.dflash_adaptive_verification is not None:
+            num_speculative_tokens.update(
+                cost.query_len - 1 for cost in self.dflash_adaptive_verification.costs
+            )
+        return tuple(sorted(count + 1 for count in num_speculative_tokens))
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

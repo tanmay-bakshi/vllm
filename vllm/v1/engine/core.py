@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import json
 import os
 import queue
 import signal
@@ -11,6 +12,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -92,6 +94,157 @@ logger = init_logger(__name__)
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+
+@dataclass
+class _DFlashCalibrationPoint:
+    """Aggregate completed DFlash target passes at one operating point.
+
+    :ivar rounds: Number of completed passes.
+    :ivar min_sequence_length: Smallest ending sequence length.
+    :ivar max_sequence_length: Largest ending sequence length.
+    :ivar contaminated_rounds: Passes containing non-verification or padded rows.
+    :ivar non_verification_rows: Scheduled rows outside the verification cohort.
+    :ivar padded_rows: Verification rows without a real proposal.
+    """
+
+    rounds: int = 0
+    min_sequence_length: int = 0
+    max_sequence_length: int = 0
+    contaminated_rounds: int = 0
+    non_verification_rows: int = 0
+    padded_rows: int = 0
+
+    def observe(
+        self,
+        sequence_length: int,
+        non_verification_rows: int,
+        padded_rows: int,
+    ) -> None:
+        """Record one completed target pass.
+
+        :param sequence_length: Longest verification sequence in the pass.
+        :param non_verification_rows: Scheduled rows outside verification.
+        :param padded_rows: Verification rows without a real proposal.
+        """
+        if self.rounds == 0:
+            self.min_sequence_length = sequence_length
+            self.max_sequence_length = sequence_length
+        else:
+            self.min_sequence_length = min(self.min_sequence_length, sequence_length)
+            self.max_sequence_length = max(self.max_sequence_length, sequence_length)
+        self.rounds += 1
+        self.non_verification_rows += non_verification_rows
+        self.padded_rows += padded_rows
+        if non_verification_rows != 0 or padded_rows > 0:
+            self.contaminated_rounds += 1
+
+
+class _DFlashCalibrationDiagnostics:
+    """Build bounded, low-frequency DFlash calibration summaries."""
+
+    interval: int
+    interval_index: int
+    rounds: int
+    non_dflash_rounds: int
+    interval_start_ns: int | None
+    points: dict[tuple[int, int], _DFlashCalibrationPoint]
+
+    def __init__(self, interval: int) -> None:
+        """Initialize the summary accumulator.
+
+        :param interval: Completed DFlash passes per emitted summary.
+        """
+        if interval <= 0:
+            raise ValueError("DFlash calibration log interval must be positive.")
+        self.interval = interval
+        self.interval_index = 0
+        self.rounds = 0
+        self.non_dflash_rounds = 0
+        self.interval_start_ns = None
+        self.points: dict[tuple[int, int], _DFlashCalibrationPoint] = defaultdict(
+            _DFlashCalibrationPoint
+        )
+
+    def begin_interval(self, start_ns: int) -> None:
+        """Begin timing an empty calibration interval.
+
+        :param start_ns: Monotonic interval boundary in nanoseconds.
+        :raises RuntimeError: If an interval is already active.
+        """
+        if self.interval_start_ns is not None:
+            raise RuntimeError("DFlash calibration interval is already active.")
+        self.interval_start_ns = start_ns
+
+    def observe(
+        self,
+        scheduler_output: SchedulerOutput,
+        completed_ns: int,
+    ) -> str | None:
+        """Record a completed scheduler output and possibly render a summary.
+
+        :param scheduler_output: Output attached to the completed target pass.
+        :param completed_ns: Monotonic completion timestamp in nanoseconds.
+        :returns: A JSON summary when the configured interval is complete.
+        """
+        query_len = scheduler_output.dflash_verification_query_len
+        interval_start_ns = self.interval_start_ns
+        if interval_start_ns is None:
+            if query_len > 0:
+                self.begin_interval(completed_ns)
+            return None
+
+        if query_len <= 0:
+            self.non_dflash_rounds += 1
+            return None
+        if completed_ns < interval_start_ns:
+            raise ValueError(
+                "DFlash completion timestamp precedes the interval boundary."
+            )
+        if self.rounds + 1 == self.interval and completed_ns == interval_start_ns:
+            raise ValueError("DFlash calibration elapsed time must be positive.")
+
+        batch_size = scheduler_output.dflash_verification_batch_size
+        sequence_length = scheduler_output.dflash_verification_max_sequence_length
+        padded_request_ids = scheduler_output.dflash_padded_request_ids
+        padded_rows = len(padded_request_ids) if padded_request_ids is not None else 0
+        non_verification_rows = len(scheduler_output.num_scheduled_tokens) - batch_size
+        self.points[(query_len, batch_size)].observe(
+            sequence_length,
+            non_verification_rows,
+            padded_rows,
+        )
+        self.rounds += 1
+        if self.rounds < self.interval:
+            return None
+
+        elapsed_ns = completed_ns - interval_start_ns
+        self.interval_index += 1
+        summary = {
+            "schema_version": 2,
+            "interval_index": self.interval_index,
+            "rounds": self.rounds,
+            "elapsed_ns": elapsed_ns,
+            "non_dflash_rounds": self.non_dflash_rounds,
+            "points": [
+                {
+                    "q": query_len,
+                    "r": batch_size,
+                    "rounds": point.rounds,
+                    "min_l": point.min_sequence_length,
+                    "max_l": point.max_sequence_length,
+                    "contaminated_rounds": point.contaminated_rounds,
+                    "non_verification_rows": point.non_verification_rows,
+                    "padded_rows": point.padded_rows,
+                }
+                for (query_len, batch_size), point in sorted(self.points.items())
+            ],
+        }
+        self.rounds = 0
+        self.non_dflash_rounds = 0
+        self.interval_start_ns = None
+        self.points.clear()
+        return json.dumps(summary, separators=(",", ":"), sort_keys=True)
 
 
 class EngineCore:
@@ -223,6 +376,16 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
+        dflash_calibration_interval = envs.VLLM_DFLASH_CALIBRATION_LOG_INTERVAL
+        if dflash_calibration_interval < 0:
+            raise ValueError(
+                "VLLM_DFLASH_CALIBRATION_LOG_INTERVAL must be non-negative."
+            )
+        self._dflash_calibration_diagnostics: _DFlashCalibrationDiagnostics | None = (
+            _DFlashCalibrationDiagnostics(dflash_calibration_interval)
+            if dflash_calibration_interval > 0
+            else None
+        )
 
         self.aborts_queue = queue.Queue[list[str]]()
 
@@ -576,6 +739,26 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    def _record_dflash_calibration(
+        self,
+        scheduler_output: SchedulerOutput,
+        completed_ns: int | None = None,
+    ) -> None:
+        """Record one completed pass for opt-in DFlash calibration.
+
+        :param scheduler_output: Output attached to the completed target pass.
+        :param completed_ns: Explicit monotonic completion timestamp, if available.
+        """
+        diagnostics = self._dflash_calibration_diagnostics
+        if diagnostics is None:
+            return
+        if completed_ns is None:
+            completed_ns = time.perf_counter_ns()
+        summary = diagnostics.observe(scheduler_output, completed_ns)
+        if summary is not None:
+            logger.info("DFlash calibration interval: %s", summary)
+            diagnostics.begin_interval(time.perf_counter_ns())
+
     def _should_throttle_prefills(self) -> bool:
         """Whether to defer new prefills this step (DP prefill balancing).
         Overridden by the DP engine core; never throttles otherwise."""
@@ -607,6 +790,8 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+
+        self._record_dflash_calibration(scheduler_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -708,6 +893,8 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+
+        self._record_dflash_calibration(scheduler_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.

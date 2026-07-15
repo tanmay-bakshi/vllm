@@ -55,6 +55,7 @@ def create_scheduler(
     block_size: int = 16,
     max_model_len: int | None = None,
     num_speculative_tokens: int | None = None,
+    speculative_config: SpeculativeConfig | None = None,
     skip_tokenizer_init: bool = False,
     async_scheduling: bool = False,
     pipeline_parallel_size: int = 1,
@@ -77,6 +78,7 @@ def create_scheduler(
     :param block_size: Cache block size.
     :param max_model_len: Maximum model sequence length.
     :param num_speculative_tokens: Optional speculative token count.
+    :param speculative_config: Optional complete speculative-decoding configuration.
     :param skip_tokenizer_init: Whether tokenizer initialization is skipped.
     :param async_scheduling: Whether scheduler batches overlap execution.
     :param pipeline_parallel_size: Pipeline-parallel size.
@@ -136,8 +138,11 @@ def create_scheduler(
             kv_connector_extra_config={"shared_storage_path": "local_storage"},
         )
 
-    speculative_config: SpeculativeConfig | None = None
-    if num_speculative_tokens is not None:
+    if speculative_config is not None and num_speculative_tokens is not None:
+        raise ValueError(
+            "Specify either speculative_config or num_speculative_tokens, not both."
+        )
+    if speculative_config is None and num_speculative_tokens is not None:
         speculative_config = SpeculativeConfig(
             model="ngram", num_speculative_tokens=num_speculative_tokens
         )

@@ -515,9 +515,7 @@ class InputBatch:
                 t if t >= 0 else 0 for t in spec_token_ids
             ]
         else:
-            self.token_ids_cpu[req_index, start_index:end_token_index] = (
-                spec_token_ids
-            )
+            self.token_ids_cpu[req_index, start_index:end_token_index] = spec_token_ids
         self.is_token_ids[req_index, start_index:end_token_index] = True
         cur_spec_token_ids.extend(spec_token_ids)
 
@@ -1077,11 +1075,16 @@ class InputBatch:
             req_output_token_ids[first_placeholder:] = new_ids
             # ^ Implicitly resizes to (first_placeholder + num_to_replace)
 
-    def update_async_spec_token_ids(self, draft_token_ids: list[list[int]]) -> None:
+    def update_async_spec_token_ids(
+        self,
+        draft_token_ids: list[list[int]],
+        num_valid_draft_tokens: dict[str, int] | None = None,
+    ) -> None:
         """
         In async scheduling case, update spec_token_ids in sampling metadata with
         real draft token ids from prior step. This is called right before they are
         needed by the rejection sampler for penalty/bad_words computation.
+        Scheduler-inserted invalid padding remains untouched.
         """
         if not draft_token_ids or not self.prev_req_id_to_index:
             return
@@ -1089,13 +1092,18 @@ class InputBatch:
         if (spec_token_ids := self.sampling_metadata.spec_token_ids) is not None:
             for req_id, spec_ids in zip(self.req_ids, spec_token_ids):
                 if spec_ids:
+                    valid_count = (
+                        num_valid_draft_tokens.get(req_id, len(spec_ids))
+                        if num_valid_draft_tokens is not None
+                        else len(spec_ids)
+                    )
+                    if valid_count == 0:
+                        continue
                     prev_index = self.prev_req_id_to_index.get(req_id)
                     if prev_index is not None:
-                        draft_ids = draft_token_ids[prev_index]
+                        draft_ids = draft_token_ids[prev_index][:valid_count]
                         if draft_ids:
-                            del draft_ids[len(spec_ids) :]
-                            spec_ids.clear()
-                            spec_ids.extend(draft_ids)
+                            spec_ids[: len(draft_ids)] = draft_ids
 
     @property
     def num_reqs(self) -> int:

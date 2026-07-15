@@ -113,7 +113,7 @@ class TestCudagraphDispatcher:
 
         dispatcher = CudagraphDispatcher(config)
         dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode=comp_config.cudagraph_mode, uniform_decode_query_len=1
+            cudagraph_mode=comp_config.cudagraph_mode, uniform_decode_query_lens=(1,)
         )
 
         # Verify the key is initialized correctly
@@ -231,7 +231,7 @@ class TestCudagraphDispatcher:
         config = _create_vllm_config(comp_config, max_num_seqs=16)
         dispatcher = CudagraphDispatcher(config)
         dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode=comp_config.cudagraph_mode, uniform_decode_query_len=1
+            cudagraph_mode=comp_config.cudagraph_mode, uniform_decode_query_lens=(1,)
         )
 
         capture_descs = dispatcher.get_capture_descs()
@@ -266,6 +266,120 @@ class TestCudagraphDispatcher:
         # Don't initialize keys
 
         assert dispatcher.get_capture_descs() == []
+
+    def test_dynamic_dflash_uses_query_specific_request_buckets(self):
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_AND_PIECEWISE",
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_capture_sizes=[16, 32, 64, 128, 256, 384, 512],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=32)
+        dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            comp_config.cudagraph_mode,
+            uniform_decode_query_lens=(1, 4, 8, 12, 16),
+        )
+
+        assert dispatcher.uniform_decode_capture_num_reqs == (
+            1,
+            2,
+            4,
+            8,
+            16,
+            24,
+            32,
+        )
+        assert len(dispatcher.cudagraph_keys[CUDAGraphMode.FULL]) == 35
+
+        for query_len in (1, 4, 8, 12, 16):
+            mode, descriptor = dispatcher.dispatch(
+                num_tokens=query_len * 16,
+                num_reqs=16,
+                uniform_decode=True,
+                uniform_decode_query_len=query_len,
+            )
+            assert mode == CUDAGraphMode.FULL
+            assert descriptor == BatchDescriptor(
+                num_tokens=query_len * 16,
+                num_reqs=16,
+                uniform=True,
+            )
+
+        mode, descriptor = dispatcher.dispatch(
+            num_tokens=12 * 24,
+            num_reqs=24,
+            uniform_decode=True,
+            uniform_decode_query_len=12,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert descriptor == BatchDescriptor(
+            num_tokens=288,
+            num_reqs=24,
+            uniform=True,
+        )
+
+        mode_q4, descriptor_q4 = dispatcher.dispatch(
+            num_tokens=128,
+            num_reqs=32,
+            uniform_decode=True,
+            uniform_decode_query_len=4,
+        )
+        mode_q8, descriptor_q8 = dispatcher.dispatch(
+            num_tokens=128,
+            num_reqs=16,
+            uniform_decode=True,
+            uniform_decode_query_len=8,
+        )
+        assert mode_q4 == CUDAGraphMode.FULL
+        assert mode_q8 == CUDAGraphMode.FULL
+        assert descriptor_q4 == BatchDescriptor(
+            num_tokens=128,
+            num_reqs=32,
+            uniform=True,
+        )
+        assert descriptor_q8 == BatchDescriptor(
+            num_tokens=128,
+            num_reqs=16,
+            uniform=True,
+        )
+        assert descriptor_q4 != descriptor_q8
+
+        mode, descriptor = dispatcher.dispatch(
+            num_tokens=12 * 20,
+            num_reqs=20,
+            uniform_decode=True,
+            uniform_decode_query_len=12,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert descriptor == BatchDescriptor(
+            num_tokens=288,
+            num_reqs=24,
+            uniform=True,
+        )
+
+        mode, descriptor = dispatcher.dispatch(
+            num_tokens=6 * 20,
+            num_reqs=20,
+            uniform_decode=True,
+            uniform_decode_query_len=6,
+        )
+        assert mode == CUDAGraphMode.PIECEWISE
+        assert descriptor == BatchDescriptor(num_tokens=128, num_reqs=None)
+
+    def test_plain_full_rejects_multiple_uniform_decode_query_lengths(self) -> None:
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[16, 32, 64, 128],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=32)
+        dispatcher = CudagraphDispatcher(config)
+
+        with pytest.raises(ValueError, match="separate decode routine"):
+            dispatcher.initialize_cudagraph_keys(
+                comp_config.cudagraph_mode,
+                uniform_decode_query_lens=(4, 8, 12, 16),
+            )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
@@ -426,7 +540,7 @@ def test_capture_replay_bypass_logic():
     vllm_config = _create_vllm_config(comp_config)
     dispatcher = CudagraphDispatcher(vllm_config)
     dispatcher.initialize_cudagraph_keys(
-        comp_config.cudagraph_mode, uniform_decode_query_len=1
+        comp_config.cudagraph_mode, uniform_decode_query_lens=(1,)
     )
     model = SimpleMLP().to(DEVICE_TYPE)
     full_wrapper = CUDAGraphWrapper(model, vllm_config, CUDAGraphMode.FULL)
@@ -496,7 +610,7 @@ def test_nested_wrappers():
     vllm_config = _create_vllm_config(comp_config)
     dispatcher = CudagraphDispatcher(vllm_config)
     dispatcher.initialize_cudagraph_keys(
-        comp_config.cudagraph_mode, uniform_decode_query_len=1
+        comp_config.cudagraph_mode, uniform_decode_query_lens=(1,)
     )
     model = SimpleMLP().to(DEVICE_TYPE)
     full_wrapper = CUDAGraphWrapper(model, vllm_config, CUDAGraphMode.FULL)

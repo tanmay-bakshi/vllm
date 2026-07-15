@@ -178,7 +178,11 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
-from vllm.v1.spec_decode.dflash import DFlashProposer
+from vllm.v1.spec_decode.dflash import (
+    DFlashProposer,
+    make_empty_dflash_proposal,
+    select_dflash_verification_prefix,
+)
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -822,6 +826,12 @@ class GPUModelRunner(
             )
 
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
+        self.uniform_decode_query_lens = (self.uniform_decode_query_len,)
+        if self.speculative_config is not None and self.speculative_config.use_dflash():
+            query_lens = {1, self.uniform_decode_query_len}
+            if self.speculative_config.uses_dynamic_speculative_decoding():
+                query_lens.update(self.speculative_config.target_query_lens())
+            self.uniform_decode_query_lens = tuple(sorted(query_lens))
 
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
@@ -1777,8 +1787,10 @@ class GPUModelRunner(
         # on the GPU from prev_sampled_token_ids.
         prev_positions = self.prev_positions.np[:num_reqs]
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        valid_draft_counts = scheduler_output.dflash_num_valid_draft_tokens
         sample_flattened_indices: list[int] = []
         spec_flattened_indices: list[int] = []
+        padded_spec_flattened_indices: list[int] = []
         prev_draft_token_indices: list[int] = []
         prev_indices: list[int] = []
         common_indices_match = True
@@ -1794,14 +1806,28 @@ class GPUModelRunner(
             # We need to compute the flattened input_ids index of the
             # last token in each common request.
             draft_len = len(scheduled_spec_tokens.get(req_id, ()))
+            valid_draft_len = (
+                valid_draft_counts.get(req_id, draft_len)
+                if valid_draft_counts is not None
+                else draft_len
+            )
+            if valid_draft_len < 0 or valid_draft_len > draft_len:
+                raise RuntimeError(
+                    f"Request {req_id!r} has {valid_draft_len} valid DFlash "
+                    f"draft tokens in a scheduled width of {draft_len}."
+                )
             total_num_spec_tokens += draft_len
             flattened_index = cu_num_tokens[cur_index].item() - 1
             # example: cu_num_tokens = [2, 5, 8], draft_tokens = [1, 2, 2]
             # sample_flattened_indices = [0, 2, 5]
             # spec_flattened_indices = [1,   3, 4,    6, 7]
             sample_flattened_indices.append(flattened_index - draft_len)
+            first_spec_index = flattened_index - draft_len + 1
             spec_flattened_indices.extend(
-                range(flattened_index - draft_len + 1, flattened_index + 1)
+                range(first_spec_index, first_spec_index + valid_draft_len)
+            )
+            padded_spec_flattened_indices.extend(
+                range(first_spec_index + valid_draft_len, flattened_index + 1)
             )
             start = prev_index * self.prev_num_spec_tokens
             # prev_draft_token_indices is used to find which draft_tokens_id
@@ -1810,7 +1836,7 @@ class GPUModelRunner(
             # flatten draft_tokens_id [1,2,3,4,5,6]
             # draft_len of each request [1, 2, 1]
             # then prev_draft_token_indices is [0,   2, 3,   4]
-            prev_draft_token_indices.extend(range(start, start + draft_len))
+            prev_draft_token_indices.extend(range(start, start + valid_draft_len))
             common_indices_match &= prev_index == flattened_index
             max_flattened_index = max(max_flattened_index, flattened_index)
 
@@ -1831,7 +1857,12 @@ class GPUModelRunner(
             # No requests in common with the previous iteration
             # So input_ids.cpu will have all the input ids.
             return
-        if common_indices_match and max_flattened_index == (num_common_tokens - 1):
+        if (
+            common_indices_match
+            and max_flattened_index == (num_common_tokens - 1)
+            and len(spec_flattened_indices) == 0
+            and len(padded_spec_flattened_indices) == 0
+        ):
             # Common-case optimization: the batch is unchanged
             # and no reordering happened.
             # The indices are both the same permutation of 0..N-1 so
@@ -1856,8 +1887,27 @@ class GPUModelRunner(
             ],
         )
 
-        # Scatter the draft tokens after the sampled tokens are scattered.
-        if self._draft_token_ids is None or not spec_flattened_indices:
+        if len(padded_spec_flattened_indices) > 0:
+            padded_spec_index_tensor = torch.tensor(
+                padded_spec_flattened_indices,
+                dtype=torch.int64,
+                pin_memory=PIN_MEMORY,
+            ).to(self.device, non_blocking=True)
+            self.input_ids.gpu.index_fill_(
+                dim=0,
+                index=padded_spec_index_tensor,
+                value=0,
+            )
+
+        # Scatter real draft tokens after the sampled tokens are scattered.
+        if len(spec_flattened_indices) == 0:
+            return
+        if self._draft_token_ids is None:
+            if valid_draft_counts is not None:
+                raise RuntimeError(
+                    "The previous DFlash draft-token tensor is unavailable for a "
+                    "scheduled async verification row."
+                )
             return
 
         assert isinstance(self._draft_token_ids, torch.Tensor)
@@ -2234,7 +2284,9 @@ class GPUModelRunner(
                 ):
                     num_decode_draft_tokens[req_idx] = draft_len
             spec_decode_metadata = self._calc_spec_decode_metadata(
-                num_draft_tokens, cu_num_tokens
+                num_draft_tokens,
+                cu_num_tokens,
+                scheduler_output.dflash_num_valid_draft_tokens,
             )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
@@ -2804,6 +2856,7 @@ class GPUModelRunner(
         self,
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
+        dflash_num_valid_draft_tokens: dict[str, int] | None = None,
     ) -> SpecDecodeMetadata:
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
@@ -2864,6 +2917,40 @@ class GPUModelRunner(
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        # Embedding-safe padding uses token 0, but rejection sampling requires
+        # -1 to preserve the forced-reject provenance of absent DFlash drafts.
+        if dflash_num_valid_draft_tokens is not None:
+            invalid_draft_indices: list[int] = []
+            draft_offset = 0
+            for req_index, draft_len_value in enumerate(num_draft_tokens):
+                draft_len = int(draft_len_value)
+                req_id = self.input_batch.req_ids[req_index]
+                assert req_id is not None
+                valid_draft_len = dflash_num_valid_draft_tokens.get(req_id, draft_len)
+                if valid_draft_len < 0 or valid_draft_len > draft_len:
+                    raise RuntimeError(
+                        f"Request {req_id!r} has {valid_draft_len} valid DFlash "
+                        f"draft tokens in a scheduled width of {draft_len}."
+                    )
+                invalid_draft_indices.extend(
+                    range(
+                        draft_offset + valid_draft_len,
+                        draft_offset + draft_len,
+                    )
+                )
+                draft_offset += draft_len
+
+            if len(invalid_draft_indices) > 0:
+                invalid_draft_indices_gpu = async_tensor_h2d(
+                    invalid_draft_indices,
+                    device=self.device,
+                    dtype=torch.int64,
+                )
+                draft_token_ids.index_fill_(
+                    dim=0,
+                    index=invalid_draft_indices_gpu,
+                    value=-1,
+                )
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -3636,6 +3723,7 @@ class GPUModelRunner(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        scheduler_output: "SchedulerOutput",
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
@@ -3652,9 +3740,15 @@ class GPUModelRunner(
         # output_token_ids is needed (penalties or bad_words are in use).
         if self.use_async_scheduling and self._draft_token_req_ids is not None:
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
-            self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
+            self.input_batch.update_async_spec_token_ids(
+                draft_token_ids_cpu,
+                scheduler_output.dflash_num_valid_draft_tokens,
+            )
 
-        draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
+        draft_probs = self._get_spec_decode_draft_probs(
+            spec_decode_metadata,
+            scheduler_output.dflash_padded_request_ids,
+        )
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
@@ -3864,7 +3958,7 @@ class GPUModelRunner(
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
-        uniform_decode_query_len: int,
+        uniform_decode_query_lens: tuple[int, ...],
         num_tokens: int,
         num_reqs: int,
         force_uniform_decode: bool | None = None,
@@ -3875,7 +3969,7 @@ class GPUModelRunner(
         """
         return (
             (
-                (max_num_scheduled_tokens == uniform_decode_query_len)
+                (max_num_scheduled_tokens in uniform_decode_query_lens)
                 and (num_tokens == max_num_scheduled_tokens * num_reqs)
             )
             if force_uniform_decode is None
@@ -3906,7 +4000,7 @@ class GPUModelRunner(
     ]:
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
-            uniform_decode_query_len=self.uniform_decode_query_len,
+            uniform_decode_query_lens=self.uniform_decode_query_lens,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
@@ -3930,8 +4024,12 @@ class GPUModelRunner(
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
             return self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
+                num_reqs=num_reqs,
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
+                uniform_decode_query_len=(
+                    max_num_scheduled_tokens if uniform_decode else None
+                ),
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
@@ -4495,7 +4593,8 @@ class GPUModelRunner(
         return None
 
     def _input_fits_in_drafter(
-        self, common_attn_metadata: CommonAttentionMetadata | None
+        self,
+        common_attn_metadata: CommonAttentionMetadata | None,
     ) -> bool:
         if common_attn_metadata is None:
             return False
@@ -4574,7 +4673,11 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(
+                logits,
+                spec_decode_metadata,
+                scheduler_output,
+            )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4647,7 +4750,7 @@ class GPUModelRunner(
         if spec_config is not None:
             # Decide whether to run the drafter or zero out draft tokens.
             input_fits_in_drafter = self._input_fits_in_drafter(
-                spec_decode_common_attn_metadata
+                spec_decode_common_attn_metadata,
             )
             use_gpu_toks = (
                 spec_config.use_eagle()
@@ -4707,14 +4810,21 @@ class GPUModelRunner(
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
             if not input_fits_in_drafter:
-                # Zero out draft tokens so the scheduler doesn't schedule
-                # stale drafts from the previous step.
-                # For Nemotron-H: it is necessary to zero out the draft tokens,
-                # otherwise the stale tokens will corrupt Mamba recurrent
-                # state and logprobs for sequences near max_model_len.
-                self._draft_token_ids = torch.zeros(
-                    1, device=self.device, dtype=torch.int32
-                ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                if spec_config.use_dflash():
+                    if scheduler_output.num_spec_tokens_to_schedule != 0:
+                        raise RuntimeError(
+                            "The scheduler requested a DFlash proposal outside "
+                            "the drafter model's sequence-length window."
+                        )
+                    self._draft_token_ids = make_empty_dflash_proposal(
+                        len(self.input_batch.req_ids), self.device
+                    )
+                else:
+                    # Nemotron-H requires explicit zeroing here; stale drafts
+                    # would corrupt recurrent state and near-limit logprobs.
+                    self._draft_token_ids = torch.zeros(
+                        1, device=self.device, dtype=torch.int32
+                    ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._draft_probs = None
                 self._draft_prob_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
@@ -4978,8 +5088,18 @@ class GPUModelRunner(
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
     def _get_spec_decode_draft_probs(
-        self, spec_decode_metadata: SpecDecodeMetadata
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+        dflash_padded_request_ids: set[str] | None = None,
     ) -> torch.Tensor | None:
+        """Assemble cached proposal probabilities in target-batch order.
+
+        :param spec_decode_metadata: Rejection metadata for the target batch.
+        :param dflash_padded_request_ids: Requests whose scheduled draft width
+            contains no proposal.
+        :returns: Ordered draft probabilities, or ``None`` when probabilities
+            were not produced for this speculative-decoding mode.
+        """
         if self._draft_probs is None or self._draft_prob_req_ids is None:
             return None
 
@@ -4987,13 +5107,32 @@ class GPUModelRunner(
             req_id: idx for idx, req_id in enumerate(self._draft_prob_req_ids)
         }
         draft_probs_rows: list[torch.Tensor] = []
+        zero_draft_probs: torch.Tensor | None = None
         for req_id, num_draft in zip(
             self.input_batch.req_ids, spec_decode_metadata.num_draft_tokens
         ):
             if num_draft == 0:
                 continue
+            if (
+                dflash_padded_request_ids is not None
+                and req_id in dflash_padded_request_ids
+            ):
+                if zero_draft_probs is None:
+                    zero_draft_probs = self._draft_probs.new_zeros(
+                        (
+                            max(spec_decode_metadata.num_draft_tokens),
+                            self._draft_probs.shape[-1],
+                        )
+                    )
+                draft_probs_rows.append(zero_draft_probs[:num_draft])
+                continue
             row_idx = row_by_req_id.get(req_id)
             if row_idx is None:
+                if dflash_padded_request_ids is not None:
+                    raise RuntimeError(
+                        "Missing cached draft probabilities for real DFlash "
+                        f"request {req_id!r}."
+                    )
                 logger.warning(
                     "Missing cached draft probabilities for request %s; "
                     "falling back to legacy speculative rejection behavior.",
@@ -5021,7 +5160,14 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
-        num_spec_tokens_to_schedule = scheduler_output.num_spec_tokens_to_schedule
+        # This width belongs to the proposal produced after the current target
+        # pass. The current pass already consumed scheduled_spec_decode_tokens.
+        num_spec_tokens_to_verify = scheduler_output.num_spec_tokens_to_schedule
+        num_spec_tokens_to_generate = (
+            self.num_spec_tokens
+            if spec_config.use_dflash()
+            else num_spec_tokens_to_verify
+        )
         self._draft_probs = None
         self._draft_prob_req_ids = None
         if spec_config.method == "ngram":
@@ -5030,7 +5176,7 @@ class GPUModelRunner(
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.drafter.propose(
-                num_spec_tokens_to_schedule,
+                num_spec_tokens_to_generate,
                 sampled_token_ids,
                 self.input_batch.num_tokens_no_spec,
                 self.input_batch.token_ids_cpu,
@@ -5064,7 +5210,7 @@ class GPUModelRunner(
             batch_size = next_token_ids.shape[0]
 
             draft_token_ids, num_valid_draft_tokens = self.drafter.propose(
-                num_spec_tokens_to_schedule,
+                num_spec_tokens_to_generate,
                 self.num_tokens_no_spec_gpu[:batch_size],
                 self.token_ids_gpu_tensor[:batch_size],
                 valid_sampled_token_ids_gpu,
@@ -5086,7 +5232,7 @@ class GPUModelRunner(
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, SuffixDecodingProposer)
             draft_token_ids = self.drafter.propose(
-                num_spec_tokens_to_schedule,
+                num_spec_tokens_to_generate,
                 self.input_batch,
                 sampled_token_ids,
                 slot_mappings=slot_mappings,
@@ -5113,7 +5259,7 @@ class GPUModelRunner(
                 hidden_states = sample_hidden_states[indices]
 
             draft_token_ids = self.drafter.propose(
-                num_speculative_tokens=num_spec_tokens_to_schedule,
+                num_speculative_tokens=num_spec_tokens_to_generate,
                 target_hidden_states=hidden_states,
                 sampling_metadata=sampling_metadata,
                 slot_mappings=slot_mappings,
@@ -5131,7 +5277,7 @@ class GPUModelRunner(
             target_hidden_states = [h[:num_scheduled_tokens] for h in aux_hidden_states]
 
             draft_token_ids = self.drafter.propose(
-                num_speculative_tokens=num_spec_tokens_to_schedule,
+                num_speculative_tokens=num_spec_tokens_to_generate,
                 sampled_token_ids=sampled_token_ids,
                 target_hidden_states=target_hidden_states,
                 common_attn_metadata=common_attn_metadata,
@@ -5265,7 +5411,7 @@ class GPUModelRunner(
                 mm_embed_inputs = None
 
             draft_token_ids = self.drafter.propose(
-                num_speculative_tokens=num_spec_tokens_to_schedule,
+                num_speculative_tokens=num_spec_tokens_to_generate,
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -5282,6 +5428,18 @@ class GPUModelRunner(
                 if draft_probs is not None:
                     self._draft_probs = draft_probs
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
+
+            if spec_config.use_dflash():
+                assert isinstance(draft_token_ids, torch.Tensor)
+                assert draft_token_ids.ndim == 2
+                assert draft_token_ids.shape[1] == self.num_spec_tokens
+                draft_token_ids = select_dflash_verification_prefix(
+                    draft_token_ids, num_spec_tokens_to_verify
+                )
+                if self._draft_probs is not None:
+                    self._draft_probs = select_dflash_verification_prefix(
+                        self._draft_probs, num_spec_tokens_to_verify
+                    )
 
         return draft_token_ids
 
@@ -5820,6 +5978,7 @@ class GPUModelRunner(
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
+        uniform_decode_query_len: int | None = None,
         allow_microbatching: bool = True,
         skip_eplb: bool = False,
         is_profile: bool = False,
@@ -5845,6 +6004,8 @@ class GPUModelRunner(
             force_attention: If True, always create attention metadata. Used to
                 warm up attention backend when mode is NONE.
             uniform_decode: If True, the batch is a uniform decode batch.
+            uniform_decode_query_len: Query length for a uniform decode graph.
+                Defaults to the maximum configured target query length.
             skip_eplb: If True, skip EPLB state update.
             is_profile: If True, this is a profile run.
             create_mixed_batch: If True, create a mixed batch with both decode
@@ -5880,7 +6041,14 @@ class GPUModelRunner(
         # When setting max_query_len = 1, we switch to and capture the optimized
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
-        max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
+        if uniform_decode:
+            max_query_len = (
+                self.uniform_decode_query_len
+                if uniform_decode_query_len is None
+                else uniform_decode_query_len
+            )
+        else:
+            max_query_len = num_tokens
 
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
@@ -6818,12 +6986,18 @@ class GPUModelRunner(
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        uniform_decode_query_len = None
+        if desc.uniform:
+            assert desc.num_reqs is not None
+            assert desc.num_tokens % desc.num_reqs == 0
+            uniform_decode_query_len = desc.num_tokens // desc.num_reqs
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
                 force_attention=force_attention,
                 uniform_decode=desc.uniform,
+                uniform_decode_query_len=uniform_decode_query_len,
                 allow_microbatching=allow_microbatching,
                 skip_eplb=True,
                 remove_lora=False,
@@ -6834,6 +7008,7 @@ class GPUModelRunner(
             desc.num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             uniform_decode=desc.uniform,
+            uniform_decode_query_len=uniform_decode_query_len,
             allow_microbatching=allow_microbatching,
             skip_eplb=True,
             remove_lora=False,
@@ -7072,7 +7247,7 @@ class GPUModelRunner(
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode, self.uniform_decode_query_len
+            cudagraph_mode, self.uniform_decode_query_lens
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.

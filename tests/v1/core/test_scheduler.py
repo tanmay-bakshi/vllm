@@ -16,6 +16,10 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.config.speculative import (
+    DFlashAdaptiveVerificationConfig,
+    DFlashVerificationCost,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -36,6 +40,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.spec_decode.dflash import select_dflash_verification_prefix
 from vllm.v1.structured_output import StructuredOutputManager
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
@@ -1147,6 +1152,80 @@ def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
         assert stats.num_draft_tokens == expected[1]
         assert stats.num_accepted_tokens == expected[2]
         assert stats.num_accepted_tokens_per_pos == expected[3]
+
+
+def test_dflash_scheduler_observes_selected_prefix_in_output_policy_tier() -> None:
+    adaptive_config = DFlashAdaptiveVerificationConfig(
+        costs=[
+            DFlashVerificationCost(
+                batch_size_range=batch_size_range,
+                sequence_length_range=(1, 256),
+                query_len=query_len,
+                round_cost_ms=round_cost_ms,
+            )
+            for batch_size_range in ((1, 1), (2, 2))
+            for query_len, round_cost_ms in (
+                (4, 2.0),
+                (8, 3.0),
+                (12, 8.0),
+                (16, 10.0),
+            )
+        ],
+        initial_acceptance_rates=[1.0] * 15,
+        acceptance_ema_alpha=1.0,
+    )
+    speculative_config = SpeculativeConfig(model="ngram", num_speculative_tokens=15)
+    speculative_config.method = "dflash"
+    speculative_config.parallel_drafting = True
+    speculative_config.dflash_adaptive_verification = adaptive_config
+    scheduler = create_scheduler(
+        max_model_len=256, speculative_config=speculative_config
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=8, max_tokens=64)
+    request_id = request.request_id
+    scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    _model_output(scheduler, prefill_output, [[100]])
+
+    full_draft = torch.arange(15).view(1, 15)
+    scheduler.update_draft_token_ids(DraftTokenIds([request_id], full_draft.tolist()))
+    full_verification_output = scheduler.schedule()
+
+    assert full_verification_output.dflash_verification_query_len == 16
+    assert full_verification_output.num_spec_tokens_to_schedule == 7
+    _model_output(scheduler, full_verification_output, [list(range(16))])
+
+    selected_prefix = select_dflash_verification_prefix(full_draft, 7)
+    assert selected_prefix.stride(0) == 15
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request_id], selected_prefix.tolist())
+    )
+    selected_verification_output = scheduler.schedule()
+
+    assert selected_verification_output.scheduled_spec_decode_tokens[request_id] == (
+        selected_prefix[0].tolist()
+    )
+    assert selected_verification_output.dflash_verification_query_len == 8
+    assert selected_verification_output.dflash_num_valid_draft_tokens == {request_id: 7}
+
+    policy = scheduler.dflash_adaptive_verification_policy
+    assert policy is not None
+    tier = policy._get_tier(
+        selected_verification_output.dflash_verification_batch_size,
+        selected_verification_output.dflash_verification_max_sequence_length,
+    )
+    other_tier = policy._get_tier(
+        2, selected_verification_output.dflash_verification_max_sequence_length
+    )
+    assert tier is not None
+    assert other_tier is not None
+    assert tier.conditional_acceptance_rates[0] == 1.0
+
+    _model_output(scheduler, selected_verification_output, [[200]])
+
+    assert tier.conditional_acceptance_rates[0] == 0.0
+    assert other_tier.conditional_acceptance_rates[0] == 1.0
 
 
 def test_spec_decoding_stats_empty_output():

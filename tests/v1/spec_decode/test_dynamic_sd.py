@@ -5,6 +5,14 @@
 import pytest
 
 from tests.v1.core.utils import create_requests, create_scheduler
+from vllm.config import (
+    CompilationConfig,
+    CompilationMode,
+    CUDAGraphMode,
+    SpeculativeConfig,
+    VllmConfig,
+)
+from vllm.platforms import current_platform
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.spec_decode.dynamic.utils import (
     build_dynamic_sd_schedule_lookup,
@@ -339,3 +347,96 @@ def test_scheduler_composes_batch_size_and_seq_len_schedules():
     output = _add_requests_and_schedule(scheduler, 1, num_tokens=200)
 
     assert output.num_spec_tokens_to_schedule == 1
+
+
+def test_decode_operating_point_uses_explicit_dflash_cohort() -> None:
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        max_num_batched_tokens=32,
+        num_speculative_tokens=3,
+    )
+    decode_request, prefill_request = create_requests(
+        num_requests=2,
+        num_tokens=16,
+    )
+    decode_request.append_output_token_ids(1)
+    decode_request.num_computed_tokens = decode_request.num_tokens - 1
+    scheduler.requests = {
+        decode_request.request_id: decode_request,
+        prefill_request.request_id: prefill_request,
+    }
+
+    batch_size, max_sequence_length = scheduler._scheduled_decode_operating_point(
+        {
+            decode_request.request_id: 1,
+            prefill_request.request_id: 8,
+        }
+    )
+
+    assert batch_size == 1
+    assert max_sequence_length == decode_request.num_tokens
+
+    final_prefill_batch_size, final_prefill_max_sequence_length = (
+        scheduler._scheduled_decode_operating_point(
+            {prefill_request.request_id: prefill_request.num_tokens}
+        )
+    )
+    assert final_prefill_batch_size == 1
+    assert final_prefill_max_sequence_length == prefill_request.num_tokens
+
+    dflash_batch_size, dflash_max_sequence_length = (
+        scheduler._scheduled_decode_operating_point(
+            {prefill_request.request_id: prefill_request.num_tokens},
+            decode_req_ids=set(),
+        )
+    )
+    assert dflash_batch_size == 0
+    assert dflash_max_sequence_length == 0
+
+
+@pytest.mark.parametrize(
+    ("cudagraph_mode", "expected_mode"),
+    [
+        (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE),
+        (CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE),
+    ],
+)
+def test_dynamic_dflash_requires_shape_specific_full_graphs(
+    cudagraph_mode: CUDAGraphMode,
+    expected_mode: CUDAGraphMode,
+) -> None:
+    speculative_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=15,
+        num_speculative_tokens_per_batch_size=[(1, 16, 15)],
+    )
+    speculative_config.method = "dflash"
+    vllm_config = VllmConfig()
+    vllm_config.speculative_config = speculative_config
+    vllm_config.compilation_config.cudagraph_mode = cudagraph_mode
+
+    vllm_config._maybe_override_spec_decode_cudagraph_mode()
+
+    assert vllm_config.compilation_config.cudagraph_mode == expected_mode
+
+
+def test_dflash_graph_guard_runs_after_splitting_op_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(current_platform, "support_static_graph_mode", lambda: True)
+    speculative_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=15,
+    )
+    speculative_config.method = "dflash"
+
+    vllm_config = VllmConfig(
+        speculative_config=speculative_config,
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            splitting_ops=[],
+        ),
+    )
+
+    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE

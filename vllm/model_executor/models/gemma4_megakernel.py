@@ -6,9 +6,10 @@ module is never imported). Kernels + weight-prep recipes are imported
 from the megakernel workspace (VLLM_GEMMA4_MEGAKERNEL_PATH).
 
 Knobs: MK_MSET "q:r,..." = (tokens-per-request, requests) batch shapes
-to SERVE (default "1:1,16:1"). Shapes with q*r > 128 run as row-block
-chains of their base-shape kernels (see BASE_ROWS) -- compile cost is
-per unique base shape only. MK_STRICT=1 (default) makes uncovered
+to SERVE (default "1:1,16:1"). Measured M256/M384/M512 shapes use their
+high-M tactic; other shapes above 128 rows run as exact row-block
+compositions (see plan_shape). Compile cost is per unique component shape.
+MK_STRICT=1 (default) makes uncovered
 uniform-decode shapes a hard error (mega-only decode: under the F2b
 single-plane cache the stock path is numerically wrong, not merely
 slow); MK_STRICT_MIXED=1 extends that to non-uniform decode batches
@@ -51,6 +52,13 @@ import sys
 
 import torch
 
+from vllm.model_executor.models.gemma4_megakernel_shapes import (
+    MAX_SERVED_ROWS,
+    kernel_shapes,
+    plan_shape,
+    row_offsets,
+)
+
 MK_ROOT = os.environ.get(
     "VLLM_GEMMA4_MEGAKERNEL_PATH",
     "/data/gemma4-2026-06-optimization-effort/megakernel")
@@ -59,34 +67,7 @@ if MK_ROOT not in sys.path:
 
 HIDDEN, INTER = 5376, 21504
 N2 = 5632                      # down/o_proj padded N (tile 128 x cga 4)
-MAXM = 512
-# Max rows per kernel launch. Shapes with q*r > BASE_ROWS run as
-# row-block CHAINS of the base-shape kernels (per-block offset
-# pointers + per-block flag sets): the M>128 single-launch redesign
-# is parked (probe_m256.py: kernels are single-wave/cadence-bound;
-# chaining costs ~2.7us/block, upper bound of the redesign ~1-3% at
-# C16/C32 only -- SESSION_FINDINGS phase 18 addendum).
-BASE_ROWS = 128
-
-
-def _rpb(key):
-    """Requests per 128-row block for a (q_len, R) shape."""
-    q, _ = key
-    return max(1, BASE_ROWS // q)
-
-
-def _nblk(key):
-    """Row blocks for a shape; chained shapes must fill blocks evenly."""
-    q, r = key
-    rpb = _rpb(key)
-    assert r <= rpb or r % rpb == 0, f"uneven row blocks for {key}"
-    return (r + rpb - 1) // rpb
-
-
-def _base_key(key):
-    """The compiled-kernel shape a (possibly chained) key launches."""
-    q, r = key
-    return (q, min(r, _rpb(key)))
+MAXM = MAX_SERVED_ROWS
 EPS = 1e-6
 # compile-time KV extent: a fixed upper bound instead of the live
 # cache's numel. It is only a flat layout extent (addressing is
@@ -130,43 +111,55 @@ def _compile_shapes(m_set, facts, pdl, tag):
     boot-invariant, so async-compiled kernels stay valid across KV
     rebinds. Every cute.compile goes through the process-wide lock."""
     import time
-    from mk_fused.fused_preattn_sm100 import Sm100PreAttnKernel
-    from mk_fused.fused_postattn_sm100 import Sm100PostAttnKernel
+    from mk_fused.gemma4_kernel_tactics import select_kernel_tactic
     from mkbench.cutedsl_driver import (compile_fused_preattn,
                                         compile_fused_postattn)
     t0 = time.time()
     k3, k2, k2_by_m = {}, {}, {}
-    # chained shapes (q*r > BASE_ROWS) launch their base-shape kernels
-    # per row block: compile unique base keys only
-    bases = sorted({_base_key(k) for k in m_set})
-    for (q, r) in bases:
+    flag_slots3, flag_slots2_by_m = {}, {}
+    # Compile each component shape once, regardless of how many complete
+    # served shapes reuse it.
+    for (q, r) in kernel_shapes(m_set):
         M = q * r
         mp = max(M, 8)
+        tactic = select_kernel_tactic(M)
         for f, c in facts.items():
-            if f == "global" and "MK_KSPLIT_Q" not in os.environ:
+            injected_ksplit_q = (
+                f == "global" and "MK_KSPLIT_Q" not in os.environ
+            )
+            if injected_ksplit_q:
                 os.environ["MK_KSPLIT_Q"] = "2"
-            k = Sm100PreAttnKernel(
-                mp, M, c["n_qkv"], HIDDEN, c["heads"], c["KV"],
-                c["hd"], kv_numel=KV_NUMEL_BOUND,
-                cs_numel=c["cs_numel"], bt_len=c["bt_len"],
-                page_size=c["ps"], bt_stride=c["bt_len"], q_len=q,
-                mo_stride=N2,
-                cluster_shape_mn=(1, 4), enable_pdl=pdl,
-                kv_bf16=c.get("kv_bf16", False),
-                kv_single=c.get("single", False))
-            k3[(f, q, r)] = compile_fused_preattn(k)
-            if f == "global":
-                os.environ.pop("MK_KSPLIT_Q", None)
+            try:
+                k = tactic.preattn_kernel(
+                    mp, M, c["n_qkv"], HIDDEN, c["heads"], c["KV"],
+                    c["hd"], kv_numel=KV_NUMEL_BOUND,
+                    cs_numel=c["cs_numel"], bt_len=c["bt_len"],
+                    page_size=c["ps"], bt_stride=c["bt_len"], q_len=q,
+                    mo_stride=N2,
+                    cluster_shape_mn=tactic.cluster_shape_mn, enable_pdl=pdl,
+                    kv_bf16=c.get("kv_bf16", False),
+                    kv_single=c.get("single", False))
+                k3[(f, q, r)] = compile_fused_preattn(k)
+                flag_slots3[(f, q, r)] = k.flags_slots
+            finally:
+                if injected_ksplit_q:
+                    os.environ.pop("MK_KSPLIT_Q", None)
             if (f, M) not in k2_by_m:
-                k = Sm100PostAttnKernel(
+                k = tactic.postattn_kernel(
                     mp, M, 2 * INTER, HIDDEN, N2, INTER,
                     c["q_size"], mma_tiler_mn=(128, 128),
-                    cluster_shape_mn=(1, 4), enable_pdl=pdl)
+                    cluster_shape_mn=tactic.cluster_shape_mn, enable_pdl=pdl)
                 k2_by_m[(f, M)] = compile_fused_postattn(k)
+                flag_slots2_by_m[(f, M)] = k.flags_slots
             k2[(f, q, r)] = k2_by_m[(f, M)]
             _log(f"[{tag}] compiled B3+B2 {f} q={q} r={r} M={M} "
+                 f"cluster={tactic.cluster_shape_mn} "
                  f"({time.time() - t0:.0f}s)")
-    return k3, k2
+    flag_slots2 = {
+        (f, q, r): flag_slots2_by_m[(f, q * r)]
+        for f, q, r in k2
+    }
+    return k3, k2, flag_slots3, flag_slots2
 
 
 def _kv5(kvc: torch.Tensor, KV: int, hd: int) -> torch.Tensor:
@@ -272,7 +265,7 @@ class MegaRunner:
                 for p in ms.split(","))
         for k in self.m_set:
             assert k[0] * k[1] <= MAXM, f"{k} exceeds MAXM={MAXM}"
-            _nblk(k)  # validates even row-block fill for chained shapes
+            plan_shape(k)
         self.pdl = os.environ.get("MK_PDL", "0") == "1"
         # periodic counter log for serve-mode observability (0 = off)
         self.log_every = int(os.environ.get("MK_LOG_EVERY", "0"))
@@ -368,8 +361,8 @@ class MegaRunner:
         self._compile_thread = threading.Thread(
             target=work, daemon=True, name="mk-compile")
         self._compile_thread.start()
-        nb = len({_base_key(k) for k in m_set})
-        _log(f"async kernel compiles started ({nb} base shapes for "
+        nb = len(kernel_shapes(m_set))
+        _log(f"async kernel compiles started ({nb} component shapes for "
              f"{len(m_set)} served shapes x {len(facts)} flavors)")
 
     def _join_async_compiles(self):
@@ -662,48 +655,13 @@ class MegaRunner:
         s.out = torch.zeros(MAXM, N2, dtype=torch.bfloat16, device=dev)
         sf_k1 = (HIDDEN // 16 + 3) // 4
         sf_k2 = (INTER // 16 + 3) // 4
+        sf_m = (MAXM + 127) // 128
         s.xq = torch.zeros(MAXM, HIDDEN // 2, dtype=torch.uint8, device=dev)
-        s.xsf = torch.zeros(32 * 4 * 1 * 4 * sf_k1, dtype=torch.uint8,
+        s.xsf = torch.zeros(32 * 4 * sf_m * 4 * sf_k1, dtype=torch.uint8,
                             device=dev)
         s.iq = torch.zeros(MAXM, INTER // 2, dtype=torch.uint8, device=dev)
-        s.isf = torch.zeros(32 * 4 * 1 * 4 * sf_k2, dtype=torch.uint8,
+        s.isf = torch.zeros(32 * 4 * sf_m * 4 * sf_k2, dtype=torch.uint8,
                             device=dev)
-        ks_o = int(os.environ.get("MK_KSPLIT_O", "3"))
-        ks_d = int(os.environ.get("MK_KSPLIT", "2"))
-        t2_slots = (N2 // 128) * ks_d
-        # The kernels' progressive-release gates poll persistent epoch
-        # counters whose arithmetic assumes every launch on a counter set
-        # has the same m_real. Sharing a set across compiled shapes
-        # deadlocks the first larger-shape launch after smaller-shape
-        # traffic (poll target runs ahead of the cumulative release) and
-        # opens gates early in the other direction. One set per shape.
-        s.flag_guards = []
-
-        def _fl(n):
-            t = torch.zeros(n, dtype=torch.int32, device=dev)
-            # redzone right after each flags tensor: same segment in the
-            # caching allocator with high probability, so an OOB writer
-            # runs into it and the flaglog checksum exposes it
-            s.flag_guards.append(
-                torch.zeros(512, dtype=torch.int32, device=dev))
-            return t
-
-        # one counter set per (flavor, served shape, row block): chained
-        # launches of the same compiled kernel never share epochs with
-        # another serving shape (the cross-shape sharing deadlock), and
-        # per-block sets isolate failure domains in the flaglog
-        s.flags3 = {(f, q, r, b): _fl(2048)
-                    for f in fc for (q, r) in s.m_set
-                    for b in range(_nblk((q, r)))}
-        s.flags2 = {(f, q, r, b): _fl(
-                        2 * INTER // 128 + t2_slots + 2 + 2048)
-                    for f in fc for (q, r) in s.m_set
-                    for b in range(_nblk((q, r)))}
-        # trtllm-gen workspace is allocated AFTER cap_max_seq is known
-        # (see below): its demand scales with the baked max_seq_len, and
-        # an undersized buffer corrupts long-context attention SILENTLY
-        # before it eventually IMAs at higher concurrency.
-
         # ---- kernels compile at the END of prepare: weight prep runs
         # first so it overlaps the async compile thread's tail
         for f in fc:
@@ -711,7 +669,7 @@ class MegaRunner:
 
         # ---- per-layer weights + arg lists ----
         s.lps = []
-        max_nblk = max(_nblk(k) for k in s.m_set)
+        served_row_offsets = row_offsets(s.m_set)
         FP8 = torch.float8_e4m3fn
         for i, layer in enumerate(layers):
             lw = load_layer(i)
@@ -814,11 +772,9 @@ class MegaRunner:
                 0,  # flags2 ptr, patched per shape+block (fl2_idx)
             ]
             lp.fl2_idx = 20
-            # row-block variants: chained shapes launch the base-shape
-            # kernels once per 128-row block with the per-row buffers
-            # advanced by 128 rows. Weight/shared-scratch pointers (the
-            # sf swizzle buffers are 128-row-sized, produced and
-            # consumed within one stream-ordered launch) stay fixed.
+            # Weight/shared-scratch pointers stay fixed. The sf swizzle
+            # buffers are produced and consumed within one stream-ordered
+            # launch, so ragged component kernels can safely reuse them.
             off3 = {0: 2 * N2, 1: 2 * HIDDEN, 4: 2 * HIDDEN, 5: HIDDEN,
                     6: 4, 9: 2 * c["n_qkv"], 13: 4,
                     15: s.q8[f].element_size() * c["q_size"]}
@@ -827,10 +783,13 @@ class MegaRunner:
                     10: HIDDEN // 2, 14: INTER // 2, 18: 2 * N2}
 
             def _blocks(base, off):
-                return [
-                    [(v + off[i] * b * BASE_ROWS) if i in off else v
-                     for i, v in enumerate(base)]
-                    for b in range(max_nblk)]
+                return {
+                    row_offset: [
+                        (v + off[i] * row_offset) if i in off else v
+                        for i, v in enumerate(base)
+                    ]
+                    for row_offset in served_row_offsets
+                }
 
             lp.b3_blk = _blocks(base3, off3)
             lp.b2_blk = _blocks(base2, off2)
@@ -895,12 +854,41 @@ class MegaRunner:
         _log(f"aux taps: {s.taps}; cap_max_seq {s.cap_max_seq}")
         pre = self._join_async_compiles()
         if pre is not None:
-            s.k3, s.k2 = pre
+            s.k3, s.k2, flag_slots3, flag_slots2 = pre
             _log(f"kernels: adopted async-compiled set "
                  f"({time.time() - t0:.0f}s into prepare)")
         else:
             _install_dsl_compile_lock()
-            s.k3, s.k2 = _compile_shapes(self.m_set, fc, self.pdl, "prep")
+            s.k3, s.k2, flag_slots3, flag_slots2 = _compile_shapes(
+                self.m_set, fc, self.pdl, "prep")
+
+        # Progressive-release epochs are tactic-specific. Each served shape
+        # and row block owns independent counters, so interleaved graph replays
+        # cannot advance another shape's gates.
+        s.flag_guards = []
+
+        def _fl(n):
+            t = torch.zeros(n, dtype=torch.int32, device=dev)
+            # Adjacent redzones make tactic-specific flag overruns visible to
+            # the existing checksum diagnostics.
+            s.flag_guards.append(
+                torch.zeros(512, dtype=torch.int32, device=dev))
+            return t
+
+        s.flags3 = {
+            (f, q, r, block_index): _fl(
+                flag_slots3[(f, *block.kernel_shape)])
+            for f in fc
+            for q, r in s.m_set
+            for block_index, block in enumerate(plan_shape((q, r)))
+        }
+        s.flags2 = {
+            (f, q, r, block_index): _fl(
+                flag_slots2[(f, *block.kernel_shape)])
+            for f in fc
+            for q, r in s.m_set
+            for block_index, block in enumerate(plan_shape((q, r)))
+        }
         self.prepared = True
         if s.flag_log:
             s._flagdump("post-prep")
@@ -920,16 +908,14 @@ class MegaRunner:
         """The capturable decode step: reads xin/pos_i32 + baked
         pointers, writes hid + aux_buf. Allocation- and sync-free.
         q = tokens per request, r = requests, T = q*r total rows.
-        Shapes with T > BASE_ROWS run each fused kernel as a chain of
-        row-block launches (base-shape kernels, offset pointers); the
+        Shapes with T > 128 run each fused kernel as an exact
+        composition of row-block launches with offset pointers; the
         trtllm core takes the full batch in one call. ov/sl (q1-ized
         path): PER-LAYER expanded block tables + per-token seq_lens
         replacing the engine metadata."""
         s = self
         m = q * r
-        nb = _nblk((q, r))
-        rpb = _rpb((q, r))
-        bq, br = _base_key((q, r))
+        blocks = plan_shape((q, r))
         # B3 reads B2's padded out directly (mo_stride=N2); zeroed rows
         # are the layer-0 "mo = 0" entry
         s.out[:m].zero_()
@@ -945,12 +931,12 @@ class MegaRunner:
                 sl_t = md.decode.seq_lens
             bt0 = bt_t.data_ptr()
             btr = bt_t.stride(0) * 4  # bytes/req row
-            for b in range(nb):
-                args = lp.b3_blk[b]
-                args[lp.bt_idx] = bt0 + b * rpb * btr
+            for b, block in enumerate(blocks):
+                args = lp.b3_blk[block.row_offset]
+                args[lp.bt_idx] = bt0 + block.request_offset * btr
                 args[lp.fl3_idx] = (
                     s.flags3[(lp.flavor, q, r, b)].data_ptr())
-                s.k3[(lp.flavor, bq, br)](*args)
+                s.k3[(lp.flavor, *block.kernel_shape)](*args)
             if i in s.tapset and i > 0:
                 s.aux_buf[i][:m].copy_(s.h[:m])
             if lp.kvc_sp is not None:
@@ -977,11 +963,11 @@ class MegaRunner:
                     q_len_per_req=q,
                     enable_pdl=s.pdl,
                 )
-            for b in range(nb):
-                args2 = lp.b2_blk[b]
+            for b, block in enumerate(blocks):
+                args2 = lp.b2_blk[block.row_offset]
                 args2[lp.fl2_idx] = (
                     s.flags2[(lp.flavor, q, r, b)].data_ptr())
-                s.k2[(lp.flavor, bq, br)](*args2)
+                s.k2[(lp.flavor, *block.kernel_shape)](*args2)
         # tail: close layer 59 + the model's final norm. One contiguous
         # staging copy for rms_norm's input contract (was per-layer).
         s.mo[:m].copy_(s.out[:m, :HIDDEN])

@@ -766,20 +766,31 @@ class VllmConfig:
 
         apply_recursive(self, defaults)
 
-    def _maybe_override_dynamic_sd_cudagraph_mode(self) -> None:
+    def _maybe_override_spec_decode_cudagraph_mode(self) -> None:
         speculative_config = self.speculative_config
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        has_variable_query_lengths = speculative_config is not None and (
+            speculative_config.uses_dynamic_speculative_decoding()
+            or speculative_config.use_dflash()
+        )
+        dflash_has_shape_specific_graphs = (
+            speculative_config is not None
+            and speculative_config.use_dflash()
+            and cudagraph_mode.separate_routine()
+        )
         if (
             speculative_config is None
-            or not speculative_config.uses_dynamic_speculative_decoding()
-            or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            or not has_variable_query_lengths
+            or dflash_has_shape_specific_graphs
+            or not cudagraph_mode.has_full_cudagraphs()
         ):
             return
 
         logger.warning_once(
-            "Dynamic speculative decoding changes the target verification "
+            "Speculative decoding changes the target verification "
             "length at runtime. Overriding cudagraph_mode from %s to "
             "PIECEWISE for reliability.",
-            self.compilation_config.cudagraph_mode.name,
+            cudagraph_mode.name,
         )
         self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
@@ -1178,21 +1189,6 @@ class VllmConfig:
                 "optimization level defaults."
             )
 
-        self._maybe_override_dynamic_sd_cudagraph_mode()
-
-        if (
-            self.compilation_config.cudagraph_mode.requires_piecewise_compilation()
-            and self.compilation_config.mode != CompilationMode.VLLM_COMPILE
-            and not envs.VLLM_USE_BREAKABLE_CUDAGRAPH
-        ):
-            logger.info(
-                "Cudagraph mode %s is not compatible with compilation mode %s."
-                "Overriding to NONE.",
-                self.compilation_config.cudagraph_mode,
-                self.compilation_config.mode,
-            )
-            self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-
         # async tp is built on top of sequence parallelism and requires it.
         pass_config = self.compilation_config.pass_config
         if pass_config.fuse_gemm_comms:
@@ -1377,6 +1373,20 @@ class VllmConfig:
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
         )
+        self._maybe_override_spec_decode_cudagraph_mode()
+
+        if (
+            self.compilation_config.cudagraph_mode.requires_piecewise_compilation()
+            and self.compilation_config.mode != CompilationMode.VLLM_COMPILE
+            and not envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+        ):
+            logger.info(
+                "Cudagraph mode %s is not compatible with compilation mode %s."
+                "Overriding to NONE.",
+                self.compilation_config.cudagraph_mode,
+                self.compilation_config.mode,
+            )
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
         if self.compilation_config.pass_config.enable_sp:
             # With pipeline parallelism, native rms norm tracing errors due to

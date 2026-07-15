@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import vllm.utils.torch_utils as torch_utils
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.config import (
     AttentionConfig,
@@ -309,6 +310,112 @@ def test_sample_tokens_skips_pp_group_lookup_without_async_scheduling(
 
     output = GPUModelRunner.sample_tokens(runner, None)
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
+
+
+def test_prepare_input_ids_preserves_dflash_padding_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gpu_model_runner_module, "PIN_MEMORY", False)
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.enable_prompt_embeds = False
+    runner.prev_num_spec_tokens = 3
+    runner.prev_positions = SimpleNamespace(np=np.array([0, 1], dtype=np.int32))
+    runner.input_ids = SimpleNamespace(
+        gpu=torch.full((8,), -99, dtype=torch.int32),
+        copy_to_gpu=Mock(),
+    )
+    runner.input_batch = SimpleNamespace(
+        prev_sampled_token_ids=torch.tensor([[100], [200]], dtype=torch.int32),
+        req_ids=["real", "padding"],
+    )
+    runner._draft_token_ids = torch.tensor(
+        [[10, 11, 12], [20, 21, 22]], dtype=torch.int32
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={
+            "real": [-1, -1, -1],
+            "padding": [-1, -1, -1],
+        },
+        dflash_num_valid_draft_tokens={"real": 3, "padding": 0},
+    )
+
+    runner._prepare_input_ids(
+        scheduler_output,
+        num_reqs=2,
+        total_num_scheduled_tokens=8,
+        cu_num_tokens=np.array([4, 8], dtype=np.int32),
+    )
+
+    torch.testing.assert_close(
+        runner.input_ids.gpu,
+        torch.tensor([100, 10, 11, 12, 200, 0, 0, 0], dtype=torch.int32),
+    )
+
+
+def test_update_async_spec_token_ids_leaves_invalid_padding_untouched() -> None:
+    input_batch = InputBatch.__new__(InputBatch)
+    input_batch.prev_req_id_to_index = {"real": 0, "padding": 1, "partial": 2}
+    input_batch._req_ids = ["real", "padding", "partial"]
+    input_batch.sampling_metadata = SimpleNamespace(
+        spec_token_ids=[[-1, -1, -1], [-1, -1, -1], [-1, -1, -1]]
+    )
+
+    input_batch.update_async_spec_token_ids(
+        [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+        {"real": 3, "padding": 0, "partial": 2},
+    )
+
+    assert input_batch.sampling_metadata.spec_token_ids == [
+        [1, 2, 3],
+        [-1, -1, -1],
+        [7, 8, -1],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("input_ids", "valid_draft_counts", "expected_draft_ids"),
+    [
+        pytest.param(
+            [100, 10, 11, 12, 200, 0, 0, 0],
+            {"real": 3, "padding": 0},
+            [10, 11, 12, -1, -1, -1],
+            id="async-q1-padding",
+        ),
+        pytest.param(
+            [100, 10, 0, 0, 200, 20, 21, 22],
+            {"real": 1, "padding": 3},
+            [10, -1, -1, 20, 21, 22],
+            id="sync-structured-prefix",
+        ),
+    ],
+)
+def test_calc_spec_decode_metadata_restores_invalid_dflash_sentinels(
+    monkeypatch: pytest.MonkeyPatch,
+    input_ids: list[int],
+    valid_draft_counts: dict[str, int],
+    expected_draft_ids: list[int],
+) -> None:
+    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.arange_np = np.arange(8, dtype=np.int32)
+    runner._arange_scratch = np.empty(8, dtype=np.int32)
+    runner.input_ids = SimpleNamespace(
+        gpu=torch.tensor(input_ids, dtype=torch.int32),
+    )
+    runner.input_batch = SimpleNamespace(req_ids=["real", "padding"])
+
+    metadata = runner._calc_spec_decode_metadata(
+        num_draft_tokens=np.array([3, 3], dtype=np.int32),
+        cu_num_scheduled_tokens=np.array([4, 8], dtype=np.int32),
+        dflash_num_valid_draft_tokens=valid_draft_counts,
+    )
+
+    torch.testing.assert_close(
+        metadata.draft_token_ids,
+        torch.tensor(expected_draft_ids, dtype=torch.int32),
+    )
 
 
 def test_select_common_block_size_no_valid_option():
@@ -850,7 +957,12 @@ def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
     )
     logits = torch.randn(6, 4)
 
-    output = GPUModelRunner._sample(runner, logits, spec_decode_metadata)
+    output = GPUModelRunner._sample(
+        runner,
+        logits,
+        spec_decode_metadata,
+        SimpleNamespace(dflash_padded_request_ids=None),
+    )
 
     assert output == "sampler_output"
     passed_draft_probs = runner.rejection_sampler.call_args.args[1]
@@ -862,6 +974,52 @@ def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
         dim=0,
     )
     assert torch.equal(passed_draft_probs, expected_draft_probs)
+
+
+def test_dflash_draft_probs_preserve_real_rows_and_zero_no_proposal_rows() -> None:
+    runner = object.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(req_ids=["real", "padding"])
+    runner._draft_prob_req_ids = ["padding", "real"]
+    runner._draft_probs = torch.arange(
+        2 * 3 * 4,
+        dtype=torch.float32,
+    ).reshape(2, 3, 4)
+    spec_decode_metadata = SpecDecodeMetadata.make_dummy(
+        [[10, 11, 12], [-1, -1, -1]],
+        device=torch.device("cpu"),
+    )
+
+    draft_probs = runner._get_spec_decode_draft_probs(
+        spec_decode_metadata,
+        dflash_padded_request_ids={"padding"},
+    )
+
+    assert draft_probs is not None
+    expected_draft_probs = torch.cat(
+        [
+            runner._draft_probs[1],
+            torch.zeros_like(runner._draft_probs[0]),
+        ],
+        dim=0,
+    )
+    torch.testing.assert_close(draft_probs, expected_draft_probs)
+
+
+def test_dflash_draft_probs_reject_missing_real_row() -> None:
+    runner = object.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(req_ids=["real", "padding"])
+    runner._draft_prob_req_ids = ["padding"]
+    runner._draft_probs = torch.ones((1, 3, 4), dtype=torch.float32)
+    spec_decode_metadata = SpecDecodeMetadata.make_dummy(
+        [[10, 11, 12], [-1, -1, -1]],
+        device=torch.device("cpu"),
+    )
+
+    with pytest.raises(RuntimeError, match="real DFlash request 'real'"):
+        runner._get_spec_decode_draft_probs(
+            spec_decode_metadata,
+            dflash_padded_request_ids={"padding"},
+        )
 
 
 def test_apply_sparse_weight_patches_updates_only_selected_entries():
@@ -1502,80 +1660,96 @@ def test_is_uniform_decode() -> None:
     # Normal
     assert GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=1,
-        uniform_decode_query_len=1,
+        uniform_decode_query_lens=(1,),
         num_tokens=16,
         num_reqs=16,
     )
     assert not GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=2,
-        uniform_decode_query_len=1,
+        uniform_decode_query_lens=(1,),
         num_tokens=16,
         num_reqs=16,
     )
     assert not GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=1,
-        uniform_decode_query_len=1,
+        uniform_decode_query_lens=(1,),
         num_tokens=16,
         num_reqs=15,
     )
     # Spec decoding
     assert GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=5,
-        uniform_decode_query_len=5,
+        uniform_decode_query_lens=(5,),
         num_tokens=30,
         num_reqs=6,
     )
     assert not GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=5,
-        uniform_decode_query_len=4,
+        uniform_decode_query_lens=(4,),
         num_tokens=30,
         num_reqs=6,
     )
     assert not GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=5,
-        uniform_decode_query_len=5,
+        uniform_decode_query_lens=(5,),
         num_tokens=30,
         num_reqs=7,
+    )
+    # Adaptive DFlash query lengths.
+    for query_len in (4, 8, 12, 16):
+        assert GPUModelRunner._is_uniform_decode(
+            max_num_scheduled_tokens=query_len,
+            uniform_decode_query_lens=(4, 8, 12, 16),
+            num_tokens=query_len * 6,
+            num_reqs=6,
+        )
+    # A request shortened by max_tokens makes the step non-uniform and must not
+    # replay a FULL uniform-decode graph.
+    assert not GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=4,
+        uniform_decode_query_lens=(4, 8, 12, 16),
+        num_tokens=15,
+        num_reqs=4,
     )
     # Force uniform decode
     assert GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=1,
-        uniform_decode_query_len=1,
+        uniform_decode_query_lens=(1,),
         num_tokens=16,
         num_reqs=16,
         force_uniform_decode=True,
     )
     assert GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=2,
-        uniform_decode_query_len=1,
+        uniform_decode_query_lens=(1,),
         num_tokens=16,
         num_reqs=16,
         force_uniform_decode=True,
     )
     assert GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=1,
-        uniform_decode_query_len=1,
+        uniform_decode_query_lens=(1,),
         num_tokens=16,
         num_reqs=15,
         force_uniform_decode=True,
     )
     assert not GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=1,
-        uniform_decode_query_len=1,
+        uniform_decode_query_lens=(1,),
         num_tokens=16,
         num_reqs=16,
         force_uniform_decode=False,
     )
     assert not GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=2,
-        uniform_decode_query_len=1,
+        uniform_decode_query_lens=(1,),
         num_tokens=16,
         num_reqs=16,
         force_uniform_decode=False,
     )
     assert not GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=1,
-        uniform_decode_query_len=1,
+        uniform_decode_query_lens=(1,),
         num_tokens=16,
         num_reqs=15,
         force_uniform_decode=False,
