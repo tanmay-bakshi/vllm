@@ -98,45 +98,49 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 
 @dataclass
 class _DFlashCalibrationPoint:
-    """Aggregate completed DFlash target passes at one operating point.
+    """Aggregate completed DFlash target passes at one exact cost coordinate.
 
     :ivar rounds: Number of completed passes.
-    :ivar min_sequence_length: Smallest ending sequence length.
-    :ivar max_sequence_length: Largest ending sequence length.
+    :ivar elapsed_ns: End-to-end cadence time for the completed passes.
     :ivar contaminated_rounds: Passes containing non-verification or padded rows.
+    :ivar intervening_non_dflash_rounds: Non-DFlash passes included in cadence
+        samples assigned to this point.
     :ivar non_verification_rows: Scheduled rows outside the verification cohort.
     :ivar padded_rows: Verification rows without a real proposal.
     """
 
     rounds: int = 0
-    min_sequence_length: int = 0
-    max_sequence_length: int = 0
+    elapsed_ns: int = 0
     contaminated_rounds: int = 0
+    intervening_non_dflash_rounds: int = 0
     non_verification_rows: int = 0
     padded_rows: int = 0
 
     def observe(
         self,
-        sequence_length: int,
+        elapsed_ns: int,
+        intervening_non_dflash_rounds: int,
         non_verification_rows: int,
         padded_rows: int,
     ) -> None:
         """Record one completed target pass.
 
-        :param sequence_length: Longest verification sequence in the pass.
+        :param elapsed_ns: Cadence time from the preceding clean boundary.
+        :param intervening_non_dflash_rounds: Non-DFlash passes inside the
+            cadence sample.
         :param non_verification_rows: Scheduled rows outside verification.
         :param padded_rows: Verification rows without a real proposal.
         """
-        if self.rounds == 0:
-            self.min_sequence_length = sequence_length
-            self.max_sequence_length = sequence_length
-        else:
-            self.min_sequence_length = min(self.min_sequence_length, sequence_length)
-            self.max_sequence_length = max(self.max_sequence_length, sequence_length)
         self.rounds += 1
+        self.elapsed_ns += elapsed_ns
+        self.intervening_non_dflash_rounds += intervening_non_dflash_rounds
         self.non_verification_rows += non_verification_rows
         self.padded_rows += padded_rows
-        if non_verification_rows != 0 or padded_rows > 0:
+        if (
+            intervening_non_dflash_rounds > 0
+            or non_verification_rows != 0
+            or padded_rows > 0
+        ):
             self.contaminated_rounds += 1
 
 
@@ -148,7 +152,8 @@ class _DFlashCalibrationDiagnostics:
     rounds: int
     non_dflash_rounds: int
     interval_start_ns: int | None
-    points: dict[tuple[int, int], _DFlashCalibrationPoint]
+    pending_non_dflash_rounds: int
+    points: dict[tuple[int, int, int], _DFlashCalibrationPoint]
 
     def __init__(self, interval: int) -> None:
         """Initialize the summary accumulator.
@@ -162,7 +167,8 @@ class _DFlashCalibrationDiagnostics:
         self.rounds = 0
         self.non_dflash_rounds = 0
         self.interval_start_ns = None
-        self.points: dict[tuple[int, int], _DFlashCalibrationPoint] = defaultdict(
+        self.pending_non_dflash_rounds = 0
+        self.points: dict[tuple[int, int, int], _DFlashCalibrationPoint] = defaultdict(
             _DFlashCalibrationPoint
         )
 
@@ -196,12 +202,9 @@ class _DFlashCalibrationDiagnostics:
 
         if query_len <= 0:
             self.non_dflash_rounds += 1
+            self.pending_non_dflash_rounds += 1
             return None
-        if completed_ns < interval_start_ns:
-            raise ValueError(
-                "DFlash completion timestamp precedes the interval boundary."
-            )
-        if self.rounds + 1 == self.interval and completed_ns == interval_start_ns:
+        if completed_ns <= interval_start_ns:
             raise ValueError("DFlash calibration elapsed time must be positive.")
 
         batch_size = scheduler_output.dflash_verification_batch_size
@@ -209,19 +212,23 @@ class _DFlashCalibrationDiagnostics:
         padded_request_ids = scheduler_output.dflash_padded_request_ids
         padded_rows = len(padded_request_ids) if padded_request_ids is not None else 0
         non_verification_rows = len(scheduler_output.num_scheduled_tokens) - batch_size
-        self.points[(query_len, batch_size)].observe(
-            sequence_length,
+        elapsed_ns = completed_ns - interval_start_ns
+        self.points[(query_len, batch_size, sequence_length)].observe(
+            elapsed_ns,
+            self.pending_non_dflash_rounds,
             non_verification_rows,
             padded_rows,
         )
+        self.interval_start_ns = completed_ns
+        self.pending_non_dflash_rounds = 0
         self.rounds += 1
         if self.rounds < self.interval:
             return None
 
-        elapsed_ns = completed_ns - interval_start_ns
+        elapsed_ns = sum(point.elapsed_ns for point in self.points.values())
         self.interval_index += 1
         summary = {
-            "schema_version": 2,
+            "schema_version": 3,
             "interval_index": self.interval_index,
             "rounds": self.rounds,
             "elapsed_ns": elapsed_ns,
@@ -230,19 +237,25 @@ class _DFlashCalibrationDiagnostics:
                 {
                     "q": query_len,
                     "r": batch_size,
+                    "l": sequence_length,
                     "rounds": point.rounds,
-                    "min_l": point.min_sequence_length,
-                    "max_l": point.max_sequence_length,
+                    "elapsed_ns": point.elapsed_ns,
                     "contaminated_rounds": point.contaminated_rounds,
+                    "intervening_non_dflash_rounds": (
+                        point.intervening_non_dflash_rounds
+                    ),
                     "non_verification_rows": point.non_verification_rows,
                     "padded_rows": point.padded_rows,
                 }
-                for (query_len, batch_size), point in sorted(self.points.items())
+                for (query_len, batch_size, sequence_length), point in sorted(
+                    self.points.items()
+                )
             ],
         }
         self.rounds = 0
         self.non_dflash_rounds = 0
         self.interval_start_ns = None
+        self.pending_non_dflash_rounds = 0
         self.points.clear()
         return json.dumps(summary, separators=(",", ":"), sort_keys=True)
 

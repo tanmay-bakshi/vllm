@@ -93,6 +93,9 @@ def _create_dflash_scheduler(
         parallel_config=ParallelConfig(),
         speculative_config=speculative_config,
     )
+    # The host executor can disable async mode during config verification, while
+    # this unit helper directly instantiates the requested scheduler class.
+    scheduler_config.async_scheduling = async_scheduling
     num_blocks = 32 if variable_verification else NUM_BLOCKS
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,

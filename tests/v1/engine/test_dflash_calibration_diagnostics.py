@@ -37,8 +37,8 @@ def _scheduler_output(
     return output
 
 
-def test_dflash_calibration_diagnostics_aggregate_exact_operating_points() -> None:
-    """Aggregate mixed operating points and reset after each interval."""
+def test_first_completion_is_boundary_then_exactly_n_rounds_are_attributed() -> None:
+    """Exclude the first completion and attribute exactly the next N cadences."""
     diagnostics = _DFlashCalibrationDiagnostics(interval=2)
 
     boundary = _scheduler_output(
@@ -71,8 +71,9 @@ def test_dflash_calibration_diagnostics_aggregate_exact_operating_points() -> No
         "points": [
             {
                 "contaminated_rounds": 0,
-                "max_l": 50,
-                "min_l": 50,
+                "elapsed_ns": 150,
+                "intervening_non_dflash_rounds": 0,
+                "l": 50,
                 "non_verification_rows": 0,
                 "padded_rows": 0,
                 "q": 4,
@@ -81,8 +82,9 @@ def test_dflash_calibration_diagnostics_aggregate_exact_operating_points() -> No
             },
             {
                 "contaminated_rounds": 1,
-                "max_l": 100,
-                "min_l": 100,
+                "elapsed_ns": 100,
+                "intervening_non_dflash_rounds": 0,
+                "l": 100,
                 "non_verification_rows": 1,
                 "padded_rows": 1,
                 "q": 8,
@@ -91,7 +93,7 @@ def test_dflash_calibration_diagnostics_aggregate_exact_operating_points() -> No
             },
         ],
         "rounds": 2,
-        "schema_version": 2,
+        "schema_version": 3,
     }
 
     diagnostics.begin_interval(400)
@@ -134,14 +136,26 @@ def test_dflash_calibration_diagnostics_aggregate_exact_operating_points() -> No
     assert next_summary["points"] == [
         {
             "contaminated_rounds": 0,
-            "max_l": 240,
-            "min_l": 200,
+            "elapsed_ns": 100,
+            "intervening_non_dflash_rounds": 0,
+            "l": 200,
             "non_verification_rows": 0,
             "padded_rows": 0,
             "q": 16,
             "r": 8,
-            "rounds": 2,
-        }
+            "rounds": 1,
+        },
+        {
+            "contaminated_rounds": 1,
+            "elapsed_ns": 150,
+            "intervening_non_dflash_rounds": 1,
+            "l": 240,
+            "non_verification_rows": 0,
+            "padded_rows": 0,
+            "q": 16,
+            "r": 8,
+            "rounds": 1,
+        },
     ]
 
 
@@ -197,6 +211,8 @@ def test_dflash_calibration_diagnostics_count_active_non_dflash_passes() -> None
     summary = json.loads(rendered)
     assert summary["elapsed_ns"] == 100
     assert summary["non_dflash_rounds"] == 1
+    assert summary["points"][0]["contaminated_rounds"] == 1
+    assert summary["points"][0]["intervening_non_dflash_rounds"] == 1
 
 
 def test_engine_core_dflash_calibration_is_log_inert_when_disabled() -> None:
@@ -286,8 +302,9 @@ def test_engine_core_dflash_calibration_restarts_after_logging() -> None:
     assert first_summary["points"] == [
         {
             "contaminated_rounds": 0,
-            "max_l": 8192,
-            "min_l": 8192,
+            "elapsed_ns": 100,
+            "intervening_non_dflash_rounds": 0,
+            "l": 8192,
             "non_verification_rows": 0,
             "padded_rows": 0,
             "q": 12,
@@ -298,7 +315,7 @@ def test_engine_core_dflash_calibration_restarts_after_logging() -> None:
     _, next_rendered = logger_info.call_args_list[1].args
     next_summary = json.loads(next_rendered)
     assert next_summary["elapsed_ns"] == 100
-    assert next_summary["points"][0]["max_l"] == 8200
+    assert next_summary["points"][0]["l"] == 8200
 
 
 def test_dflash_calibration_diagnostics_reject_non_positive_elapsed_time() -> None:
