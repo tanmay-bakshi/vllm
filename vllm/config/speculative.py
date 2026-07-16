@@ -77,7 +77,8 @@ class DFlashVerificationCost:
     """Measured round cost for one adaptive DFlash operating point.
 
     :ivar batch_size_range: Inclusive decode batch-size range.
-    :ivar sequence_length_range: Inclusive longest-sequence-length range.
+    :ivar sequence_length_range: Inclusive longest target-pass starting
+        sequence-length range.
     :ivar query_len: Number of target verification queries per request.
     :ivar round_cost_ms: Measured target, fixed-draft, and sampling round cost.
     """
@@ -108,8 +109,8 @@ class DFlashVerificationCost:
 class DFlashAdaptiveVerificationConfig:
     """Cost-aware target-prefix policy for a fixed-block DFlash drafter.
 
-    :ivar costs: Offline measured round costs for each calibrated runtime tier
-        and query length.
+    :ivar costs: Offline measured round costs for each calibrated target-pass
+        starting-sequence tier and query length.
     :ivar fallback_query_len: Target query length used outside the calibrated
         cost surface.
     :ivar initial_acceptance_rates: Initial unconditional acceptance probability
@@ -256,6 +257,7 @@ class SpeculativeConfig:
 
     Each entry is ``(range_start, range_end, num_speculative_tokens)`` with an
     inclusive range over the longest sequence length in the running batch.
+    Speculative-token counts must be non-increasing as sequence length grows.
     When combined with ``num_speculative_tokens_per_batch_size``, the smaller
     speculative-token count wins so long contexts and large batches both shrink
     the verification length.

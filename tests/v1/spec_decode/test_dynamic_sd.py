@@ -240,7 +240,9 @@ def _resolve_seq_len(
     runtime_num_speculative_tokens: int = 6,
 ) -> int:
     normalized = validate_and_normalize_dynamic_sd_schedule(
-        schedule, field_name="num_speculative_tokens_per_seq_len"
+        schedule,
+        field_name="num_speculative_tokens_per_seq_len",
+        require_non_increasing_values=True,
     )
     return resolve_dynamic_sd_num_speculative_tokens(
         normalized, seq_len, runtime_num_speculative_tokens
@@ -276,7 +278,21 @@ def test_seq_len_schedule_validation_uses_field_name():
         ValueError, match="num_speculative_tokens_per_seq_len.*must start at 1"
     ):
         validate_and_normalize_dynamic_sd_schedule(
-            [(2, 16, 3)], field_name="num_speculative_tokens_per_seq_len"
+            [(2, 16, 3)],
+            field_name="num_speculative_tokens_per_seq_len",
+            require_non_increasing_values=True,
+        )
+
+
+def test_seq_len_schedule_rejects_increasing_speculative_width() -> None:
+    with pytest.raises(
+        ValueError,
+        match="num_speculative_tokens_per_seq_len values must be non-increasing",
+    ):
+        validate_and_normalize_dynamic_sd_schedule(
+            [(1, 16, 3), (17, 128, 7)],
+            field_name="num_speculative_tokens_per_seq_len",
+            require_non_increasing_values=True,
         )
 
 

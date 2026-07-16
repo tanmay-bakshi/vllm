@@ -153,7 +153,7 @@ class _DFlashCalibrationDiagnostics:
     non_dflash_rounds: int
     interval_start_ns: int | None
     pending_non_dflash_rounds: int
-    points: dict[tuple[int, int, int], _DFlashCalibrationPoint]
+    points: dict[tuple[int, int, int, int, int], _DFlashCalibrationPoint]
 
     def __init__(self, interval: int) -> None:
         """Initialize the summary accumulator.
@@ -168,8 +168,8 @@ class _DFlashCalibrationDiagnostics:
         self.non_dflash_rounds = 0
         self.interval_start_ns = None
         self.pending_non_dflash_rounds = 0
-        self.points: dict[tuple[int, int, int], _DFlashCalibrationPoint] = defaultdict(
-            _DFlashCalibrationPoint
+        self.points: dict[tuple[int, int, int, int, int], _DFlashCalibrationPoint] = (
+            defaultdict(_DFlashCalibrationPoint)
         )
 
     def begin_interval(self, start_ns: int) -> None:
@@ -209,11 +209,32 @@ class _DFlashCalibrationDiagnostics:
 
         batch_size = scheduler_output.dflash_verification_batch_size
         sequence_length = scheduler_output.dflash_verification_max_sequence_length
+        min_starting_sequence_length = (
+            scheduler_output.dflash_verification_min_starting_sequence_length
+        )
+        max_starting_sequence_length = (
+            scheduler_output.dflash_verification_max_starting_sequence_length
+        )
+        if min_starting_sequence_length > max_starting_sequence_length:
+            raise RuntimeError("DFlash starting sequence-length bounds are reversed.")
+        if max_starting_sequence_length + query_len != sequence_length:
+            raise RuntimeError(
+                "DFlash ending sequence length does not match its starting "
+                "upper bound and query length."
+            )
         padded_request_ids = scheduler_output.dflash_padded_request_ids
         padded_rows = len(padded_request_ids) if padded_request_ids is not None else 0
         non_verification_rows = len(scheduler_output.num_scheduled_tokens) - batch_size
         elapsed_ns = completed_ns - interval_start_ns
-        self.points[(query_len, batch_size, sequence_length)].observe(
+        self.points[
+            (
+                query_len,
+                batch_size,
+                sequence_length,
+                min_starting_sequence_length,
+                max_starting_sequence_length,
+            )
+        ].observe(
             elapsed_ns,
             self.pending_non_dflash_rounds,
             non_verification_rows,
@@ -228,7 +249,7 @@ class _DFlashCalibrationDiagnostics:
         elapsed_ns = sum(point.elapsed_ns for point in self.points.values())
         self.interval_index += 1
         summary = {
-            "schema_version": 3,
+            "schema_version": 4,
             "interval_index": self.interval_index,
             "rounds": self.rounds,
             "elapsed_ns": elapsed_ns,
@@ -238,6 +259,8 @@ class _DFlashCalibrationDiagnostics:
                     "q": query_len,
                     "r": batch_size,
                     "l": sequence_length,
+                    "s_min": min_starting_sequence_length,
+                    "s_max": max_starting_sequence_length,
                     "rounds": point.rounds,
                     "elapsed_ns": point.elapsed_ns,
                     "contaminated_rounds": point.contaminated_rounds,
@@ -247,9 +270,13 @@ class _DFlashCalibrationDiagnostics:
                     "non_verification_rows": point.non_verification_rows,
                     "padded_rows": point.padded_rows,
                 }
-                for (query_len, batch_size, sequence_length), point in sorted(
-                    self.points.items()
-                )
+                for (
+                    query_len,
+                    batch_size,
+                    sequence_length,
+                    min_starting_sequence_length,
+                    max_starting_sequence_length,
+                ), point in sorted(self.points.items())
             ],
         }
         self.rounds = 0

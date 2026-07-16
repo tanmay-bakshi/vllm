@@ -40,7 +40,6 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.spec_decode.dflash import select_dflash_verification_prefix
 from vllm.v1.structured_output import StructuredOutputManager
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
@@ -1154,32 +1153,42 @@ def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
         assert stats.num_accepted_tokens_per_pos == expected[3]
 
 
-def test_dflash_scheduler_observes_selected_prefix_in_output_policy_tier() -> None:
-    adaptive_config = DFlashAdaptiveVerificationConfig(
-        costs=[
-            DFlashVerificationCost(
-                batch_size_range=batch_size_range,
-                sequence_length_range=(1, 256),
-                query_len=query_len,
-                round_cost_ms=round_cost_ms,
-            )
-            for batch_size_range in ((1, 1), (2, 2))
-            for query_len, round_cost_ms in (
-                (4, 2.0),
-                (8, 3.0),
-                (12, 8.0),
-                (16, 10.0),
-            )
-        ],
-        initial_acceptance_rates=[1.0] * 15,
-        acceptance_ema_alpha=1.0,
-    )
+def _dflash_adaptive_speculative_config(
+    adaptive_config: DFlashAdaptiveVerificationConfig,
+) -> SpeculativeConfig:
+    """Build the fixed-block DFlash configuration used by scheduler tests.
+
+    :param adaptive_config: Adaptive target-verification policy under test.
+    :returns: Complete speculative-decoding configuration.
+    """
     speculative_config = SpeculativeConfig(model="ngram", num_speculative_tokens=15)
     speculative_config.method = "dflash"
     speculative_config.parallel_drafting = True
     speculative_config.dflash_adaptive_verification = adaptive_config
+    return speculative_config
+
+
+def test_dflash_scheduler_selects_and_observes_by_target_starting_length() -> None:
+    adaptive_config = DFlashAdaptiveVerificationConfig(
+        costs=[
+            DFlashVerificationCost(
+                batch_size_range=(1, 1),
+                sequence_length_range=sequence_length_range,
+                query_len=query_len,
+                round_cost_ms=round_cost_ms,
+            )
+            for sequence_length_range, costs in (
+                ((1, 8), (4.0, 4.0, 20.0, 30.0)),
+                ((9, 256), (1.0, 4.0, 8.0, 12.0)),
+            )
+            for query_len, round_cost_ms in zip((4, 8, 12, 16), costs, strict=True)
+        ],
+        initial_acceptance_rates=[1.0] * 15,
+        acceptance_ema_alpha=1.0,
+    )
     scheduler = create_scheduler(
-        max_model_len=256, speculative_config=speculative_config
+        max_model_len=256,
+        speculative_config=_dflash_adaptive_speculative_config(adaptive_config),
     )
     (request,) = create_requests(num_requests=1, num_tokens=8, max_tokens=64)
     request_id = request.request_id
@@ -1190,42 +1199,310 @@ def test_dflash_scheduler_observes_selected_prefix_in_output_policy_tier() -> No
 
     full_draft = torch.arange(15).view(1, 15)
     scheduler.update_draft_token_ids(DraftTokenIds([request_id], full_draft.tolist()))
-    full_verification_output = scheduler.schedule()
-
-    assert full_verification_output.dflash_verification_query_len == 16
-    assert full_verification_output.num_spec_tokens_to_schedule == 7
-    _model_output(scheduler, full_verification_output, [list(range(16))])
-
-    selected_prefix = select_dflash_verification_prefix(full_draft, 7)
-    assert selected_prefix.stride(0) == 15
-    scheduler.update_draft_token_ids(
-        DraftTokenIds([request_id], selected_prefix.tolist())
-    )
     selected_verification_output = scheduler.schedule()
 
     assert selected_verification_output.scheduled_spec_decode_tokens[request_id] == (
-        selected_prefix[0].tolist()
+        full_draft[0, :7].tolist()
     )
     assert selected_verification_output.dflash_verification_query_len == 8
     assert selected_verification_output.dflash_num_valid_draft_tokens == {request_id: 7}
+    assert selected_verification_output.num_spec_tokens_to_schedule == 15
+    assert selected_verification_output.dflash_verification_max_sequence_length == 16
+    assert (
+        selected_verification_output.dflash_verification_min_starting_sequence_length
+        == 8
+    )
+    assert (
+        selected_verification_output.dflash_verification_max_starting_sequence_length
+        == 8
+    )
+    assert selected_verification_output.dflash_acceptance_observation_eligible
 
     policy = scheduler.dflash_adaptive_verification_policy
     assert policy is not None
-    tier = policy._get_tier(
-        selected_verification_output.dflash_verification_batch_size,
-        selected_verification_output.dflash_verification_max_sequence_length,
-    )
-    other_tier = policy._get_tier(
-        2, selected_verification_output.dflash_verification_max_sequence_length
-    )
+    tier = policy._get_tier(1, 8)
+    ending_length_tier = policy._get_tier(1, 16)
     assert tier is not None
-    assert other_tier is not None
+    assert ending_length_tier is not None
     assert tier.conditional_acceptance_rates[0] == 1.0
 
     _model_output(scheduler, selected_verification_output, [[200]])
 
     assert tier.conditional_acceptance_rates[0] == 0.0
-    assert other_tier.conditional_acceptance_rates[0] == 1.0
+    assert ending_length_tier.conditional_acceptance_rates[0] == 1.0
+
+
+def test_dflash_scheduler_reselects_for_changed_target_cohort() -> None:
+    adaptive_config = DFlashAdaptiveVerificationConfig(
+        costs=[
+            DFlashVerificationCost(
+                batch_size_range=(batch_size, batch_size),
+                sequence_length_range=(1, 256),
+                query_len=query_len,
+                round_cost_ms=round_cost_ms,
+            )
+            for batch_size, costs in (
+                (1, (4.0, 4.0, 20.0, 30.0)),
+                (2, (1.0, 4.0, 8.0, 12.0)),
+            )
+            for query_len, round_cost_ms in zip((4, 8, 12, 16), costs, strict=True)
+        ],
+        initial_acceptance_rates=[1.0] * 15,
+    )
+    scheduler = create_scheduler(
+        max_model_len=256,
+        speculative_config=_dflash_adaptive_speculative_config(adaptive_config),
+    )
+    requests = create_requests(num_requests=2, num_tokens=8, max_tokens=64)
+    request_ids = [request.request_id for request in requests]
+    for request in requests:
+        scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    _model_output(scheduler, prefill_output, [[100], [101]])
+    full_drafts = torch.arange(30).view(2, 15).tolist()
+    scheduler.update_draft_token_ids(DraftTokenIds(request_ids, full_drafts))
+
+    two_request_output = scheduler.schedule()
+    assert two_request_output.dflash_verification_batch_size == 2
+    assert two_request_output.dflash_verification_query_len == 4
+    assert two_request_output.num_spec_tokens_to_schedule == 15
+    _model_output(scheduler, two_request_output, [[200], [201]])
+
+    scheduler.update_draft_token_ids(DraftTokenIds(request_ids, full_drafts))
+    scheduler.finish_requests(request_ids[1], RequestStatus.FINISHED_ABORTED)
+    one_request_output = scheduler.schedule()
+
+    assert one_request_output.dflash_verification_batch_size == 1
+    assert one_request_output.dflash_verification_query_len == 8
+    assert (
+        one_request_output.scheduled_spec_decode_tokens[request_ids[0]]
+        == (full_drafts[0][:7])
+    )
+
+
+def test_dflash_async_scheduler_selects_inside_one_length_tier() -> None:
+    adaptive_config = DFlashAdaptiveVerificationConfig(
+        costs=[
+            DFlashVerificationCost(
+                batch_size_range=(1, 1),
+                sequence_length_range=(1, 256),
+                query_len=query_len,
+                round_cost_ms=round_cost_ms,
+            )
+            for query_len, round_cost_ms in zip(
+                (4, 8, 12, 16),
+                (1.0, 4.0, 8.0, 12.0),
+                strict=True,
+            )
+        ],
+        initial_acceptance_rates=[1.0] * 15,
+    )
+    scheduler = create_scheduler(
+        max_model_len=256,
+        speculative_config=_dflash_adaptive_speculative_config(adaptive_config),
+        async_scheduling=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=8, max_tokens=64)
+    scheduler.add_request(request)
+
+    scheduler.schedule()
+    assert request.num_output_placeholders == 1
+    target_output = scheduler.schedule()
+
+    assert target_output.dflash_verification_query_len == 4
+    assert target_output.dflash_verification_min_starting_sequence_length == 8
+    assert target_output.dflash_verification_max_starting_sequence_length == 8
+    assert target_output.dflash_acceptance_observation_eligible
+
+
+def test_dflash_async_scheduler_falls_back_across_length_tiers() -> None:
+    adaptive_config = DFlashAdaptiveVerificationConfig(
+        costs=[
+            DFlashVerificationCost(
+                batch_size_range=(1, 1),
+                sequence_length_range=sequence_length_range,
+                query_len=query_len,
+                round_cost_ms=round_cost_ms,
+            )
+            for sequence_length_range, costs in (
+                ((1, 16), (20.0, 12.0, 8.0, 1.0)),
+                ((17, 256), (1.0, 4.0, 8.0, 12.0)),
+            )
+            for query_len, round_cost_ms in zip((4, 8, 12, 16), costs, strict=True)
+        ],
+        initial_acceptance_rates=[1.0] * 15,
+        acceptance_ema_alpha=1.0,
+    )
+    scheduler = create_scheduler(
+        max_model_len=256,
+        speculative_config=_dflash_adaptive_speculative_config(adaptive_config),
+        async_scheduling=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=8, max_tokens=64)
+    scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    first_target_output = scheduler.schedule()
+    assert first_target_output.dflash_verification_query_len == 16
+    _model_output(scheduler, prefill_output, [[100]])
+
+    crossing_output = scheduler.schedule()
+    assert crossing_output.dflash_verification_min_starting_sequence_length == 9
+    assert crossing_output.dflash_verification_max_starting_sequence_length == 24
+    assert crossing_output.dflash_verification_query_len == 16
+
+    _model_output(scheduler, first_target_output, [[200]])
+    policy = scheduler.dflash_adaptive_verification_policy
+    assert policy is not None
+    lower_tier = policy._get_tier(1, 16)
+    upper_tier = policy._get_tier(1, 17)
+    assert lower_tier is not None
+    assert upper_tier is not None
+    lower_tier.conditional_acceptance_rates = [0.5] * 15
+    upper_tier.conditional_acceptance_rates = [0.5] * 15
+
+    _model_output(scheduler, crossing_output, [[201]])
+
+    assert lower_tier.conditional_acceptance_rates == [0.5] * 15
+    assert upper_tier.conditional_acceptance_rates == [0.5] * 15
+
+
+def test_dflash_async_length_bounds_are_aggregated_per_request() -> None:
+    scheduler = create_scheduler(async_scheduling=True)
+    requests = create_requests(num_requests=2, num_tokens=8)
+    requests[0].num_computed_tokens = 100
+    requests[0].num_output_placeholders = 16
+    requests[1].num_computed_tokens = 95
+    requests[1].num_output_placeholders = 1
+    scheduler.requests = {request.request_id: request for request in requests}
+
+    assert scheduler._dflash_target_starting_sequence_length_range(
+        {request.request_id for request in requests}
+    ) == (95, 100)
+
+
+def test_dflash_adaptive_scheduler_falls_back_for_mixed_prefill_batch() -> None:
+    adaptive_config = DFlashAdaptiveVerificationConfig(
+        costs=[
+            DFlashVerificationCost(
+                batch_size_range=(1, 1),
+                sequence_length_range=(1, 256),
+                query_len=query_len,
+                round_cost_ms=round_cost_ms,
+            )
+            for query_len, round_cost_ms in zip(
+                (4, 8, 12, 16),
+                (1.0, 4.0, 8.0, 12.0),
+                strict=True,
+            )
+        ],
+        initial_acceptance_rates=[1.0] * 15,
+        acceptance_ema_alpha=1.0,
+    )
+    scheduler = create_scheduler(
+        max_model_len=256,
+        max_num_batched_tokens=256,
+        speculative_config=_dflash_adaptive_speculative_config(adaptive_config),
+    )
+    (decode_request,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=64,
+        req_ids=["decode"],
+    )
+    (prefill_request,) = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        max_tokens=64,
+        req_ids=["prefill"],
+    )
+    scheduler.add_request(decode_request)
+    decode_prefill_output = scheduler.schedule()
+    _model_output(scheduler, decode_prefill_output, [[100]])
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([decode_request.request_id], [list(range(15))])
+    )
+    scheduler.add_request(prefill_request)
+
+    mixed_output = scheduler.schedule()
+
+    assert len(mixed_output.num_scheduled_tokens) == 2
+    assert mixed_output.dflash_verification_batch_size == 1
+    assert mixed_output.dflash_verification_query_len == 16
+    assert not mixed_output.dflash_acceptance_observation_eligible
+    policy = scheduler.dflash_adaptive_verification_policy
+    assert policy is not None
+    tier = policy._get_tier(1, 8)
+    assert tier is not None
+    _model_output(scheduler, mixed_output, [[200], [201]])
+    assert tier.conditional_acceptance_rates == [1.0] * 15
+
+
+def test_dflash_static_sequence_ceiling_covers_an_uncertain_interval() -> None:
+    adaptive_config = DFlashAdaptiveVerificationConfig(
+        costs=[
+            DFlashVerificationCost(
+                batch_size_range=(1, 1),
+                sequence_length_range=(1, 256),
+                query_len=query_len,
+                round_cost_ms=float(query_len),
+            )
+            for query_len in (4, 8, 12, 16)
+        ],
+        initial_acceptance_rates=[1.0] * 15,
+    )
+    speculative_config = _dflash_adaptive_speculative_config(adaptive_config)
+    speculative_config.num_speculative_tokens_per_seq_len = [
+        (1, 15, 15),
+        (16, 256, 3),
+    ]
+    scheduler = create_scheduler(
+        max_model_len=256,
+        speculative_config=speculative_config,
+    )
+
+    assert scheduler._resolve_dynamic_num_speculative_tokens(1, 15, 17) == 3
+
+
+def test_dflash_adaptive_target_respects_static_sequence_ceiling() -> None:
+    adaptive_config = DFlashAdaptiveVerificationConfig(
+        costs=[
+            DFlashVerificationCost(
+                batch_size_range=(1, 1),
+                sequence_length_range=(1, 256),
+                query_len=query_len,
+                round_cost_ms=round_cost_ms,
+            )
+            for query_len, round_cost_ms in zip(
+                (4, 8, 12, 16),
+                (4.0, 1.0, 8.0, 12.0),
+                strict=True,
+            )
+        ],
+        initial_acceptance_rates=[1.0] * 15,
+    )
+    speculative_config = _dflash_adaptive_speculative_config(adaptive_config)
+    speculative_config.num_speculative_tokens_per_seq_len = [
+        (1, 15, 15),
+        (16, 256, 3),
+    ]
+    scheduler = create_scheduler(
+        max_model_len=256,
+        speculative_config=speculative_config,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=8, max_tokens=64)
+    scheduler.add_request(request)
+    prefill_output = scheduler.schedule()
+    _model_output(scheduler, prefill_output, [[100]])
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [list(range(15))])
+    )
+
+    target_output = scheduler.schedule()
+
+    assert target_output.dflash_verification_query_len == 4
+    assert target_output.num_scheduled_tokens[request.request_id] == 4
 
 
 def test_spec_decoding_stats_empty_output():

@@ -50,7 +50,7 @@ def test_policy_maximizes_expected_output_tokens_per_round_cost() -> None:
         max_sequence_length=1024,
     )
 
-    assert policy.select_query_len(8, 128) == 8
+    assert policy.select_query_len(8, 128, 128) == 8
 
 
 def test_policy_updates_prefix_acceptance_without_observing_the_tail() -> None:
@@ -59,16 +59,17 @@ def test_policy_updates_prefix_acceptance_without_observing_the_tail() -> None:
         max_batch_size=32,
         max_sequence_length=1024,
     )
-    assert policy.select_query_len(8, 128) == 8
+    assert policy.select_query_len(8, 128, 128) == 8
 
     policy.observe(
         batch_size=8,
-        sequence_length=128,
+        min_sequence_length=128,
+        max_sequence_length=128,
         query_len=8,
         num_accepted_draft_tokens=0,
     )
 
-    assert policy.select_query_len(8, 128) == 4
+    assert policy.select_query_len(8, 128, 128) == 4
 
 
 def test_policy_aggregates_conditional_hazards_once_per_batch() -> None:
@@ -80,7 +81,8 @@ def test_policy_aggregates_conditional_hazards_once_per_batch() -> None:
 
     policy.observe_batch(
         batch_size=3,
-        sequence_length=128,
+        min_sequence_length=128,
+        max_sequence_length=128,
         query_len=4,
         accepted_and_observed_draft_tokens=[(3, 3), (0, 3), (0, 0)],
     )
@@ -99,7 +101,8 @@ def test_policy_censors_unexecuted_tail_after_full_prefix_acceptance() -> None:
 
     policy.observe(
         batch_size=1,
-        sequence_length=128,
+        min_sequence_length=128,
+        max_sequence_length=128,
         query_len=4,
         num_accepted_draft_tokens=3,
     )
@@ -119,9 +122,9 @@ def test_policy_periodically_probes_the_complete_draft_block() -> None:
         max_sequence_length=1024,
     )
 
-    assert policy.select_query_len(8, 128) == 8
-    assert policy.select_query_len(8, 128) == 16
-    assert policy.select_query_len(8, 128) == 8
+    assert policy.select_query_len(8, 128, 128) == 8
+    assert policy.select_query_len(8, 128, 128) == 16
+    assert policy.select_query_len(8, 128, 128) == 8
 
 
 def test_policy_respects_a_static_query_length_ceiling() -> None:
@@ -131,7 +134,7 @@ def test_policy_respects_a_static_query_length_ceiling() -> None:
         max_sequence_length=1024,
     )
 
-    assert policy.select_query_len(8, 128, max_query_len=4) == 4
+    assert policy.select_query_len(8, 128, 128, max_query_len=4) == 4
 
 
 def test_policy_uses_static_fallback_outside_measured_cost_surface() -> None:
@@ -154,8 +157,53 @@ def test_policy_uses_static_fallback_outside_measured_cost_surface() -> None:
         max_sequence_length=1024,
     )
 
-    assert policy.select_query_len(17, 128) == 16
-    assert policy.select_query_len(17, 128, max_query_len=8) == 8
+    assert policy.select_query_len(17, 128, 128) == 16
+    assert policy.select_query_len(17, 128, 128, max_query_len=8) == 8
+
+
+def test_policy_falls_back_and_skips_learning_across_a_tier_boundary() -> None:
+    config = DFlashAdaptiveVerificationConfig(
+        costs=[
+            DFlashVerificationCost(
+                batch_size_range=(1, 32),
+                sequence_length_range=sequence_length_range,
+                query_len=cast(DFlashTargetQueryLen, query_len),
+                round_cost_ms=round_cost_ms,
+            )
+            for sequence_length_range, costs_ms in (
+                ((1, 127), (2.0, 3.0, 8.0, 10.0)),
+                ((128, 1024), (1.0, 4.0, 8.0, 12.0)),
+            )
+            for query_len, round_cost_ms in zip(
+                (4, 8, 12, 16),
+                costs_ms,
+                strict=True,
+            )
+        ],
+        initial_acceptance_rates=[1.0] * 15,
+        acceptance_ema_alpha=1.0,
+    )
+    policy = DFlashAdaptiveVerificationPolicy(
+        config,
+        max_batch_size=32,
+        max_sequence_length=1024,
+    )
+
+    assert policy.select_query_len(8, 127, 128) == 16
+    policy.observe(
+        batch_size=8,
+        min_sequence_length=127,
+        max_sequence_length=128,
+        query_len=16,
+        num_accepted_draft_tokens=0,
+    )
+
+    lower_tier = policy._get_tier(8, 127)
+    upper_tier = policy._get_tier(8, 128)
+    assert lower_tier is not None
+    assert upper_tier is not None
+    assert lower_tier.conditional_acceptance_rates == [1.0] * 15
+    assert upper_tier.conditional_acceptance_rates == [1.0] * 15
 
 
 def test_policy_rejects_overlapping_cost_tiers() -> None:

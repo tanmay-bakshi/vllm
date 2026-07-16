@@ -250,6 +250,14 @@ class SchedulerOutput:
     dflash_verification_query_len: int = 0
     dflash_verification_batch_size: int = 0
     dflash_verification_max_sequence_length: int = 0
+    # Bounds on the target cohort's actual longest starting sequence. Under
+    # async speculative decoding, CPU request state assumes every unresolved
+    # draft was accepted, while the worker corrects rejected drafts on-device.
+    dflash_verification_min_starting_sequence_length: int = 0
+    dflash_verification_max_starting_sequence_length: int = 0
+    # Mixed prefill/decode passes fall outside the calibrated cost dimensions
+    # and must not update a verification tier's acceptance estimates.
+    dflash_acceptance_observation_eligible: bool = False
     # Longest row in DFlash's actual padded proposal batch. Unlike the
     # verification cohort, this includes every scheduled prefill row.
     dflash_proposal_max_sequence_length: int = 0

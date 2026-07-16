@@ -72,20 +72,34 @@ VLLM_USE_V2_MODEL_RUNNER=0 vllm serve meta-llama/Llama-3.1-8B-Instruct \
 ### Cost-aware DFlash target verification
 
 DFlash adaptive verification does not shorten the draft-model input. The
-drafter always executes its complete trained block of 16 queries and produces
-15 draft tokens. The scheduler exposes only a prefix of 3, 7, 11, or 15 draft
-tokens to the next target pass, producing target query lengths 4, 8, 12, or 16.
+drafter always executes its complete trained block of 16 queries and retains
+all 15 draft tokens until the next target batch is formed. The scheduler then
+exposes a prefix of 3, 7, 11, or 15 draft tokens to that target pass, producing
+target query lengths 4, 8, 12, or 16. Selection therefore uses the actual
+target cohort instead of the preceding round's cohort.
 
-`dflash_adaptive_verification.costs` is an offline measured table. Each
-calibrated batch-size and sequence-length rectangle must contain one total round
-cost for every target query length, and calibrated rectangles must not overlap.
+With async speculative decoding, the CPU scheduler has not yet received the
+preceding target result. It knows a tight interval for the cohort's actual
+longest starting sequence: the CPU state is the all-drafts-accepted upper
+bound, while unresolved draft positions define the lower bound. Adaptive costs
+are used only when that complete interval belongs to one calibrated rectangle.
+A boundary-crossing interval uses the capped fallback and does not update
+acceptance estimates.
+
+`dflash_adaptive_verification.costs` is an offline measured table. Its sequence
+coordinate is the longest sequence length at the start of the target pass,
+before any of that pass's queries execute. This coordinate is independent of
+the candidate query length. Each calibrated batch-size and starting-sequence
+rectangle must contain one total round cost for every target query length, and
+calibrated rectangles must not overlap.
 An operating point outside those rectangles uses `fallback_query_len` (16 by
 default), capped by the active static schedule. This leaves unmeasured or
-unreachable regions conservative without inventing costs. Incomplete prefill
-chunks do not contribute to the decode batch size. A round cost includes target
-verification, the fixed 16-query draft pass, and sampling. At runtime, the
-policy updates conditional per-position acceptance hazards once per executed
-batch, with rejected tails treated as censored rather than failed observations.
+unreachable regions conservative without inventing costs. A pass containing an
+incomplete prefill also uses the fallback because prefill work is not a
+dimension of the calibrated table. A round cost includes target verification,
+the fixed 16-query draft pass, and sampling. At runtime, the policy updates
+conditional per-position acceptance hazards once per eligible executed batch,
+with rejected tails treated as censored rather than failed observations.
 Invalid target padding is excluded. The policy chooses the prefix with the
 highest expected accepted output tokens per millisecond. A switching threshold
 prevents oscillation, and periodic full-block probes keep acceptance estimates
@@ -127,13 +141,16 @@ priors must come from the deployment's matched workload and hardware.
 
 For low-overhead calibration, set
 `VLLM_DFLASH_CALIBRATION_LOG_INTERVAL` to a positive number of completed target
-passes, such as 32. The EngineCore then emits one JSON summary per interval,
-with points keyed by the query length actually executed (`q`) and verification
-batch size (`r`), the minimum and maximum ending sequence lengths, and counts
-of non-verification and invalid-padding rows. The default value is zero, which
-does not invoke the calibration logger. Timed calibration should use this
-aggregate instead of per-iteration logging, since writing one line per pass
-perturbs the cadence being measured.
+passes, such as 32. The EngineCore then emits one schema-version-4 JSON summary
+per interval. Each point records the query length actually executed (`q`),
+verification batch size (`r`), scheduler-visible ending upper bound (`l`), and
+the actual longest starting-sequence bounds (`s_min` and `s_max`), plus counts
+of non-verification and invalid-padding rows. `l` equals `s_max + q`; a
+calibration point is authoritative for a sequence rectangle only when its
+complete `[s_min, s_max]` interval is inside that rectangle. The default log
+interval is zero, which does not invoke the calibration logger. Timed
+calibration should use this aggregate instead of per-iteration logging, since
+writing one line per pass perturbs the cadence being measured.
 
 ## Limitations
 

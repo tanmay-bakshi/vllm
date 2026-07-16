@@ -5,8 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.utils import ConstantList
@@ -259,53 +258,15 @@ def test_prefix_caching_for_multi_turn():
 
 
 def test_abort_request_when_structured_output_fsm_cannot_advance():
-    scheduler = object.__new__(AsyncScheduler)
+    scheduler = create_scheduler(async_scheduling=True)
     request = create_requests(num_requests=1, num_tokens=1)[0]
     request.structured_output_request = Mock()
     request.structured_output_request.grammar = Mock()
     request.structured_output_request.grammar.accept_tokens.return_value = False
-    request.status = RequestStatus.RUNNING
-    request.num_computed_tokens = request.num_tokens
-    request.num_output_placeholders = 1
-
-    scheduler.perf_metrics = None
-    scheduler.connector = None
     scheduler.structured_output_manager = Mock()
     scheduler.structured_output_manager.should_advance.return_value = True
-    scheduler.requests = {request.request_id: request}
-    scheduler.running = [request]
-    scheduler.waiting = Mock()
-    scheduler.kv_cache_manager = Mock()
-    scheduler.kv_cache_manager.take_events.return_value = None
-    scheduler.kv_event_publisher = Mock()
-    scheduler.finished_req_ids = set()
-    scheduler.finished_req_ids_dict = None
-    scheduler.vllm_config = Mock()
-    scheduler.vllm_config.model_config.enable_return_routed_experts = False
-    scheduler.enable_return_routed_experts = False
-    scheduler.recompute_kv_load_failures = False
-    scheduler.defer_block_free = False
-    scheduler.make_stats = Mock(return_value=None)
-    scheduler.max_model_len = 128
-
-    def free_request(req, delay_free_blocks=False):
-        scheduler.finished_req_ids.add(req.request_id)
-        scheduler.requests.pop(req.request_id, None)
-        return None
-
-    scheduler._free_request = Mock(side_effect=free_request)
-
-    output = SchedulerOutput(
-        scheduled_new_reqs=[],
-        scheduled_cached_reqs=CachedRequestData.make_empty(),
-        num_scheduled_tokens={request.request_id: 1},
-        total_num_scheduled_tokens=1,
-        scheduled_encoder_inputs={},
-        scheduled_spec_decode_tokens={},
-        num_common_prefix_blocks=[],
-        finished_req_ids=set(),
-        free_encoder_mm_hashes=[],
-    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
     model_runner_output = ModelRunnerOutput(
         req_ids=[request.request_id],
         req_id_to_index={request.request_id: 0},

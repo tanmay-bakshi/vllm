@@ -12,7 +12,8 @@ class _VerificationTier:
     """Runtime state for one measured batch-size and sequence-length tier.
 
     :ivar batch_size_range: Inclusive decode batch-size range.
-    :ivar sequence_length_range: Inclusive longest-sequence-length range.
+    :ivar sequence_length_range: Inclusive longest target-pass starting
+        sequence-length range.
     :ivar costs_ms: Total measured round cost by target query length.
     :ivar conditional_acceptance_rates: Conditional acceptance estimate by draft
         position, given that the preceding draft prefix was accepted.
@@ -33,7 +34,7 @@ class _VerificationTier:
         """Return whether this tier owns the runtime operating point.
 
         :param batch_size: Number of scheduled requests.
-        :param sequence_length: Longest scheduled sequence length.
+        :param sequence_length: Longest target-pass starting sequence length.
         :returns: Whether both values are inside the tier's inclusive ranges.
         """
         return (
@@ -57,7 +58,8 @@ class DFlashAdaptiveVerificationPolicy:
 
         :param config: Cost-aware adaptive verification configuration.
         :param max_batch_size: Largest scheduler batch the table must cover.
-        :param max_sequence_length: Largest sequence length the table must cover.
+        :param max_sequence_length: Largest target-pass starting sequence the
+            table may cover.
         """
         self.config = config
         tiers: dict[tuple[tuple[int, int], tuple[int, int]], _VerificationTier] = {}
@@ -121,7 +123,35 @@ class DFlashAdaptiveVerificationPolicy:
             )
         return matches[0] if len(matches) == 1 else None
 
-    def _fallback_query_len(self, max_query_len: int) -> int:
+    def _get_tier_for_range(
+        self,
+        batch_size: int,
+        min_sequence_length: int,
+        max_sequence_length: int,
+    ) -> _VerificationTier | None:
+        """Return the one tier containing an entire runtime length interval.
+
+        :param batch_size: Number of target-verification requests.
+        :param min_sequence_length: Lower bound on the longest target-pass
+            starting sequence.
+        :param max_sequence_length: Upper bound on the longest target-pass
+            starting sequence.
+        :returns: The containing tier, or ``None`` when the interval is
+            uncovered or crosses a tier boundary.
+        :raises ValueError: If the sequence-length bounds are reversed.
+        """
+        if min_sequence_length > max_sequence_length:
+            raise ValueError("DFlash sequence-length bounds must be ordered.")
+        min_tier = self._get_tier(batch_size, min_sequence_length)
+        max_tier = self._get_tier(batch_size, max_sequence_length)
+        return min_tier if min_tier is max_tier else None
+
+    def fallback_query_len(self, max_query_len: int) -> int:
+        """Return the configured conservative query length under a ceiling.
+
+        :param max_query_len: Static target-query ceiling.
+        :returns: Largest supported fallback query length under the ceiling.
+        """
         supported_query_lens = (4, 8, 12, 16)
         candidates = [
             query_len
@@ -143,19 +173,27 @@ class DFlashAdaptiveVerificationPolicy:
     def select_query_len(
         self,
         batch_size: int,
-        sequence_length: int,
+        min_sequence_length: int,
+        max_sequence_length: int,
         max_query_len: int = 16,
     ) -> int:
-        """Select the target query length for the next verification round.
+        """Select the target query length for the current verification pass.
 
         :param batch_size: Number of requests scheduled in this round.
-        :param sequence_length: Longest sequence in the scheduled batch.
+        :param min_sequence_length: Lower bound on the longest target-pass
+            starting sequence in the scheduled batch.
+        :param max_sequence_length: Upper bound on the longest target-pass
+            starting sequence in the scheduled batch.
         :param max_query_len: Optional static schedule ceiling.
         :returns: Query length chosen from the measured candidates.
         """
-        tier = self._get_tier(batch_size, sequence_length)
+        tier = self._get_tier_for_range(
+            batch_size,
+            min_sequence_length,
+            max_sequence_length,
+        )
         if tier is None:
-            return self._fallback_query_len(max_query_len)
+            return self.fallback_query_len(max_query_len)
         candidates = sorted(
             query_len for query_len in tier.costs_ms if query_len <= max_query_len
         )
@@ -189,7 +227,8 @@ class DFlashAdaptiveVerificationPolicy:
     def observe(
         self,
         batch_size: int,
-        sequence_length: int,
+        min_sequence_length: int,
+        max_sequence_length: int,
         query_len: int,
         num_accepted_draft_tokens: int,
         num_observed_draft_tokens: int | None = None,
@@ -197,7 +236,10 @@ class DFlashAdaptiveVerificationPolicy:
         """Update acceptance hazards from one executed prefix.
 
         :param batch_size: Number of requests in the executed batch.
-        :param sequence_length: Longest sequence in the executed batch.
+        :param min_sequence_length: Lower bound on the longest target-pass
+            starting sequence in the executed batch.
+        :param max_sequence_length: Upper bound on the longest target-pass
+            starting sequence in the executed batch.
         :param query_len: Executed target query length.
         :param num_accepted_draft_tokens: Accepted draft-prefix length.
         :param num_observed_draft_tokens: Number of real draft positions in the
@@ -208,7 +250,8 @@ class DFlashAdaptiveVerificationPolicy:
             observed_draft_tokens = num_observed_draft_tokens
         self.observe_batch(
             batch_size=batch_size,
-            sequence_length=sequence_length,
+            min_sequence_length=min_sequence_length,
+            max_sequence_length=max_sequence_length,
             query_len=query_len,
             accepted_and_observed_draft_tokens=[
                 (num_accepted_draft_tokens, observed_draft_tokens)
@@ -218,19 +261,27 @@ class DFlashAdaptiveVerificationPolicy:
     def observe_batch(
         self,
         batch_size: int,
-        sequence_length: int,
+        min_sequence_length: int,
+        max_sequence_length: int,
         query_len: int,
         accepted_and_observed_draft_tokens: list[tuple[int, int]],
     ) -> None:
         """Update conditional acceptance estimates once for a target batch.
 
         :param batch_size: Number of requests in the executed batch.
-        :param sequence_length: Longest sequence in the executed batch.
+        :param min_sequence_length: Lower bound on the longest target-pass
+            starting sequence in the executed batch.
+        :param max_sequence_length: Upper bound on the longest target-pass
+            starting sequence in the executed batch.
         :param query_len: Executed target query length.
         :param accepted_and_observed_draft_tokens: Accepted prefix length and
             real executed draft count for each non-padding row.
         """
-        tier = self._get_tier(batch_size, sequence_length)
+        tier = self._get_tier_for_range(
+            batch_size,
+            min_sequence_length,
+            max_sequence_length,
+        )
         if tier is None:
             return
         if query_len not in tier.costs_ms:

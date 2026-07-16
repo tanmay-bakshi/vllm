@@ -15,6 +15,8 @@ def _scheduler_output(
     query_len: int,
     batch_size: int,
     sequence_length: int,
+    min_starting_sequence_length: int | None = None,
+    max_starting_sequence_length: int | None = None,
     non_verification_rows: int = 0,
     padded_rows: int = 0,
 ) -> SchedulerOutput:
@@ -23,6 +25,10 @@ def _scheduler_output(
     :param query_len: Target query length executed by the pass.
     :param batch_size: Number of target-verification rows.
     :param sequence_length: Longest ending verification sequence.
+    :param min_starting_sequence_length: Lower bound on the longest starting
+        verification sequence.
+    :param max_starting_sequence_length: Upper bound on the longest starting
+        verification sequence.
     :param non_verification_rows: Additional scheduled prefill rows.
     :param padded_rows: Verification rows without a real proposal.
     :returns: Synthetic scheduler output for diagnostic tests.
@@ -31,6 +37,16 @@ def _scheduler_output(
     output.dflash_verification_query_len = query_len
     output.dflash_verification_batch_size = batch_size
     output.dflash_verification_max_sequence_length = sequence_length
+    if min_starting_sequence_length is None:
+        min_starting_sequence_length = max(sequence_length - query_len, 0)
+    if max_starting_sequence_length is None:
+        max_starting_sequence_length = max(sequence_length - query_len, 0)
+    output.dflash_verification_min_starting_sequence_length = (
+        min_starting_sequence_length
+    )
+    output.dflash_verification_max_starting_sequence_length = (
+        max_starting_sequence_length
+    )
     total_rows = batch_size + non_verification_rows
     output.num_scheduled_tokens = {str(index): query_len for index in range(total_rows)}
     output.dflash_padded_request_ids = {str(index) for index in range(padded_rows)}
@@ -50,6 +66,7 @@ def test_first_completion_is_boundary_then_exactly_n_rounds_are_attributed() -> 
         query_len=8,
         batch_size=2,
         sequence_length=100,
+        min_starting_sequence_length=90,
         non_verification_rows=1,
         padded_rows=1,
     )
@@ -79,6 +96,8 @@ def test_first_completion_is_boundary_then_exactly_n_rounds_are_attributed() -> 
                 "q": 4,
                 "r": 1,
                 "rounds": 1,
+                "s_max": 46,
+                "s_min": 46,
             },
             {
                 "contaminated_rounds": 1,
@@ -90,10 +109,12 @@ def test_first_completion_is_boundary_then_exactly_n_rounds_are_attributed() -> 
                 "q": 8,
                 "r": 2,
                 "rounds": 1,
+                "s_max": 92,
+                "s_min": 90,
             },
         ],
         "rounds": 2,
-        "schema_version": 3,
+        "schema_version": 4,
     }
 
     diagnostics.begin_interval(400)
@@ -144,6 +165,8 @@ def test_first_completion_is_boundary_then_exactly_n_rounds_are_attributed() -> 
             "q": 16,
             "r": 8,
             "rounds": 1,
+            "s_max": 184,
+            "s_min": 184,
         },
         {
             "contaminated_rounds": 1,
@@ -155,6 +178,8 @@ def test_first_completion_is_boundary_then_exactly_n_rounds_are_attributed() -> 
             "q": 16,
             "r": 8,
             "rounds": 1,
+            "s_max": 224,
+            "s_min": 224,
         },
     ]
 
@@ -310,6 +335,8 @@ def test_engine_core_dflash_calibration_restarts_after_logging() -> None:
             "q": 12,
             "r": 4,
             "rounds": 1,
+            "s_max": 8180,
+            "s_min": 8180,
         }
     ]
     _, next_rendered = logger_info.call_args_list[1].args

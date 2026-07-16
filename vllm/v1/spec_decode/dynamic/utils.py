@@ -8,6 +8,7 @@ def validate_and_normalize_dynamic_sd_schedule(
     schedule: object,
     *,
     field_name: str = "num_speculative_tokens_per_batch_size",
+    require_non_increasing_values: bool = False,
 ) -> DynamicSDSchedule:
     """Validate and normalize a Dynamic SD range schedule.
 
@@ -15,8 +16,16 @@ def validate_and_normalize_dynamic_sd_schedule(
 
     ``[(range_start, range_end, num_speculative_tokens), ...]``
 
-    The same shape drives both the batch-size schedule and the
-    sequence-length schedule; ``field_name`` only customizes error messages.
+    The same shape drives both the batch-size schedule and the sequence-length
+    schedule. Sequence-length schedules must be non-increasing so a shorter
+    selected query cannot violate a ceiling resolved at the admitted full
+    query width.
+
+    :param schedule: Range schedule to validate and normalize.
+    :param field_name: Configuration field used in validation errors.
+    :param require_non_increasing_values: Whether values must not increase as
+        the range coordinate grows.
+    :returns: Parsed schedule sorted by range start.
     """
     if schedule is None:
         raise ValueError(f"{field_name} is required for dynamic speculative decoding.")
@@ -63,6 +72,12 @@ def validate_and_normalize_dynamic_sd_schedule(
         if range_start <= previous_end:
             raise ValueError(f"{field_name} ranges must be non-overlapping and sorted.")
         previous_end = range_end
+
+    if require_non_increasing_values and any(
+        parsed_schedule[index][2] > parsed_schedule[index - 1][2]
+        for index in range(1, len(parsed_schedule))
+    ):
+        raise ValueError(f"{field_name} values must be non-increasing.")
 
     first_range_start = parsed_schedule[0][0]
     if first_range_start != 1:

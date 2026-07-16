@@ -270,6 +270,7 @@ class Scheduler(SchedulerInterface):
                     validate_and_normalize_dynamic_sd_schedule(
                         speculative_config.num_speculative_tokens_per_seq_len,
                         field_name="num_speculative_tokens_per_seq_len",
+                        require_non_increasing_values=True,
                     )
                 )
             if speculative_config.dflash_adaptive_verification is not None:
@@ -473,6 +474,150 @@ class Scheduler(SchedulerInterface):
                 max_seq_len = seq_len
         return batch_size, max_seq_len
 
+    def _resolve_dynamic_num_speculative_tokens(
+        self,
+        scheduled_batch_size: int,
+        min_decode_seq_len: int,
+        max_decode_seq_len: int | None = None,
+    ) -> int:
+        """Resolve the static dynamic-decoding ceiling for one target batch.
+
+        :param scheduled_batch_size: Number of requests in the complete target
+            batch, including any non-verification rows.
+        :param min_decode_seq_len: Lower bound on the longest ending decode
+            sequence.
+        :param max_decode_seq_len: Upper bound on the longest ending decode
+            sequence. The lower bound is exact when this is omitted.
+        :returns: Maximum number of draft tokens permitted by static schedules.
+        """
+        num_speculative_tokens = self.num_spec_tokens
+        if scheduled_batch_size <= 0:
+            return num_speculative_tokens
+        if self.dynamic_sd_lookup is not None:
+            num_speculative_tokens = self.dynamic_sd_lookup[scheduled_batch_size]
+        if self.dynamic_sd_seq_len_schedule is None:
+            return num_speculative_tokens
+
+        if max_decode_seq_len is None:
+            max_decode_seq_len = min_decode_seq_len
+        if min_decode_seq_len > max_decode_seq_len:
+            raise ValueError("Decode sequence-length bounds must be ordered.")
+        sequence_length_points = {min_decode_seq_len, max_decode_seq_len}
+        sequence_length_points.update(
+            range_start
+            for range_start, _, _ in self.dynamic_sd_seq_len_schedule
+            if min_decode_seq_len <= range_start <= max_decode_seq_len
+        )
+        num_speculative_tokens = min(
+            num_speculative_tokens,
+            *(
+                resolve_dynamic_sd_num_speculative_tokens(
+                    self.dynamic_sd_seq_len_schedule,
+                    sequence_length,
+                    self.num_spec_tokens,
+                )
+                for sequence_length in sequence_length_points
+            ),
+        )
+        return num_speculative_tokens
+
+    def _dflash_target_starting_sequence_length_range(
+        self,
+        dflash_cohort_req_ids: set[str],
+    ) -> tuple[int, int]:
+        """Bound the target cohort's actual longest starting sequence.
+
+        Async scheduling advances CPU request state before the preceding target
+        result is available. Its output placeholders include one guaranteed
+        sampled token and every draft token that may still be rejected. The
+        worker corrects that rejection drift on-device before executing the
+        next target pass.
+
+        :param dflash_cohort_req_ids: Requests in the verification cohort.
+        :returns: Inclusive lower and upper bounds on the actual longest
+            starting sequence.
+        """
+        min_starting_seq_len = 0
+        max_starting_seq_len = 0
+        for req_id in dflash_cohort_req_ids:
+            request = self.requests[req_id]
+            optimistic_start = request.num_computed_tokens
+            max_rejected_tokens = max(request.num_output_placeholders - 1, 0)
+            conservative_start = max(optimistic_start - max_rejected_tokens, 0)
+            min_starting_seq_len = max(
+                min_starting_seq_len,
+                conservative_start,
+            )
+            max_starting_seq_len = max(
+                max_starting_seq_len,
+                optimistic_start,
+            )
+        return min_starting_seq_len, max_starting_seq_len
+
+    def _select_dflash_target_query_len(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+        dflash_cohort_req_ids: set[str],
+        current_query_len: int,
+        min_starting_seq_len: int,
+        max_starting_seq_len: int,
+    ) -> int:
+        """Select and apply an adaptive prefix to the actual target batch.
+
+        DFlash always retains its complete trained proposal until this point.
+        The scheduler first admits a uniform full-width target cohort, then
+        selects a prefix from that cohort's exact request count and bounded
+        longest starting sequence. The bounds account for unresolved async
+        speculative rejection. This keeps the cost coordinate independent of
+        the candidate query length and prevents a decision made for one round
+        from being applied to a different next-round cohort.
+
+        Slot allocation has already reserved the full target width. Truncation
+        therefore changes only scheduled work; the small amount of excess
+        lookahead remains owned by the request and is reusable by later rounds.
+
+        :param num_scheduled_tokens: Mutable scheduled token counts by request.
+        :param scheduled_spec_decode_tokens: Mutable draft prefixes by request.
+        :param dflash_cohort_req_ids: Requests in the verification cohort.
+        :param current_query_len: Uniform admitted target query length.
+        :param min_starting_seq_len: Lower bound on the cohort's actual longest
+            starting sequence.
+        :param max_starting_seq_len: Upper bound on the cohort's actual longest
+            starting sequence.
+        :returns: Query length selected for this target pass.
+        """
+        policy = self.dflash_adaptive_verification_policy
+        if policy is None or current_query_len <= 1:
+            return current_query_len
+        batch_size = len(dflash_cohort_req_ids)
+        if batch_size <= 0:
+            return current_query_len
+        max_query_len = min(
+            current_query_len,
+            self._resolve_dynamic_num_speculative_tokens(
+                len(num_scheduled_tokens),
+                min_starting_seq_len + current_query_len,
+                max_starting_seq_len + current_query_len,
+            )
+            + 1,
+        )
+        if len(num_scheduled_tokens) != batch_size:
+            selected_query_len = policy.fallback_query_len(max_query_len)
+        else:
+            selected_query_len = policy.select_query_len(
+                batch_size=batch_size,
+                min_sequence_length=min_starting_seq_len,
+                max_sequence_length=max_starting_seq_len,
+                max_query_len=max_query_len,
+            )
+        self._truncate_dflash_target_batch(
+            selected_query_len,
+            num_scheduled_tokens,
+            scheduled_spec_decode_tokens,
+        )
+        return selected_query_len
+
     def _max_dflash_proposal_sequence_length(
         self, num_scheduled_tokens: dict[str, int]
     ) -> int:
@@ -559,6 +704,9 @@ class Scheduler(SchedulerInterface):
         dflash_padded_request_ids: set[str] = set()
         dflash_cohort_req_ids: set[str] = set()
         dflash_target_query_len: int | None = None
+        dflash_min_starting_seq_len = 0
+        dflash_max_starting_seq_len = 0
+        dflash_acceptance_observation_eligible = False
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
 
@@ -1266,6 +1414,29 @@ class Scheduler(SchedulerInterface):
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
 
+        if dflash_target_query_len is not None and len(dflash_cohort_req_ids) > 0:
+            (
+                dflash_min_starting_seq_len,
+                dflash_max_starting_seq_len,
+            ) = self._dflash_target_starting_sequence_length_range(
+                dflash_cohort_req_ids
+            )
+            dflash_acceptance_observation_eligible = len(num_scheduled_tokens) == len(
+                dflash_cohort_req_ids
+            )
+
+        if self.dflash_adaptive_verification_policy is not None and (
+            dflash_target_query_len is not None
+        ):
+            dflash_target_query_len = self._select_dflash_target_query_len(
+                num_scheduled_tokens,
+                scheduled_spec_decode_tokens,
+                dflash_cohort_req_ids,
+                dflash_target_query_len,
+                dflash_min_starting_seq_len,
+                dflash_max_starting_seq_len,
+            )
+
         dflash_verification_query_len = 0
         if self.use_dflash:
             if self.scheduler_config.async_scheduling:
@@ -1351,9 +1522,9 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
-        # Dynamic speculative decoding: choose the verification length K from the
-        # batch size and/or the longest scheduled sequence, taking the smaller K
-        # when both schedules apply.
+        # Non-DFlash methods and fixed/scheduled DFlash choose the proposal width
+        # for the next pass here. Adaptive DFlash retains all 15 proposals so the
+        # next scheduler pass can choose against its actual target cohort.
         num_spec_tokens_to_schedule = self.num_spec_tokens
         scheduled_batch_size = len(num_scheduled_tokens)
         decode_batch_size, max_decode_seq_len = self._scheduled_decode_operating_point(
@@ -1374,31 +1545,12 @@ class Scheduler(SchedulerInterface):
             )
         )
         if scheduled_batch_size > 0:
-            if self.dynamic_sd_lookup is not None:
-                num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                    scheduled_batch_size
-                ]
-            if self.dynamic_sd_seq_len_schedule is not None:
-                num_spec_tokens_to_schedule = min(
-                    num_spec_tokens_to_schedule,
-                    resolve_dynamic_sd_num_speculative_tokens(
-                        self.dynamic_sd_seq_len_schedule,
-                        max_decode_seq_len,
-                        self.num_spec_tokens,
-                    ),
-                )
-            if (
-                self.dflash_adaptive_verification_policy is not None
-                and decode_batch_size > 0
-                and dflash_proposal_fits
-            ):
+            if self.dflash_adaptive_verification_policy is None:
                 num_spec_tokens_to_schedule = (
-                    self.dflash_adaptive_verification_policy.select_query_len(
-                        batch_size=decode_batch_size,
-                        sequence_length=max_decode_seq_len,
-                        max_query_len=num_spec_tokens_to_schedule + 1,
+                    self._resolve_dynamic_num_speculative_tokens(
+                        scheduled_batch_size,
+                        max_decode_seq_len,
                     )
-                    - 1
                 )
             if not dflash_proposal_fits:
                 num_spec_tokens_to_schedule = 0
@@ -1438,6 +1590,15 @@ class Scheduler(SchedulerInterface):
             dflash_verification_query_len=dflash_verification_query_len,
             dflash_verification_batch_size=decode_batch_size,
             dflash_verification_max_sequence_length=max_decode_seq_len,
+            dflash_verification_min_starting_sequence_length=(
+                dflash_min_starting_seq_len
+            ),
+            dflash_verification_max_starting_sequence_length=(
+                dflash_max_starting_seq_len
+            ),
+            dflash_acceptance_observation_eligible=(
+                dflash_acceptance_observation_eligible
+            ),
             dflash_proposal_max_sequence_length=max_dflash_proposal_seq_len,
             dflash_num_valid_draft_tokens=dflash_num_valid_draft_tokens,
             dflash_padded_request_ids=(
@@ -2205,13 +2366,19 @@ class Scheduler(SchedulerInterface):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
-        if len(dflash_acceptance_observations) > 0:
+        if (
+            len(dflash_acceptance_observations) > 0
+            and scheduler_output.dflash_acceptance_observation_eligible
+        ):
             assert self.dflash_adaptive_verification_policy is not None
             assert dflash_observation_query_len is not None
             self.dflash_adaptive_verification_policy.observe_batch(
                 batch_size=scheduler_output.dflash_verification_batch_size,
-                sequence_length=(
-                    scheduler_output.dflash_verification_max_sequence_length
+                min_sequence_length=(
+                    scheduler_output.dflash_verification_min_starting_sequence_length
+                ),
+                max_sequence_length=(
+                    scheduler_output.dflash_verification_max_starting_sequence_length
                 ),
                 query_len=dflash_observation_query_len,
                 accepted_and_observed_draft_tokens=dflash_acceptance_observations,
