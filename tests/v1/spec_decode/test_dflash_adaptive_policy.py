@@ -23,6 +23,7 @@ from vllm.v1.spec_decode.dynamic.dflash_policy import (
 def _make_config(
     costs_ms: dict[int, float],
     *,
+    initial_acceptance_rates: list[float] | None = None,
     exploration_interval: int = 256,
     switch_threshold: float = 0.03,
 ) -> DFlashAdaptiveVerificationConfig:
@@ -36,7 +37,11 @@ def _make_config(
             )
             for query_len, round_cost_ms in costs_ms.items()
         ],
-        initial_acceptance_rates=[1.0] * 15,
+        initial_acceptance_rates=(
+            initial_acceptance_rates
+            if initial_acceptance_rates is not None
+            else [1.0] * 15
+        ),
         acceptance_ema_alpha=1.0,
         switch_threshold=switch_threshold,
         exploration_interval=exploration_interval,
@@ -51,6 +56,60 @@ def test_policy_maximizes_expected_output_tokens_per_round_cost() -> None:
     )
 
     assert policy.select_query_len(8, 128, 128) == 8
+
+
+def test_policy_returns_to_full_query_below_the_performance_floor_margin() -> None:
+    policy = DFlashAdaptiveVerificationPolicy(
+        _make_config(
+            {4: 1.0, 8: 2.1, 12: 3.1, 16: 4.05},
+            initial_acceptance_rates=[0.9**position for position in range(1, 16)],
+        ),
+        max_batch_size=32,
+        max_sequence_length=1024,
+    )
+    assert policy.select_query_len(8, 128, 128) == 4
+
+    policy.observe(
+        batch_size=8,
+        min_sequence_length=128,
+        max_sequence_length=128,
+        query_len=16,
+        num_accepted_draft_tokens=15,
+    )
+
+    assert policy.select_query_len(8, 128, 128) == 16
+
+
+def test_policy_retains_short_query_above_the_performance_floor_margin() -> None:
+    policy = DFlashAdaptiveVerificationPolicy(
+        _make_config(
+            {4: 1.0, 8: 2.1, 12: 3.1, 16: 4.2},
+            initial_acceptance_rates=[0.9**position for position in range(1, 16)],
+        ),
+        max_batch_size=32,
+        max_sequence_length=1024,
+    )
+    assert policy.select_query_len(8, 128, 128) == 4
+
+    policy.observe(
+        batch_size=8,
+        min_sequence_length=128,
+        max_sequence_length=128,
+        query_len=16,
+        num_accepted_draft_tokens=15,
+    )
+
+    assert policy.select_query_len(8, 128, 128) == 4
+
+
+def test_policy_requires_switch_margin_to_leave_full_query() -> None:
+    policy = DFlashAdaptiveVerificationPolicy(
+        _make_config({4: 1.0, 8: 2.1, 12: 3.1, 16: 4.08}),
+        max_batch_size=32,
+        max_sequence_length=1024,
+    )
+
+    assert policy.select_query_len(8, 128, 128) == 16
 
 
 def test_policy_updates_prefix_acceptance_without_observing_the_tail() -> None:

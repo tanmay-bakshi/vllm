@@ -46,7 +46,11 @@ class _VerificationTier:
 
 
 class DFlashAdaptiveVerificationPolicy:
-    """Choose a lossless DFlash target prefix from measured round utility."""
+    """Choose a lossless DFlash target prefix from measured round utility.
+
+    The complete measured prefix is the performance floor. A shorter prefix
+    must preserve the configured utility margin over it to remain selected.
+    """
 
     def __init__(
         self,
@@ -219,6 +223,15 @@ class DFlashAdaptiveVerificationPolicy:
             return best_query_len
 
         current_utility = utilities[tier.current_query_len]
+        full_utility = utilities[full_query_len]
+        required_full_margin = full_utility * (1.0 + self.config.switch_threshold)
+        if (
+            tier.current_query_len != full_query_len
+            and current_utility < required_full_margin
+        ):
+            tier.current_query_len = full_query_len
+            return full_query_len
+
         required_utility = current_utility * (1.0 + self.config.switch_threshold)
         if utilities[best_query_len] >= required_utility:
             tier.current_query_len = best_query_len

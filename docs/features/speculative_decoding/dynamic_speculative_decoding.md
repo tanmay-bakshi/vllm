@@ -101,9 +101,12 @@ the fixed 16-query draft pass, and sampling. At runtime, the policy updates
 conditional per-position acceptance hazards once per eligible executed batch,
 with rejected tails treated as censored rather than failed observations.
 Invalid target padding is excluded. The policy chooses the prefix with the
-highest expected accepted output tokens per millisecond. A switching threshold
-prevents oscillation, and periodic full-block probes keep acceptance estimates
-for the tail current.
+highest expected accepted output tokens per millisecond. The complete measured
+query length is the performance floor: a shorter query is selected or retained
+only while its estimated utility exceeds the full-query utility by the
+switching threshold. The same threshold governs changes between shorter query
+lengths, and periodic full-block probes keep acceptance estimates for the tail
+current.
 
 Every DFlash target verification cohort uses one supported query length. A row
 without a proposal can join an existing cohort through explicit invalid

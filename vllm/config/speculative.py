@@ -116,8 +116,8 @@ class DFlashAdaptiveVerificationConfig:
     :ivar initial_acceptance_rates: Initial unconditional acceptance probability
         for each of the 15 draft positions.
     :ivar acceptance_ema_alpha: Weight assigned to each new acceptance outcome.
-    :ivar switch_threshold: Minimum relative utility gain required to change
-        query length.
+    :ivar switch_threshold: Relative utility margin required to select or keep
+        a shorter query length and to switch between shorter lengths.
     :ivar exploration_interval: Policy decisions between full-block probes used
         to refresh acceptance estimates for positions outside the active prefix.
     """
