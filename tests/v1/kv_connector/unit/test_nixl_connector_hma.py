@@ -379,7 +379,7 @@ def test_pull_publication_uses_transferable_blocks() -> None:
         mode=LocalizationMode.TRACE,
         run_id="test-run",
         transport_arm="pull",
-        target_request_id=request.request_id,
+        target_request_ids=(request.request_id,),
         artifact_dir=None,
         copy_chunk_bytes=1024,
         strict_zero_byte=False,

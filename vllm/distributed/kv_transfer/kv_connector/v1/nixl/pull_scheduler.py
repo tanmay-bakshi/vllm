@@ -562,12 +562,15 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                 expected_consumers=expected_consumers,
                 consumer_tp_size=consumer_tp_size,
             )
-            if is_p_node and self._localization_config.enabled_for(request.request_id):
+            if is_p_node and self._localization_config.enabled_for_producer(
+                request.request_id
+            ):
                 self._localization_offer_generation += 1
                 offer_generation = self._localization_offer_generation
                 self._source_rosters[request.request_id] = NixlSourceRoster(
                     offer_generation=offer_generation,
                     iteration=0,
+                    expected_consumers=expected_consumers,
                     valid_token_extent=settled_num_computed_tokens,
                     group_token_capacities=tuple(
                         int(group.kv_cache_spec.block_size)

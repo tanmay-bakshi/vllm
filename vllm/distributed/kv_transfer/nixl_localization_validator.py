@@ -34,8 +34,11 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlSourceManifestRecord,
     NixlTerminalRecord,
     compute_semantic_contract_digest,
+    localization_child_index,
     localization_fingerprint_size,
+    localization_producer_target,
     localization_request_id_base,
+    localization_request_target,
     select_source_manifest,
     source_contract_from_manifest,
     validate_capture,
@@ -439,6 +442,7 @@ def _source_request_signature(contract: NixlSourceContract) -> tuple[object, ...
         contract.producer_request_id,
         contract.offer_generation,
         contract.iteration,
+        contract.expected_consumers,
         contract.region_lengths,
         tuple(_region_semantic_signature(region) for region in contract.regions),
         contract.source_group_planes,
@@ -683,8 +687,11 @@ def _record_scope_errors(
         if manifest.source_rank != session.rank:
             errors.append("source manifest rank differs from its session")
         if (
-            localization_request_id_base(manifest.producer_request_id)
-            != session.target_request_id
+            localization_producer_target(
+                manifest.producer_request_id,
+                session.target_request_ids,
+            )
+            is None
         ):
             errors.append("source manifest request differs from its session target")
         return tuple(errors)
@@ -694,10 +701,11 @@ def _record_scope_errors(
             errors.append("plan engine differs from its session")
         if record.observer_rank != session.rank:
             errors.append("plan rank differs from its session")
-        if (
-            localization_request_id_base(record.child_request_id)
-            != session.target_request_id
-        ):
+        child_target = localization_request_target(
+            record.child_request_id,
+            session.target_request_ids,
+        )
+        if child_target is None:
             errors.append("plan child differs from its session target")
         for contract in record.source_contracts:
             if contract.fingerprint_algorithm is not session.fingerprint_algorithm:
@@ -706,10 +714,11 @@ def _record_scope_errors(
                 errors.append("plan source contract run differs from its session")
             if contract.transport_arm != session.transport_arm:
                 errors.append("plan source contract arm differs from its session")
-            if (
-                localization_request_id_base(contract.producer_request_id)
-                != session.target_request_id
-            ):
+            producer_target = localization_producer_target(
+                contract.producer_request_id,
+                session.target_request_ids,
+            )
+            if producer_target is None or producer_target != child_target:
                 errors.append("plan source differs from its session target")
         return tuple(errors)
 
@@ -732,18 +741,129 @@ def _record_scope_errors(
         errors.append(f"{record.record_type} engine differs from its session")
     if record.observer_rank != session.rank:
         errors.append(f"{record.record_type} rank differs from its session")
-    if (
-        record.child_request_id is None
-        or localization_request_id_base(record.child_request_id)
-        != session.target_request_id
-    ):
+    child_target = (
+        None
+        if record.child_request_id is None
+        else localization_request_target(
+            record.child_request_id,
+            session.target_request_ids,
+        )
+    )
+    if child_target is None:
         errors.append(f"{record.record_type} child differs from its session target")
     if (
         record.producer_request_id is not None
-        and localization_request_id_base(record.producer_request_id)
-        != session.target_request_id
+        and localization_producer_target(
+            record.producer_request_id,
+            session.target_request_ids,
+        )
+        != child_target
     ):
         errors.append(f"{record.record_type} source differs from its session target")
+    return tuple(errors)
+
+
+def _target_coverage_errors(
+    target_request_ids: tuple[str, ...],
+    source_manifests: tuple[NixlSourceManifest, ...],
+    events: dict[ObserverKey, NixlEventRecord],
+) -> tuple[str, ...]:
+    """Prove every configured parent has its complete logical child set.
+
+    :param target_request_ids: Complete configured parent allowlist.
+    :param source_manifests: Every authoritative SOURCE_POST manifest.
+    :param events: Decoder-rank terminal outcomes keyed by observer identity.
+    :returns: Missing-parent, cardinality, child-form, and duplication errors.
+    """
+    errors: list[str] = []
+    consumer_counts: dict[str, set[int]] = {
+        target_request_id: set() for target_request_id in target_request_ids
+    }
+    for manifest in source_manifests:
+        target_request_id = localization_producer_target(
+            manifest.producer_request_id,
+            target_request_ids,
+        )
+        if target_request_id is not None:
+            consumer_counts[target_request_id].add(manifest.expected_consumers)
+
+    logical_children: dict[str, set[tuple[str, str]]] = {
+        target_request_id: set() for target_request_id in target_request_ids
+    }
+    for child_request_id, observer_engine_id, _ in events:
+        target_request_id = localization_request_target(
+            child_request_id,
+            target_request_ids,
+        )
+        if target_request_id is not None:
+            logical_children[target_request_id].add(
+                (child_request_id, observer_engine_id)
+            )
+
+    for target_request_id in target_request_ids:
+        counts = consumer_counts[target_request_id]
+        if len(counts) == 0:
+            errors.append(
+                f"configured target {target_request_id!r} has no SOURCE_POST manifest"
+            )
+            continue
+        if len(counts) != 1:
+            errors.append(
+                f"configured target {target_request_id!r} has inconsistent "
+                f"expected-consumer counts: {sorted(counts)}"
+            )
+            continue
+        expected_consumers = next(iter(counts))
+        children_by_index: dict[int, set[tuple[str, str]]] = {}
+        for child_request_id, observer_engine_id in logical_children[target_request_id]:
+            stable_child_id = localization_request_id_base(child_request_id)
+            child_index = localization_child_index(
+                child_request_id,
+                target_request_id,
+            )
+            if child_index is None:
+                errors.append(
+                    f"target {target_request_id!r} has an invalid child identity "
+                    f"{child_request_id!r}"
+                )
+                continue
+            direct_parent = stable_child_id == target_request_id
+            if expected_consumers == 1 and not direct_parent:
+                errors.append(
+                    f"single-consumer target {target_request_id!r} uses prefixed "
+                    f"child {child_request_id!r}"
+                )
+                continue
+            if expected_consumers > 1 and direct_parent:
+                errors.append(
+                    f"parallel target {target_request_id!r} uses bare parent "
+                    f"{child_request_id!r} as a child"
+                )
+                continue
+            if child_index >= expected_consumers:
+                errors.append(
+                    f"target {target_request_id!r} child index {child_index} exceeds "
+                    f"its {expected_consumers}-consumer contract"
+                )
+                continue
+            children_by_index.setdefault(child_index, set()).add(
+                (child_request_id, observer_engine_id)
+            )
+
+        expected_indices = set(range(expected_consumers))
+        actual_indices = set(children_by_index)
+        if actual_indices != expected_indices:
+            errors.append(
+                f"configured target {target_request_id!r} child indices are "
+                f"incomplete: {sorted(actual_indices)} != {sorted(expected_indices)}"
+            )
+        for child_index, children in children_by_index.items():
+            if len(children) != 1:
+                errors.append(
+                    f"configured target {target_request_id!r} child index "
+                    f"{child_index} maps to multiple logical decoder children: "
+                    f"{sorted(children)}"
+                )
     return tuple(errors)
 
 
@@ -1406,10 +1526,25 @@ def validate_localization_artifacts(
                 and session.fingerprint_algorithm
                 is not LocalizationFingerprintAlgorithm.BLAKE2B_128
             )
-            or session.target_request_id != reference_session.target_request_id
-            or len(session.target_request_id) == 0
-            or localization_request_id_base(session.target_request_id)
-            != session.target_request_id
+            or session.target_request_ids != reference_session.target_request_ids
+            or len(session.target_request_ids) == 0
+            or tuple(sorted(session.target_request_ids)) != session.target_request_ids
+            or len(set(session.target_request_ids)) != len(session.target_request_ids)
+            or any(
+                len(target_request_id) == 0
+                or localization_request_id_base(target_request_id) != target_request_id
+                for target_request_id in session.target_request_ids
+            )
+            or any(
+                separator == "_"
+                and child_index.isascii()
+                and child_index.isdecimal()
+                and parent_request_id in session.target_request_ids
+                for target_request_id in session.target_request_ids
+                for child_index, separator, parent_request_id in (
+                    target_request_id.partition("_"),
+                )
+            )
             or session.world_size <= 0
             or session.rank < 0
             or session.rank >= session.world_size
@@ -1516,6 +1651,14 @@ def validate_localization_artifacts(
                 f"engine {engine_id} process ranks are incomplete: "
                 f"{sorted(actual_ranks)} != {sorted(expected_ranks)}"
             )
+
+    errors.extend(
+        _target_coverage_errors(
+            reference_session.target_request_ids,
+            tuple(source_post_by_lineage.values()),
+            events,
+        )
+    )
 
     divergences: list[LocalizationDivergence] = []
     verified_observers: set[ObserverKey] = set()

@@ -3,6 +3,7 @@
 """CPU tests for authoritative P-to-D localization artifacts."""
 
 import hashlib
+import queue
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -48,7 +49,10 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     build_integrity_identity,
     build_integrity_leaf,
     compute_semantic_contract_digest,
+    localization_child_index,
     localization_fingerprint_size,
+    localization_producer_target,
+    localization_request_target,
     seal_source_manifest,
     source_contract_from_manifest,
     validate_source_contract_structure,
@@ -79,8 +83,8 @@ def test_worker_construction_initializes_localization_model_topology(
     monkeypatch.setenv("VLLM_NIXL_P2D_RUN_ID", "constructor-regression")
     monkeypatch.setenv("VLLM_NIXL_P2D_TRANSPORT_ARM", "unit-test")
     monkeypatch.setenv(
-        "VLLM_NIXL_P2D_TARGET_REQUEST_ID",
-        TARGET_REQUEST_ID_BASE,
+        "VLLM_NIXL_P2D_TARGET_REQUEST_IDS_JSON",
+        msgspec.json.encode([TARGET_REQUEST_ID_BASE]).decode(),
     )
     monkeypatch.setenv("VLLM_NIXL_P2D_ARTIFACT_DIR", str(tmp_path))
 
@@ -178,13 +182,13 @@ def _config(
     *,
     run_id: str = "run-localization",
     mode: LocalizationMode = LocalizationMode.TRACE,
-    target_request_id: str = TARGET_REQUEST_ID_BASE,
+    target_request_ids: tuple[str, ...] = (TARGET_REQUEST_ID_BASE,),
 ) -> NixlLocalizationConfig:
     return NixlLocalizationConfig(
         mode=mode,
         run_id=run_id,
         transport_arm="tcp-shm-cuda-copy",
-        target_request_id=target_request_id,
+        target_request_ids=target_request_ids,
         artifact_dir=artifact_dir,
         copy_chunk_bytes=64 * 1024 * 1024,
         strict_zero_byte=False,
@@ -225,12 +229,13 @@ def _manifest(
     registration_generation: str = "registration-1",
     producer_request_id: str | None = None,
     source_planes: int = 2,
+    expected_consumers: int = 1,
 ) -> NixlSourceManifest:
     source_region = region if region is not None else _region()
     request_id = (
         producer_request_id
         if producer_request_id is not None
-        else config.target_request_id
+        else config.target_request_ids[0]
     )
     contract_digest = compute_semantic_contract_digest(
         region=source_region,
@@ -304,6 +309,7 @@ def _manifest(
             registration_generation=registration_generation,
             offer_generation=1,
             iteration=0,
+            expected_consumers=expected_consumers,
             source_rank=source_rank,
             region_lengths=(source_region.row_bytes,),
             regions=(source_region,),
@@ -525,8 +531,14 @@ def _write_trace(
     complete_decoder_world: bool = False,
     source_block_rosters: dict[int, tuple[int, ...]] | None = None,
     mode: LocalizationMode = LocalizationMode.TRACE,
+    target_request_ids: tuple[str, ...] = (TARGET_REQUEST_ID_BASE,),
+    expected_consumers: int = 1,
 ) -> tuple[tuple[Path, ...], NixlSourceManifest, NixlPlanRecord]:
-    config = _config(artifact_dir, mode=mode)
+    config = _config(
+        artifact_dir,
+        mode=mode,
+        target_request_ids=target_request_ids,
+    )
     source_world_size = decoder_world_size * 2
     manifests = tuple(
         _manifest(
@@ -541,6 +553,7 @@ def _write_trace(
             source_rank=source_rank,
             registration_generation=f"registration-{source_rank}",
             producer_request_id=producer_request_id,
+            expected_consumers=expected_consumers,
         )
         for source_rank in range(source_world_size)
     )
@@ -648,7 +661,7 @@ def _write_trace(
 
 
 @pytest.mark.cpu_test
-def test_config_requires_and_selects_exact_target(
+def test_config_requires_and_selects_exact_targets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -656,30 +669,118 @@ def test_config_requires_and_selects_exact_target(
     monkeypatch.setenv("VLLM_NIXL_P2D_RUN_ID", "targeted-run")
     monkeypatch.setenv("VLLM_NIXL_P2D_TRANSPORT_ARM", "cuda-copy")
     monkeypatch.setenv("VLLM_NIXL_P2D_ARTIFACT_DIR", str(tmp_path))
-    monkeypatch.delenv("VLLM_NIXL_P2D_TARGET_REQUEST_ID", raising=False)
+    monkeypatch.delenv("VLLM_NIXL_P2D_TARGET_REQUEST_IDS_JSON", raising=False)
 
-    with pytest.raises(ValueError, match="TARGET_REQUEST_ID is required"):
+    with pytest.raises(ValueError, match="TARGET_REQUEST_IDS_JSON is required"):
         NixlLocalizationConfig.from_environment()
 
     monkeypatch.setenv(
-        "VLLM_NIXL_P2D_TARGET_REQUEST_ID",
-        TARGET_REQUEST_ID_BASE,
+        "VLLM_NIXL_P2D_TARGET_REQUEST_IDS_JSON",
+        msgspec.json.encode(
+            [TARGET_REQUEST_ID_BASE, "chatcmpl-second-target"]
+        ).decode(),
     )
     config = NixlLocalizationConfig.from_environment()
 
     assert config.enabled
+    assert config.target_request_ids == (
+        TARGET_REQUEST_ID_BASE,
+        "chatcmpl-second-target",
+    )
     assert config.enabled_for(TARGET_REQUEST_ID_BASE)
     assert config.enabled_for(f"{TARGET_REQUEST_ID_BASE}-deadbeef")
+    assert config.enabled_for_producer(TARGET_REQUEST_ID_BASE)
+    assert config.enabled_for_producer(f"{TARGET_REQUEST_ID_BASE}-deadbeef")
+    assert all(
+        config.enabled_for(f"{choice}_{TARGET_REQUEST_ID_BASE}-deadbeef")
+        for choice in range(8)
+    )
+    assert config.enabled_for("7_chatcmpl-second-target-deadbeef")
+    assert config.enabled_for_producer(f"4_{TARGET_REQUEST_ID_BASE}-deadbeef") is False
+    assert (
+        localization_request_target(
+            f"4_{TARGET_REQUEST_ID_BASE}-deadbeef",
+            config.target_request_ids,
+        )
+        == TARGET_REQUEST_ID_BASE
+    )
+    assert (
+        localization_producer_target(
+            f"4_{TARGET_REQUEST_ID_BASE}-deadbeef",
+            config.target_request_ids,
+        )
+        is None
+    )
+    assert (
+        localization_child_index(
+            f"4_{TARGET_REQUEST_ID_BASE}-deadbeef",
+            TARGET_REQUEST_ID_BASE,
+        )
+        == 4
+    )
     assert config.enabled_for(f"{TARGET_REQUEST_ID_BASE}-DEADBEEF") is False
     assert config.enabled_for(f"{TARGET_REQUEST_ID_BASE}-r1-deadbeef") is False
     assert config.enabled_for(f"{TARGET_REQUEST_ID_BASE}-deadbee") is False
     assert config.enabled_for(f"{TARGET_REQUEST_ID_BASE}-deadbeef0") is False
+    assert config.enabled_for(f"4_5_{TARGET_REQUEST_ID_BASE}-deadbeef") is False
     assert config.enabled_for(HTTP_TARGET_REQUEST_ID) is False
+    direct_target_config = _config(
+        tmp_path,
+        target_request_ids=("0_chatcmpl-direct-target",),
+    )
+    assert (
+        localization_request_target(
+            "0_chatcmpl-direct-target-deadbeef",
+            direct_target_config.target_request_ids,
+        )
+        == "0_chatcmpl-direct-target"
+    )
     with pytest.raises(ValueError, match="must not include a random suffix"):
         _config(
             tmp_path,
-            target_request_id=f"{TARGET_REQUEST_ID_BASE}-deadbeef",
+            target_request_ids=(f"{TARGET_REQUEST_ID_BASE}-deadbeef",),
         )
+    with pytest.raises(ValueError, match="unique and sorted"):
+        _config(
+            tmp_path,
+            target_request_ids=("chatcmpl-z", "chatcmpl-a"),
+        )
+    with pytest.raises(ValueError, match="ambiguous parent/child"):
+        _config(
+            tmp_path,
+            target_request_ids=("4_chatcmpl-parent", "chatcmpl-parent"),
+        )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "target_request_ids_json",
+    (
+        "{}",
+        "[]",
+        '["chatcmpl-target",1]',
+        '["chatcmpl-z","chatcmpl-a"]',
+        '["chatcmpl-target","chatcmpl-target"]',
+        '["chatcmpl-target-deadbeef"]',
+    ),
+)
+def test_config_rejects_invalid_target_allowlists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_request_ids_json: str,
+) -> None:
+    """The environment cannot weaken or ambiguously encode request scope."""
+    monkeypatch.setenv("VLLM_NIXL_P2D_LOCALIZATION", "trace")
+    monkeypatch.setenv("VLLM_NIXL_P2D_RUN_ID", "targeted-run")
+    monkeypatch.setenv("VLLM_NIXL_P2D_TRANSPORT_ARM", "cuda-copy")
+    monkeypatch.setenv("VLLM_NIXL_P2D_ARTIFACT_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "VLLM_NIXL_P2D_TARGET_REQUEST_IDS_JSON",
+        target_request_ids_json,
+    )
+
+    with pytest.raises(ValueError):
+        NixlLocalizationConfig.from_environment()
 
 
 @pytest.mark.cpu_test
@@ -699,6 +800,8 @@ def test_normal_consumer_metadata_names_only_the_actual_forward() -> None:
     scheduler._audit_finished_reqs = set()
     scheduler._heartbeat_by_engine = {}
     scheduler._heartbeat_snapshot_dirty = False
+    scheduler._parallel_pull_flights = {}
+    scheduler._offer_cancellation_queue = queue.Queue()
 
     request = MagicMock()
     request.request_id = child_request_id
@@ -778,6 +881,56 @@ def test_pre_read_waits_for_the_target_forward(tmp_path: Path) -> None:
         detail="all decoder stages captured; offline source comparison pending",
     )
     assert worker._localization_pre_read_plans == {}
+
+
+@pytest.mark.cpu_test
+def test_pre_read_captures_all_scheduled_parallel_children(tmp_path: Path) -> None:
+    """One model batch captures every scheduled target and preserves the rest."""
+    first_child_request_id = f"3_{TARGET_REQUEST_ID_BASE}-22222222"
+    second_child_request_id = f"4_{TARGET_REQUEST_ID_BASE}-33333333"
+    waiting_child_request_id = f"5_{TARGET_REQUEST_ID_BASE}-44444444"
+    producer_request_id = f"{TARGET_REQUEST_ID_BASE}-11111111"
+    manifest = _manifest(
+        _config(tmp_path),
+        producer_request_id=producer_request_id,
+    )
+    contract = source_contract_from_manifest(manifest)
+    first_plan: dict[str, object] = {"source_contracts": (contract,)}
+    second_plan: dict[str, object] = {"source_contracts": (contract,)}
+    waiting_plan: dict[str, object] = {"source_contracts": (contract,)}
+    worker = object.__new__(NixlPullConnectorWorker)
+    worker._localization_config = _config(tmp_path)
+    worker._localization_pre_read_plans = {
+        first_child_request_id: first_plan,
+        second_child_request_id: second_plan,
+        waiting_child_request_id: waiting_plan,
+    }
+    capture = MagicMock()
+    record = MagicMock()
+    worker._localization_capture_destination = capture
+    worker._localization_record_event = record
+
+    worker._localization_capture_pre_read(
+        {first_child_request_id, second_child_request_id}
+    )
+
+    assert capture.call_count == 2
+    capture.assert_any_call(
+        first_child_request_id,
+        first_plan,
+        IntegrityStage.PRE_READ,
+        "after_transfer_phase_drain_before_model_forward",
+    )
+    capture.assert_any_call(
+        second_child_request_id,
+        second_plan,
+        IntegrityStage.PRE_READ,
+        "after_transfer_phase_drain_before_model_forward",
+    )
+    assert record.call_count == 2
+    assert worker._localization_pre_read_plans == {
+        waiting_child_request_id: waiting_plan
+    }
 
 
 def _contract_worker(
@@ -882,6 +1035,27 @@ def test_source_contract_rejects_mismatched_request_lineage(tmp_path: Path) -> N
 
 
 @pytest.mark.cpu_test
+def test_source_contract_rejects_cross_target_lineage(tmp_path: Path) -> None:
+    """Allowlist membership cannot pair a child with another target's producer."""
+    worker, req_id, metadata, read_specs, expected = _contract_worker(tmp_path)
+    worker._localization_config = _config(
+        tmp_path,
+        target_request_ids=(TARGET_REQUEST_ID_BASE, "chatcmpl-z-target"),
+    )
+    assert metadata.remote is not None
+    metadata.remote.request_id = "chatcmpl-z-target-11111111"
+
+    with pytest.raises(LocalizationError, match="mismatched localization lineage"):
+        worker._localization_build_source_contracts(
+            req_id,
+            metadata,
+            read_specs,
+            expected.block_ids,
+            expected.region_lengths,
+        )
+
+
+@pytest.mark.cpu_test
 def test_source_contract_rejects_handshake_outside_native_registration(
     tmp_path: Path,
 ) -> None:
@@ -908,6 +1082,7 @@ def test_completed_source_roster_captures_source_post_then_retires(
     roster = NixlSourceRoster(
         offer_generation=1,
         iteration=0,
+        expected_consumers=1,
         valid_token_extent=100,
         group_token_capacities=(64,),
         block_ids=((10, 11),),
@@ -945,6 +1120,212 @@ def test_complete_fingerprint_trace_validates(tmp_path: Path) -> None:
     assert report.passed
     assert report.physical_pull_count == 1
     assert report.verified_pull_count == 1
+
+
+@pytest.mark.cpu_test
+def test_validator_requires_every_configured_target(tmp_path: Path) -> None:
+    """An allowlisted parent with no source or child evidence is incomplete."""
+    missing_target = "chatcmpl-z-target"
+    paths, _, _ = _write_trace(
+        tmp_path,
+        mode=LocalizationMode.FINGERPRINT,
+        target_request_ids=(TARGET_REQUEST_ID_BASE, missing_target),
+    )
+
+    report = validate_localization_artifacts(paths)
+
+    assert report.passed is False
+    assert any(
+        f"configured target {missing_target!r} has no SOURCE_POST manifest" in error
+        for error in report.errors
+    )
+
+
+@pytest.mark.cpu_test
+def test_validator_requires_every_parallel_child_index(tmp_path: Path) -> None:
+    """A producer-declared n=8 request cannot pass with only one child."""
+    paths, _, _ = _write_trace(
+        tmp_path,
+        mode=LocalizationMode.FINGERPRINT,
+        child_request_id=f"0_{TARGET_REQUEST_ID_BASE}-abcdef12",
+        expected_consumers=8,
+    )
+
+    report = validate_localization_artifacts(paths)
+
+    assert report.passed is False
+    assert any(
+        "child indices are incomplete: [0] != [0, 1, 2, 3, 4, 5, 6, 7]" in error
+        for error in report.errors
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("expected_consumers", "child_request_id", "error_fragment"),
+    (
+        (
+            1,
+            f"0_{TARGET_REQUEST_ID_BASE}-abcdef12",
+            "single-consumer target",
+        ),
+        (
+            8,
+            f"{TARGET_REQUEST_ID_BASE}-abcdef12",
+            "parallel target",
+        ),
+    ),
+)
+def test_validator_requires_canonical_child_form(
+    tmp_path: Path,
+    expected_consumers: int,
+    child_request_id: str,
+    error_fragment: str,
+) -> None:
+    """Consumer cardinality independently determines the child-ID form."""
+    paths, _, _ = _write_trace(
+        tmp_path,
+        mode=LocalizationMode.FINGERPRINT,
+        child_request_id=child_request_id,
+        expected_consumers=expected_consumers,
+    )
+
+    report = validate_localization_artifacts(paths)
+
+    assert report.passed is False
+    assert any(error_fragment in error for error in report.errors)
+
+
+@pytest.mark.cpu_test
+def test_complete_interleaved_multi_target_trace_validates(tmp_path: Path) -> None:
+    """One process artifact can prove independent pulls for several parents."""
+    target_request_ids = (TARGET_REQUEST_ID_BASE, "chatcmpl-z-target")
+    config = _config(
+        tmp_path,
+        mode=LocalizationMode.FINGERPRINT,
+        target_request_ids=target_request_ids,
+    )
+    source_writers = tuple(
+        LocalizationArtifactWriter(config, "prefill", rank, 2, 8) for rank in range(2)
+    )
+    manifests_by_target: list[tuple[NixlSourceManifest, ...]] = []
+    for target_index, target_request_id in enumerate(target_request_ids):
+        manifests = tuple(
+            _manifest(
+                config,
+                region=_region(base_address=0x100000 + source_rank * 0x10000),
+                source_rank=source_rank,
+                registration_generation=f"registration-{source_rank}",
+                producer_request_id=f"{target_request_id}-{target_index + 1:08x}",
+                expected_consumers=8,
+            )
+            for source_rank in range(2)
+        )
+        manifests_by_target.append(manifests)
+        for source_writer, manifest in zip(
+            source_writers,
+            manifests,
+            strict=True,
+        ):
+            source_writer.write(
+                NixlSourceManifestRecord(
+                    record_type=NixlSourceManifestRecord.RECORD_TYPE,
+                    stage=IntegrityStage.SOURCE_POST,
+                    manifest=manifest,
+                )
+            )
+    for source_writer in source_writers:
+        source_writer.close()
+
+    decoder_writer = LocalizationArtifactWriter(config, "decoder", 0, 1, 8)
+    for target_index, manifests in enumerate(manifests_by_target):
+        contracts = tuple(
+            source_contract_from_manifest(manifest) for manifest in manifests
+        )
+        for child_index in range(8):
+            plan = _plan(
+                contracts[0],
+                source_contracts=contracts,
+                local_region=_region(base_address=0x200000, row_bytes=16),
+                child_request_id=(
+                    f"{child_index}_{target_request_ids[target_index]}-abcdef12"
+                ),
+            )
+            decoder_writer.write(plan)
+            for stage in (
+                IntegrityStage.STAGING_POST_SCATTER,
+                IntegrityStage.DESTINATION,
+                IntegrityStage.PRE_READ,
+            ):
+                for manifest in manifests:
+                    decoder_writer.write(_capture(manifest, plan, stage))
+            decoder_writer.write(
+                NixlEventRecord(
+                    record_type=NixlEventRecord.RECORD_TYPE,
+                    schema_version=IntegrityIdentity.SCHEMA_VERSION,
+                    run_id=config.run_id,
+                    transport_arm=config.transport_arm,
+                    code="CAPTURE_COMPLETE",
+                    evidentiary=False,
+                    producer_engine_id=manifests[0].producer_engine_id,
+                    producer_request_id=manifests[0].producer_request_id,
+                    child_request_id=plan.child_request_id,
+                    observer_engine_id=plan.observer_engine_id,
+                    observer_rank=plan.observer_rank,
+                    detail=(
+                        "all decoder stages captured; offline source comparison pending"
+                    ),
+                    created_ns=time.time_ns(),
+                )
+            )
+    decoder_writer.close()
+
+    paths = tuple(writer.path for writer in source_writers) + (decoder_writer.path,)
+    report = validate_localization_artifacts(paths)
+
+    assert report.passed
+    assert report.physical_pull_count == 16
+    assert report.verified_pull_count == 16
+    assert (
+        read_localization_artifact(decoder_writer.path).session.target_request_ids
+        == target_request_ids
+    )
+
+
+@pytest.mark.cpu_test
+def test_validator_rejects_cross_target_plan_lineage(tmp_path: Path) -> None:
+    """A child and producer from different allowed parents cannot share a plan."""
+    target_request_ids = (TARGET_REQUEST_ID_BASE, "chatcmpl-z-target")
+    config = _config(tmp_path, target_request_ids=target_request_ids)
+    manifest = _manifest(
+        config,
+        producer_request_id=f"{TARGET_REQUEST_ID_BASE}-11111111",
+    )
+    source_writer = LocalizationArtifactWriter(config, "prefill", 0, 1, 8)
+    source_writer.write(
+        NixlSourceManifestRecord(
+            record_type=NixlSourceManifestRecord.RECORD_TYPE,
+            stage=IntegrityStage.SOURCE_POST,
+            manifest=manifest,
+        )
+    )
+    source_writer.close()
+    decoder_writer = LocalizationArtifactWriter(config, "decoder", 0, 1, 8)
+    decoder_writer.write(
+        _plan(
+            source_contract_from_manifest(manifest),
+            child_request_id="4_chatcmpl-z-target-22222222",
+        )
+    )
+    decoder_writer.close()
+
+    report = validate_localization_artifacts((source_writer.path, decoder_writer.path))
+
+    assert report.passed is False
+    assert any(
+        "plan source differs from its session target" in error
+        for error in report.errors
+    )
 
 
 @pytest.mark.cpu_test
@@ -999,6 +1380,24 @@ def test_validator_accepts_independent_internal_request_ids(tmp_path: Path) -> N
 
 
 @pytest.mark.cpu_test
+def test_validator_rejects_prefixed_producer_identity(tmp_path: Path) -> None:
+    """Parallel choice prefixes are decoder-only lineage."""
+    paths, _, _ = _write_trace(
+        tmp_path,
+        producer_request_id=f"4_{TARGET_REQUEST_ID_BASE}-11111111",
+        child_request_id=f"{TARGET_REQUEST_ID_BASE}-22222222",
+    )
+
+    report = validate_localization_artifacts(paths)
+
+    assert report.passed is False
+    assert any(
+        "source manifest request differs from its session target" in error
+        for error in report.errors
+    )
+
+
+@pytest.mark.cpu_test
 def test_reader_rejects_truncated_and_corrupted_frames(tmp_path: Path) -> None:
     """Neither truncation nor a payload mutation can resemble a clean trace."""
     paths, _, _ = _write_trace(tmp_path / "source")
@@ -1037,7 +1436,7 @@ def test_validator_rejects_duplicate_and_mixed_artifacts(tmp_path: Path) -> None
 
     mixed_target_config = _config(
         tmp_path / "mixed-target",
-        target_request_id="chatcmpl-unrelated",
+        target_request_ids=("chatcmpl-unrelated",),
     )
     mixed_target_writer = LocalizationArtifactWriter(
         mixed_target_config,

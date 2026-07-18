@@ -2263,7 +2263,7 @@ class NixlBaseConnectorWorker:
                 )
             return
         for req_id, logical_roster in rosters.items():
-            if self._localization_config.enabled_for(req_id) is False:
+            if self._localization_config.enabled_for_producer(req_id) is False:
                 continue
             if req_id in self._localization_source_rosters:
                 raise LocalizationError(f"duplicate source roster for {req_id}")
@@ -2297,6 +2297,7 @@ class NixlBaseConnectorWorker:
             physical_roster = NixlSourceRoster(
                 offer_generation=logical_roster.offer_generation,
                 iteration=logical_roster.iteration,
+                expected_consumers=logical_roster.expected_consumers,
                 valid_token_extent=logical_roster.valid_token_extent,
                 group_token_capacities=physical_capacities,
                 block_ids=tuple(
@@ -2609,6 +2610,7 @@ class NixlBaseConnectorWorker:
                 registration_generation=self._registration_generation,
                 offer_generation=roster.offer_generation,
                 iteration=roster.iteration,
+                expected_consumers=roster.expected_consumers,
                 source_rank=self.tp_rank,
                 region_lengths=tuple(int(rows.shape[1]) for rows in self._region_rows),
                 regions=self._region_descriptors,
@@ -2669,7 +2671,7 @@ class NixlBaseConnectorWorker:
 
         :param req_id: Producer request whose pages are still pinned.
         """
-        if self._localization_config.enabled_for(req_id) is False:
+        if self._localization_config.enabled_for_producer(req_id) is False:
             return
         roster = self._localization_source_rosters.get(req_id)
         if roster is None:
@@ -3232,35 +3234,37 @@ class NixlBaseConnectorWorker:
             return
         if len(self._localization_pre_read_plans) == 0:
             return
-        if len(self._localization_pre_read_plans) != 1:
-            raise LocalizationError(
-                "multiple localization targets are pending first-read capture"
+        scheduled_plans: list[tuple[ReqId, dict[str, Any]]] = []
+        for req_id, plan in self._localization_pre_read_plans.items():
+            if self._localization_config.enabled_for(req_id) is False:
+                raise LocalizationError(
+                    "pre-read plan is outside the localization target set"
+                )
+            if req_id in req_ids:
+                scheduled_plans.append((req_id, plan))
+        for req_id, plan in scheduled_plans:
+            self._localization_pre_read_plans.pop(req_id)
+            self._localization_capture_destination(
+                req_id,
+                plan,
+                IntegrityStage.PRE_READ,
+                "after_transfer_phase_drain_before_model_forward",
             )
-        req_id, plan = next(iter(self._localization_pre_read_plans.items()))
-        if self._localization_config.enabled_for(req_id) is False:
-            raise LocalizationError("pre-read plan is outside the localization target")
-        if req_id not in req_ids:
-            return
-        self._localization_pre_read_plans.pop(req_id)
-        self._localization_capture_destination(
-            req_id,
-            plan,
-            IntegrityStage.PRE_READ,
-            "after_transfer_phase_drain_before_model_forward",
-        )
-        contracts = tuple(plan["source_contracts"])
-        if len(contracts) == 0:
-            raise LocalizationError("pre-read plan has no source contracts")
-        producer = contracts[0]
-        is_sham = self._localization_config.mode is LocalizationMode.SHAM
-        self._localization_record_event(
-            code=("SHAM_CAPTURE_COMPLETE" if is_sham else "CAPTURE_COMPLETE"),
-            evidentiary=False,
-            child_request_id=req_id,
-            producer_engine_id=producer.producer_engine_id,
-            producer_request_id=producer.producer_request_id,
-            detail="all decoder stages captured; offline source comparison pending",
-        )
+            contracts = tuple(plan["source_contracts"])
+            if len(contracts) == 0:
+                raise LocalizationError("pre-read plan has no source contracts")
+            producer = contracts[0]
+            is_sham = self._localization_config.mode is LocalizationMode.SHAM
+            self._localization_record_event(
+                code=("SHAM_CAPTURE_COMPLETE" if is_sham else "CAPTURE_COMPLETE"),
+                evidentiary=False,
+                child_request_id=req_id,
+                producer_engine_id=producer.producer_engine_id,
+                producer_request_id=producer.producer_request_id,
+                detail=(
+                    "all decoder stages captured; offline source comparison pending"
+                ),
+            )
 
     def _localization_record_event(
         self,

@@ -25,6 +25,7 @@ LOCALIZATION_ARTIFACT_MAGIC = b"P2DLOC01"
 LOCALIZATION_FRAME_PERSON = b"vllm-p2d-frame"
 LOCALIZATION_ROOT_PERSON = b"vllm-p2d-root1"
 _RANDOMIZED_REQUEST_ID_SUFFIX = re.compile(r"-[0-9a-f]{8}$")
+_PARALLEL_CHILD_REQUEST_ID_PREFIX = re.compile(r"^[0-9]+$")
 
 IntegrityLeafKey: TypeAlias = tuple[
     int,
@@ -87,6 +88,75 @@ def localization_request_id_base(request_id: str) -> str:
     return _RANDOMIZED_REQUEST_ID_SUFFIX.sub("", request_id)
 
 
+def localization_request_target(
+    request_id: str,
+    target_request_ids: tuple[str, ...],
+) -> str | None:
+    """Resolve an internal request identifier to one configured parent.
+
+    vLLM adds the engine-local suffix after parallel sampling creates decoder
+    child identifiers of the form ``<choice>_<parent>``. An exact parent match
+    takes precedence so externally supplied identifiers that begin with digits
+    and an underscore remain unambiguous.
+
+    :param request_id: Stable or engine-internal request identifier.
+    :param target_request_ids: Exact stable parent identifiers in scope.
+    :returns: The matching parent identifier, or ``None`` when out of scope.
+    """
+    stable_request_id = localization_request_id_base(request_id)
+    if stable_request_id in target_request_ids:
+        return stable_request_id
+    child_index, separator, parent_request_id = stable_request_id.partition("_")
+    if (
+        separator == "_"
+        and _PARALLEL_CHILD_REQUEST_ID_PREFIX.fullmatch(child_index) is not None
+        and parent_request_id in target_request_ids
+    ):
+        return parent_request_id
+    return None
+
+
+def localization_producer_target(
+    request_id: str,
+    target_request_ids: tuple[str, ...],
+) -> str | None:
+    """Resolve a producer identifier to one configured parent.
+
+    Parallel sampling fans out only on decode. A producer therefore must use
+    the bare shared parent identifier, optionally followed by its engine-local
+    random suffix.
+
+    :param request_id: Stable or engine-internal producer request identifier.
+    :param target_request_ids: Exact stable parent identifiers in scope.
+    :returns: The matching parent identifier, or ``None`` when out of scope.
+    """
+    stable_request_id = localization_request_id_base(request_id)
+    if stable_request_id in target_request_ids:
+        return stable_request_id
+    return None
+
+
+def localization_child_index(request_id: str, target_request_id: str) -> int | None:
+    """Resolve one request identifier to its logical parallel-choice index.
+
+    :param request_id: Stable or engine-internal request identifier.
+    :param target_request_id: Exact stable parent identifier already selected.
+    :returns: Choice index, or ``None`` when the request is not that parent or
+        one of its directly prefixed children.
+    """
+    stable_request_id = localization_request_id_base(request_id)
+    if stable_request_id == target_request_id:
+        return 0
+    child_index, separator, parent_request_id = stable_request_id.partition("_")
+    if (
+        separator != "_"
+        or parent_request_id != target_request_id
+        or _PARALLEL_CHILD_REQUEST_ID_PREFIX.fullmatch(child_index) is None
+    ):
+        return None
+    return int(child_index)
+
+
 @dataclass(frozen=True, slots=True)
 class NixlLocalizationConfig:
     """Validated process configuration for localization diagnostics.
@@ -94,8 +164,8 @@ class NixlLocalizationConfig:
     :ivar mode: Exact diagnostic observation mode.
     :ivar run_id: Identifier shared by producer and decoder processes.
     :ivar transport_arm: Human-readable transport configuration.
-    :ivar target_request_id: Exact stable request identifier to observe before
-        vLLM appends its per-engine random suffix.
+    :ivar target_request_ids: Exact, sorted stable parent identifiers to observe
+        before vLLM adds child prefixes and per-engine random suffixes.
     :ivar artifact_dir: Directory receiving framed MessagePack artifacts.
     :ivar copy_chunk_bytes: Upper bound for one materialized payload chunk.
     :ivar strict_zero_byte: Whether non-evidentiary zero-byte hits fail the request.
@@ -104,7 +174,7 @@ class NixlLocalizationConfig:
     mode: LocalizationMode
     run_id: str
     transport_arm: str
-    target_request_id: str
+    target_request_ids: tuple[str, ...]
     artifact_dir: Path | None
     copy_chunk_bytes: int
     strict_zero_byte: bool
@@ -112,16 +182,31 @@ class NixlLocalizationConfig:
     def __post_init__(self) -> None:
         """Validate the relationship between mode and request scope."""
         if self.mode is LocalizationMode.OFF:
-            if len(self.target_request_id) > 0:
-                raise ValueError("disabled localization cannot select a request")
+            if len(self.target_request_ids) > 0:
+                raise ValueError("disabled localization cannot select requests")
             return
-        if len(self.target_request_id) == 0:
-            raise ValueError("enabled localization requires a target request")
-        if (
-            localization_request_id_base(self.target_request_id)
-            != self.target_request_id
-        ):
-            raise ValueError("localization target must not include a random suffix")
+        if len(self.target_request_ids) == 0:
+            raise ValueError("enabled localization requires target requests")
+        if tuple(sorted(self.target_request_ids)) != self.target_request_ids:
+            raise ValueError("localization targets must be unique and sorted")
+        if len(set(self.target_request_ids)) != len(self.target_request_ids):
+            raise ValueError("localization targets must be unique and sorted")
+        for target_request_id in self.target_request_ids:
+            if len(target_request_id) == 0:
+                raise ValueError("localization targets must not be empty")
+            if localization_request_id_base(target_request_id) != target_request_id:
+                raise ValueError(
+                    "localization targets must not include a random suffix"
+                )
+            child_index, separator, parent_request_id = target_request_id.partition("_")
+            if (
+                separator == "_"
+                and _PARALLEL_CHILD_REQUEST_ID_PREFIX.fullmatch(child_index) is not None
+                and parent_request_id in self.target_request_ids
+            ):
+                raise ValueError(
+                    "localization targets contain an ambiguous parent/child pair"
+                )
 
     @property
     def enabled(self) -> bool:
@@ -136,7 +221,20 @@ class NixlLocalizationConfig:
         """
         return (
             self.enabled
-            and localization_request_id_base(request_id) == self.target_request_id
+            and localization_request_target(request_id, self.target_request_ids)
+            is not None
+        )
+
+    def enabled_for_producer(self, request_id: str) -> bool:
+        """Return whether a producer request is an exact configured parent.
+
+        :param request_id: Internal producer request identifier.
+        :returns: Whether localization is enabled for the producer request.
+        """
+        return (
+            self.enabled
+            and localization_producer_target(request_id, self.target_request_ids)
+            is not None
         )
 
     @property
@@ -170,7 +268,7 @@ class NixlLocalizationConfig:
                 mode=mode,
                 run_id="off",
                 transport_arm="off",
-                target_request_id="",
+                target_request_ids=(),
                 artifact_dir=None,
                 copy_chunk_bytes=64 * 1024 * 1024,
                 strict_zero_byte=False,
@@ -178,8 +276,8 @@ class NixlLocalizationConfig:
 
         run_id = os.environ.get("VLLM_NIXL_P2D_RUN_ID", "")
         transport_arm = os.environ.get("VLLM_NIXL_P2D_TRANSPORT_ARM", "")
-        target_request_id = os.environ.get(
-            "VLLM_NIXL_P2D_TARGET_REQUEST_ID",
+        target_request_ids_text = os.environ.get(
+            "VLLM_NIXL_P2D_TARGET_REQUEST_IDS_JSON",
             "",
         )
         artifact_dir_text = os.environ.get("VLLM_NIXL_P2D_ARTIFACT_DIR", "")
@@ -187,8 +285,8 @@ class NixlLocalizationConfig:
             raise ValueError("VLLM_NIXL_P2D_RUN_ID is required")
         if len(transport_arm) == 0:
             raise ValueError("VLLM_NIXL_P2D_TRANSPORT_ARM is required")
-        if len(target_request_id) == 0:
-            raise ValueError("VLLM_NIXL_P2D_TARGET_REQUEST_ID is required")
+        if len(target_request_ids_text) == 0:
+            raise ValueError("VLLM_NIXL_P2D_TARGET_REQUEST_IDS_JSON is required")
         if len(artifact_dir_text) == 0:
             raise ValueError("VLLM_NIXL_P2D_ARTIFACT_DIR is required")
 
@@ -202,11 +300,21 @@ class NixlLocalizationConfig:
         if strict_zero_byte_text not in ("0", "1"):
             raise ValueError("strict zero-byte mode must be 0 or 1")
 
+        try:
+            target_request_ids = msgspec.json.decode(
+                target_request_ids_text.encode("utf-8"),
+                type=tuple[str, ...],
+            )
+        except msgspec.DecodeError as error:
+            raise ValueError(
+                "VLLM_NIXL_P2D_TARGET_REQUEST_IDS_JSON must be a JSON string array"
+            ) from error
+
         return cls(
             mode=mode,
             run_id=run_id,
             transport_arm=transport_arm,
-            target_request_id=target_request_id,
+            target_request_ids=target_request_ids,
             artifact_dir=Path(artifact_dir_text),
             copy_chunk_bytes=chunk_mb * 1024 * 1024,
             strict_zero_byte=strict_zero_byte_text == "1",
@@ -237,6 +345,7 @@ class NixlSourceRoster(msgspec.Struct, array_like=True, frozen=True):
 
     offer_generation: int
     iteration: int
+    expected_consumers: int
     valid_token_extent: int
     group_token_capacities: tuple[int, ...]
     block_ids: tuple[tuple[int, ...], ...]
@@ -270,6 +379,7 @@ class NixlSourceContract(msgspec.Struct, array_like=True, frozen=True):
     registration_generation: str
     offer_generation: int
     iteration: int
+    expected_consumers: int
     source_rank: int
     region_lengths: tuple[int, ...]
     regions: tuple[NixlRegionDescriptor, ...]
@@ -291,6 +401,7 @@ class NixlSourceManifest(msgspec.Struct, array_like=True, frozen=True):
     registration_generation: str
     offer_generation: int
     iteration: int
+    expected_consumers: int
     source_rank: int
     region_lengths: tuple[int, ...]
     regions: tuple[NixlRegionDescriptor, ...]
@@ -383,7 +494,7 @@ class NixlSessionRecord(msgspec.Struct, array_like=True, frozen=True):
     run_id: str
     transport_arm: str
     mode: LocalizationMode
-    target_request_id: str
+    target_request_ids: tuple[str, ...]
     engine_id: str
     rank: int
     world_size: int
@@ -505,7 +616,7 @@ class LocalizationArtifactWriter:
                 run_id=config.run_id,
                 transport_arm=config.transport_arm,
                 mode=config.mode,
-                target_request_id=config.target_request_id,
+                target_request_ids=config.target_request_ids,
                 engine_id=engine_id,
                 rank=rank,
                 world_size=world_size,
@@ -757,6 +868,7 @@ def compute_source_manifest_digest(manifest: NixlSourceManifest) -> bytes:
             manifest.registration_generation,
             manifest.offer_generation,
             manifest.iteration,
+            manifest.expected_consumers,
             manifest.source_rank,
             manifest.region_lengths,
             manifest.regions,
@@ -794,6 +906,7 @@ def seal_source_manifest(manifest: NixlSourceManifest) -> NixlSourceManifest:
         registration_generation=manifest.registration_generation,
         offer_generation=manifest.offer_generation,
         iteration=manifest.iteration,
+        expected_consumers=manifest.expected_consumers,
         source_rank=manifest.source_rank,
         region_lengths=manifest.region_lengths,
         regions=manifest.regions,
@@ -828,6 +941,7 @@ def source_contract_from_manifest(
         registration_generation=manifest.registration_generation,
         offer_generation=manifest.offer_generation,
         iteration=manifest.iteration,
+        expected_consumers=manifest.expected_consumers,
         source_rank=manifest.source_rank,
         region_lengths=manifest.region_lengths,
         regions=manifest.regions,
@@ -951,6 +1065,7 @@ def select_source_manifest(
             registration_generation=manifest.registration_generation,
             offer_generation=manifest.offer_generation,
             iteration=manifest.iteration,
+            expected_consumers=manifest.expected_consumers,
             source_rank=manifest.source_rank,
             region_lengths=manifest.region_lengths,
             regions=manifest.regions,
@@ -994,6 +1109,8 @@ def validate_source_contract_structure(
         errors.append("source contract has incomplete lineage")
     if contract.offer_generation < 0 or contract.iteration < 0:
         errors.append("source contract has invalid generation lineage")
+    if type(contract.expected_consumers) is not int or contract.expected_consumers < 1:
+        errors.append("source contract has an invalid expected-consumer count")
     if contract.source_rank < 0:
         errors.append("source contract has invalid source rank")
     if len(contract.region_lengths) != len(contract.regions):

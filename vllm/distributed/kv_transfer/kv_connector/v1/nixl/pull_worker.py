@@ -37,6 +37,8 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlPlanPosition,
     NixlPlanRecord,
     NixlSourceContract,
+    localization_producer_target,
+    localization_request_target,
     locate_subsequence,
     validate_source_contract_structure,
 )
@@ -821,9 +823,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         """
         assert meta.remote is not None
         remote = meta.remote
+        child_target = localization_request_target(
+            req_id,
+            self._localization_config.target_request_ids,
+        )
+        producer_target = localization_producer_target(
+            remote.request_id,
+            self._localization_config.target_request_ids,
+        )
         if (
-            self._localization_config.enabled_for(req_id) is False
-            or self._localization_config.enabled_for(remote.request_id) is False
+            child_target is None
+            or producer_target != child_target
             or remote.p2d_run_id != self._localization_config.run_id
             or remote.p2d_transport_arm != self._localization_config.transport_arm
             or type(remote.p2d_offer_generation) is not int
@@ -976,6 +986,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 registration_generation=generations[source_rank],
                 offer_generation=remote.p2d_offer_generation,
                 iteration=remote.p2d_iteration,
+                expected_consumers=remote.expected_consumers,
                 source_rank=source_rank,
                 region_lengths=source_region_lengths,
                 regions=regions,
