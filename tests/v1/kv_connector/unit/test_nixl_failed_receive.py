@@ -4,6 +4,7 @@
 import queue
 import threading
 from collections import deque
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, call, patch
 
@@ -11,6 +12,12 @@ import msgspec
 import pytest
 import torch
 
+from vllm.distributed.kv_transfer.coalesced_layout import (
+    CoalescedTransferPlan,
+    GroupTransferRoster,
+    RegionOwnership,
+    build_coalesced_transfer_plan,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
@@ -31,7 +38,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpec
+from vllm.distributed.kv_transfer.nixl_contracts import NixlRegionDescriptor
 from vllm.distributed.kv_transfer.staging_ownership import (
+    HandleState,
     StagingRangeAllocator,
     StagingSafetyError,
 )
@@ -221,6 +231,51 @@ def _failure(
     )
 
 
+def _layout(source_rank_count: int) -> CoalescedTransferPlan:
+    """Build one canonical typed layout for staging lifecycle fixtures.
+
+    :param source_rank_count: Number of native producer-rank handles.
+    :returns: Immutable rank-major transfer plan.
+    """
+    return build_coalesced_transfer_plan(
+        source_tp_size=source_rank_count,
+        source_ranks=tuple(range(source_rank_count)),
+        rank_slots=tuple(range(source_rank_count)),
+        groups=(
+            GroupTransferRoster(
+                group_index=0,
+                source_position_start=0,
+                destination_plane_count=2,
+                local_block_ids=(0,),
+                remote_block_ids=(0,),
+            ),
+        ),
+        regions=(
+            RegionOwnership(
+                region_index=0,
+                group_indices=(0,),
+                source_row_count=4,
+                destination_row_count=4,
+                row_bytes=8,
+            ),
+        ),
+    )
+
+
+def _native_telemetry(total_bytes: int) -> SimpleNamespace:
+    """Build one complete terminal native telemetry record.
+
+    :param total_bytes: Bytes transferred by the native handle.
+    :returns: Production-compatible telemetry fixture.
+    """
+    return SimpleNamespace(
+        xferDuration=10,
+        postDuration=2,
+        totalBytes=total_bytes,
+        descCount=1,
+    )
+
+
 def _model_output(connector_output: KVConnectorOutput) -> ModelRunnerOutput:
     """Build an empty model output carrying connector state.
 
@@ -256,6 +311,10 @@ def _make_worker(
     worker.transfer_topo = Mock()
     worker._phase_separate_transfer_decode = False
     worker._phase_separation_instrumented = False
+    worker._transfer_phase_active = False
+    worker._deferred_phase_sending = set()
+    worker._deferred_phase_recving = set()
+    worker._transfer_phase_records = []
     worker._recving_transfers = {}
     worker._recving_metadata = {
         request_id: ReqMeta(
@@ -268,6 +327,7 @@ def _make_worker(
     }
     worker._coalesce_plans = {}
     worker._coalesce_pending = deque()
+    worker._pending_coalesced_scatters = {}
     worker._failed_recv_outcomes = queue.Queue()
     worker._failed_recv_pending = {}
     worker._completed_failed_recv_outcomes = queue.Queue()
@@ -286,7 +346,13 @@ def _make_worker(
     worker._get_new_notifs = Mock(return_value=set())
     worker._audit_tick = Mock()
     worker._localization_record_event = Mock()
+    worker._coalesced_localization_plans = {}
     worker._localization_pre_read_plans = {}
+    worker._handshake_futures = {}
+    worker._handshake_active_engine_id = None
+    worker._handshake_mutation_engine_id = None
+    worker._handshake_fail_stop_reason = None
+    worker._handshake_lock = threading.RLock()
     return worker
 
 
@@ -380,8 +446,8 @@ def test_failed_receive_cannot_reclaim_unquiesced_coalesced_staging() -> None:
     plan = allocator.create_plan(
         owner_id="decode:0:0",
         request_id="coalesced-request",
-        size=512,
-        source_ranks=(0,),
+        layout=_layout(1),
+        layout_duration_seconds=0.0,
         remote_engine_id="prefill-engine",
     )
     assert plan is not None
@@ -407,8 +473,8 @@ def test_failed_receive_reclaims_only_completed_coalesced_staging() -> None:
     plan = allocator.create_plan(
         owner_id="decode:0:0",
         request_id="coalesced-request",
-        size=512,
-        source_ranks=(0,),
+        layout=_layout(1),
+        layout_duration_seconds=0.0,
         remote_engine_id="prefill-engine",
     )
     assert plan is not None
@@ -416,6 +482,10 @@ def test_failed_receive_reclaims_only_completed_coalesced_staging() -> None:
     plan.attach_handle(0, 17)
     plan.begin_post(0)
     plan.record_post_result(0, "DONE")
+    plan.record_native_telemetry(
+        0,
+        _native_telemetry(plan.layout.staging_size_bytes),
+    )
     plan.mark_native_released(0)
     plan.seal_posting()
     worker = object.__new__(NixlBaseConnectorWorker)
@@ -438,8 +508,8 @@ def test_failed_receive_reclaims_quiescent_failed_coalesced_staging() -> None:
     plan = allocator.create_plan(
         owner_id="decode:0:0",
         request_id=request_id,
-        size=512,
-        source_ranks=(0, 1),
+        layout=_layout(2),
+        layout_duration_seconds=0.0,
         remote_engine_id="prefill-engine",
     )
     assert plan is not None
@@ -471,8 +541,8 @@ def test_sealed_unposted_handle_releases_without_done_evidence() -> None:
     plan = allocator.create_plan(
         owner_id="decode:0:0",
         request_id=request_id,
-        size=512,
-        source_ranks=(0,),
+        layout=_layout(1),
+        layout_duration_seconds=0.0,
         remote_engine_id="prefill-engine",
     )
     assert plan is not None
@@ -527,8 +597,8 @@ def test_multirank_prepost_failure_discharge_is_rank_exact() -> None:
     plan = allocator.create_plan(
         owner_id="decode:0:0",
         request_id=request_id,
-        size=512,
-        source_ranks=(0, 1, 2),
+        layout=_layout(3),
+        layout_duration_seconds=0.0,
         remote_engine_id=producer_engine_id,
     )
     assert plan is not None
@@ -584,8 +654,8 @@ def test_coalesced_prepare_failure_becomes_request_terminal() -> None:
     plan = allocator.create_plan(
         owner_id="decode:0:0",
         request_id=request_id,
-        size=512,
-        source_ranks=(0,),
+        layout=_layout(1),
+        layout_duration_seconds=0.0,
         remote_engine_id="prefill-engine",
     )
     assert plan is not None
@@ -597,7 +667,7 @@ def test_coalesced_prepare_failure_becomes_request_terminal() -> None:
     )
 
     with patch.object(plan, "fail", wraps=plan.fail) as fail:
-        posted = worker._initialize_and_post_coalesced(
+        prepared = worker._prepare_coalesced_handle(
             plan,
             0,
             Mock(),
@@ -607,13 +677,119 @@ def test_coalesced_prepare_failure_becomes_request_terminal() -> None:
         )
     _, finished_recving = worker.get_finished()
 
-    assert posted is False
+    assert prepared is False
     fail.assert_called_once()
     assert finished_recving == {request_id}
     assert worker.get_failed_recving() == {request_id: _failure({9})}
     assert plan.released
     assert allocator.free_bytes == allocator.capacity
     worker.nixl_wrapper.transfer.assert_not_called()
+
+
+def test_descriptor_failure_precedes_every_rank_post_and_reclaims_plan() -> None:
+    """A later-rank descriptor failure cannot race an earlier native writer."""
+    request_id = "coalesced-descriptor-failure"
+    producer_engine_id = "prefill-engine"
+    worker = _make_worker(
+        ([2],),
+        request_id,
+        worker_type=NixlPullConnectorWorker,
+    )
+    assert isinstance(worker, NixlPullConnectorWorker)
+    meta = worker._recving_metadata[request_id]
+    meta.tp_size = 4
+    meta.remote = RemoteMeta(
+        block_ids=([1],),
+        host="producer-host",
+        port=1234,
+        engine_id=producer_engine_id,
+        request_id="producer-request",
+        expected_consumers=1,
+        consumer_tp_size=1,
+    )
+    region = NixlRegionDescriptor(
+        semantic_name="layer",
+        group_indices=(0,),
+        group_semantic_names=((0, "layer"),),
+        base_address=100_000,
+        registered_bytes=64,
+        row_bytes=8,
+        shape=(8, 8),
+        strides=(8, 1),
+        dtype="torch.uint8",
+        element_size_bytes=1,
+        layout="HND",
+    )
+    worker.world_size = 1
+    worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
+        remote_tp_size=4,
+        remote_physical_blocks_per_logical=1,
+    )
+    worker.tp_mappings = {
+        producer_engine_id: SimpleNamespace(
+            rank_to_attention_slot={rank: rank for rank in range(4)}
+        )
+    }
+    worker._remote_layout = {
+        producer_engine_id: {rank: ([8], 8, 0) for rank in range(4)}
+    }
+    worker._remote_regions = {producer_engine_id: {0: (region,)}}
+    worker._region_descriptors = (region,)
+    worker.kv_caches_base_addr = {
+        producer_engine_id: {rank: [200_000 + rank * 1_000] for rank in range(4)}
+    }
+    worker._remote_agents = {
+        producer_engine_id: {rank: f"producer-agent-{rank}" for rank in range(4)}
+    }
+    worker._localization_config = Mock()
+    worker._localization_config.enabled_for.return_value = False
+    worker._sp_group_flags = Mock(return_value=[False])
+    worker._apply_prefix_caching = Mock(return_value=([[2]], [[1]]))
+    worker._staging_buf = Mock()
+    worker._staging_buf.data_ptr.return_value = 300_000
+    worker._staging_allocator = StagingRangeAllocator(1024)
+    worker._coalesce_owner_sequence = 0
+    worker._coalesce_warn_after_s = 30.0
+    worker._coalesce_fail_after_s = 300.0
+    worker.coalesce_staging_mb = 1
+    worker.nixl_memory_type = "VRAM"
+    worker.device_id = 0
+    worker._notify_failed_coalesced_producer_ranks = Mock()
+    worker._handle_failed_transfer = Mock()
+    prepared_handle = object()
+    worker.nixl_wrapper.get_xfer_descs.side_effect = (
+        ["rank-0-local"],
+        ["rank-0-remote"],
+        RuntimeError("rank-1 descriptor conversion failed"),
+    )
+    worker.nixl_wrapper.initialize_xfer.return_value = prepared_handle
+    read_specs = [
+        ReadSpec(
+            remote_rank=rank,
+            local_block_ids=[[2]],
+            remote_block_ids=[[1]],
+        )
+        for rank in range(4)
+    ]
+
+    result = worker._coalesced_read_request(
+        request_id,
+        meta,
+        read_specs,
+        b"notification",
+    )
+
+    assert result == "posted"
+    worker.nixl_wrapper.transfer.assert_not_called()
+    worker._notify_failed_coalesced_producer_ranks.assert_called_once()
+    ownership = worker._notify_failed_coalesced_producer_ranks.call_args.args[1]
+    assert ownership.released
+    assert ownership.slots[0].state is HandleState.SEALED_UNPOSTED
+    assert ownership.slots[1].state is HandleState.PREPARE_FAILED
+    assert ownership.slots[2].state is HandleState.NEVER_POSTED
+    assert ownership.slots[3].state is HandleState.NEVER_POSTED
+    worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(prepared_handle)
+    assert worker._staging_allocator.free_bytes == worker._staging_allocator.capacity
 
 
 def test_failed_receive_keeps_tombstoned_coalesced_staging_pinned() -> None:
@@ -624,8 +800,8 @@ def test_failed_receive_keeps_tombstoned_coalesced_staging_pinned() -> None:
     plan = allocator.create_plan(
         owner_id="decode:0:0",
         request_id=request_id,
-        size=512,
-        source_ranks=(0,),
+        layout=_layout(1),
+        layout_duration_seconds=0.0,
         remote_engine_id="prefill-engine",
     )
     assert plan is not None
@@ -828,6 +1004,53 @@ def test_failed_receive_releases_previously_aborted_request() -> None:
             KVConnectorOutput(
                 failed_recving={request.request_id: _failure(invalid_block_ids)},
             )
+        ),
+    )
+
+    assert request.status == RequestStatus.FINISHED_ABORTED
+    assert request.request_id not in scheduler.requests
+    assert request.request_id not in scheduler._receive_delayed_free_req_ids
+    assert (
+        scheduler.kv_cache_manager.block_pool.free_block_queue.num_free_blocks
+        == baseline_free_blocks
+    )
+    assert all(len(engine_output.outputs) == 0 for engine_output in outputs.values())
+
+
+def test_healthy_receive_releases_previously_aborted_request() -> None:
+    """A drained receive releases destination blocks retained by an abort."""
+    kv_cache_config = _make_13_group_config()
+    vllm_config = create_vllm_config(max_num_batched_tokens=64)
+    scheduler = create_scheduler(
+        vllm_config,
+        num_blocks=kv_cache_config.num_blocks,
+        kv_cache_config=kv_cache_config,
+    )
+    scheduler.connector = _HMAConnector(num_external_tokens=48)
+    baseline_free_blocks = (
+        scheduler.kv_cache_manager.block_pool.free_block_queue.num_free_blocks
+    )
+    request = create_request(num_tokens=64)
+    scheduler.add_request(request)
+    scheduler_output = scheduler.schedule()
+    allocated_free_blocks = (
+        scheduler.kv_cache_manager.block_pool.free_block_queue.num_free_blocks
+    )
+    assert allocated_free_blocks < baseline_free_blocks
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    assert request.request_id in scheduler.requests
+    assert request.request_id in scheduler._receive_delayed_free_req_ids
+    assert (
+        scheduler.kv_cache_manager.block_pool.free_block_queue.num_free_blocks
+        == allocated_free_blocks
+    )
+
+    outputs = scheduler.update_from_output(
+        scheduler_output,
+        _model_output(
+            KVConnectorOutput(finished_recving={request.request_id}),
         ),
     )
 

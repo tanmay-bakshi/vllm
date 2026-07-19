@@ -9,6 +9,7 @@ import textwrap
 import time
 import uuid
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -40,6 +41,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlHandshakePayload,
     NixlKVConnectorStats,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    NixlHandshakeFailStopError,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PULL_READ_COMPLETE_PREFIX,
     ProducerLease,
@@ -53,6 +57,7 @@ from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown,
     has_kv_transfer_group,
 )
+from vllm.distributed.kv_transfer.nixl_contracts import NixlRegionDescriptor
 from vllm.forward_context import ForwardContext
 from vllm.outputs import RequestOutput
 from vllm.platforms import current_platform
@@ -481,6 +486,126 @@ def test_kv_transfer_handshake(dist_init):
         scheduler_connector.shutdown()
 
 
+def _test_region_descriptors(
+    block_lens: list[int],
+    num_blocks: int,
+    group_count: int,
+    layout: str,
+    base_address: int,
+    semantic_reference: tuple[NixlRegionDescriptor, ...] | None = None,
+) -> tuple[NixlRegionDescriptor, ...]:
+    """Build internally consistent synthetic registration descriptors."""
+    regions: list[NixlRegionDescriptor] = []
+    next_base_address = base_address
+    owners = tuple(range(group_count))
+    for region_index, row_bytes in enumerate(block_lens):
+        registered_bytes = num_blocks * row_bytes
+        reference = (
+            semantic_reference[region_index] if semantic_reference is not None else None
+        )
+        regions.append(
+            NixlRegionDescriptor(
+                semantic_name=(
+                    reference.semantic_name
+                    if reference is not None
+                    else f"test_region_{region_index}"
+                ),
+                group_indices=(
+                    reference.group_indices if reference is not None else owners
+                ),
+                group_semantic_names=(
+                    reference.group_semantic_names
+                    if reference is not None
+                    else tuple(
+                        (owner, f"group_{owner}:region_{region_index}")
+                        for owner in owners
+                    )
+                ),
+                base_address=next_base_address,
+                registered_bytes=registered_bytes,
+                row_bytes=row_bytes,
+                shape=(num_blocks, row_bytes),
+                strides=(row_bytes, 1),
+                dtype="uint8",
+                element_size_bytes=1,
+                layout=layout,
+            )
+        )
+        next_base_address += registered_bytes + 4096
+    return tuple(regions)
+
+
+def _install_test_handshake_contract(
+    worker: "FakeNixlConnectorWorker",
+    remote_block_lens: list[int],
+    remote_num_blocks: int = 1,
+    remote_layout: str | None = None,
+) -> dict[str, Any]:
+    """Install a local contract and return matching remote metadata fields."""
+    group_count = len(worker.kv_cache_config.kv_cache_groups)
+    local_regions = _test_region_descriptors(
+        worker.block_len_per_layer,
+        worker.num_blocks,
+        group_count,
+        worker.kv_cache_layout,
+        0x100000,
+    )
+    worker._region_descriptors = local_regions
+    worker.kv_caches_base_addr[worker.engine_id][worker.tp_rank] = [
+        region.base_address for region in local_regions
+    ]
+    resolved_remote_layout = remote_layout or worker.kv_cache_layout
+    remote_regions = _test_region_descriptors(
+        remote_block_lens,
+        remote_num_blocks,
+        group_count,
+        resolved_remote_layout,
+        0x200000,
+        semantic_reference=local_regions,
+    )
+    return {
+        "kv_caches_base_addr": [region.base_address for region in remote_regions],
+        "registration_generation": "remote-registration-generation",
+        "regions": remote_regions,
+        "source_group_planes": tuple(
+            1 if flag else 2 for flag in worker._sp_group_flags()
+        ),
+        "physical_group_token_capacities": (worker._physical_group_token_capacities()),
+    }
+
+
+def _make_test_agent_metadata(
+    worker: "FakeNixlConnectorWorker",
+    remote_block_lens: list[int] | None = None,
+    remote_num_blocks: int = 1,
+    remote_layout: str | None = None,
+    device_id: int = 0,
+) -> NixlAgentMetadata:
+    """Build complete synthetic agent metadata for handshake validation."""
+    resolved_block_lens = remote_block_lens or list(worker.block_len_per_layer)
+    resolved_layout = remote_layout or worker.kv_cache_layout
+    contract_fields = _install_test_handshake_contract(
+        worker,
+        resolved_block_lens,
+        remote_num_blocks,
+        resolved_layout,
+    )
+    return NixlAgentMetadata(
+        engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+        tp_rank=device_id,
+        agent_metadata=FakeNixlWrapper.AGENT_METADATA,
+        device_id=device_id,
+        num_blocks=remote_num_blocks,
+        block_lens=resolved_block_lens,
+        kv_cache_layout=resolved_layout,
+        block_size=worker.block_size,
+        ssm_sizes=(0, 0),
+        attn_backend_name=worker.backend_name,
+        physical_blocks_per_logical_kv_block=1,
+        **contract_fields,
+    )
+
+
 class FakeNixlConnectorWorker(NixlConnectorWorker):
     REMOTE_ENGINE_ID = "remote_engine"
 
@@ -518,7 +643,7 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
             self.vllm_config, self.backend_name, self.transfer_topo.cross_layers_blocks
         )
 
-    def _nixl_handshake(
+    def _perform_nixl_handshake(
         self, host: str, port: int, remote_tp_size: int, expected_engine_id: str
     ) -> dict[int, str]:
         # Mimic slow _nixl_handshake, as well as bypass zmq communication.
@@ -537,7 +662,6 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         # invariants enforced during handshake validation.  Use per-rank
         # head ratio (not tp_ratio) to account for GQA replication capping.
         remote_block_lens = list(self.block_len_per_layer)
-        tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         total_kv = self.transfer_topo.total_num_kv_heads
         local_heads = self.transfer_topo.local_physical_heads
         remote_heads = max(1, total_kv // remote_tp_size)
@@ -547,16 +671,23 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                 for block_len in remote_block_lens
             ]
 
-        # When remote tp_size > local tp_size, handshake with multiple
-        # remote ranks.
-        num_handshakes = 1 if tp_ratio > 0 else -tp_ratio
+        assert self.transfer_topo is not None
+        handshake_plan = compute_tp_mapping(
+            self.transfer_topo,
+            remote_tp_size,
+            self._group_spec_types,
+        )
+        contract_fields = _install_test_handshake_contract(
+            self,
+            remote_block_lens,
+        )
         remote_agents: dict[int, str] = {}
-        for remote_tp_rank in range(num_handshakes):
+        for remote_tp_rank in handshake_plan.all_source_ranks:
             remote_agent_name = self.add_remote_agent(
                 NixlAgentMetadata(
                     engine_id=self.REMOTE_ENGINE_ID,
+                    tp_rank=remote_tp_rank,
                     agent_metadata=FakeNixlWrapper.AGENT_METADATA,
-                    kv_caches_base_addr=[0],
                     device_id=remote_tp_rank,
                     num_blocks=1,
                     block_lens=remote_block_lens,
@@ -567,14 +698,52 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                     ssm_sizes=(0, 0),
                     attn_backend_name=self.backend_name,
                     physical_blocks_per_logical_kv_block=1,
-                    source_group_planes=(2,),
-                    physical_group_token_capacities=(self.block_size,),
+                    **contract_fields,
                 ),
                 remote_tp_rank=remote_tp_rank,
                 remote_tp_size=remote_tp_size,
             )
             remote_agents[remote_tp_rank] = remote_agent_name
         return remote_agents
+
+
+def _import_remote_agent_under_handshake(
+    worker: FakeNixlConnectorWorker,
+    metadata: NixlAgentMetadata,
+    *,
+    remote_tp_rank: int = 0,
+    remote_tp_size: int = 1,
+) -> str:
+    """Import one test agent through the production handshake transaction.
+
+    :param worker: Test worker performing the import.
+    :param metadata: Validated remote agent metadata.
+    :param remote_tp_rank: Remote tensor-parallel rank.
+    :param remote_tp_size: Remote tensor-parallel world size.
+    :returns: Imported NIXL agent name.
+    """
+
+    def perform_import(*_args: object) -> dict[int, str]:
+        return {
+            remote_tp_rank: worker.add_remote_agent(
+                metadata,
+                remote_tp_rank=remote_tp_rank,
+                remote_tp_size=remote_tp_size,
+            )
+        }
+
+    with patch.object(
+        worker,
+        "_perform_nixl_handshake",
+        side_effect=perform_import,
+    ):
+        agents = worker._nixl_handshake(
+            host="localhost",
+            port=1234,
+            remote_tp_size=remote_tp_size,
+            expected_engine_id=metadata.engine_id,
+        )
+    return agents[remote_tp_rank]
 
 
 class TestNixlHandshake:
@@ -1020,10 +1189,15 @@ class TestNixlHandshake:
 
             # Metadata with different kv_cache_layout than local worker
             mismatched_layout = "HND" if worker.kv_cache_layout != "HND" else "NHD"
+            contract_fields = _install_test_handshake_contract(
+                worker,
+                worker.block_len_per_layer,
+                remote_layout=mismatched_layout,
+            )
             meta = NixlAgentMetadata(
                 engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+                tp_rank=0,
                 agent_metadata=FakeNixlWrapper.AGENT_METADATA,
-                kv_caches_base_addr=[0],
                 device_id=0,
                 num_blocks=1,
                 block_lens=worker.block_len_per_layer,
@@ -1032,8 +1206,7 @@ class TestNixlHandshake:
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker.backend_name,
                 physical_blocks_per_logical_kv_block=1,
-                source_group_planes=(2,),
-                physical_group_token_capacities=(worker.block_size,),
+                **contract_fields,
             )
 
             with pytest.raises(RuntimeError):
@@ -1079,26 +1252,35 @@ class TestNixlHandshake:
             worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
 
             # Metadata with different kv_cache_layout than local worker
+            remote_block_lens = [i * 2 for i in worker.block_len_per_layer]
+            contract_fields = _install_test_handshake_contract(
+                worker,
+                remote_block_lens,
+                remote_layout="HND",
+            )
             meta = NixlAgentMetadata(
                 engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+                tp_rank=0,
                 agent_metadata=FakeNixlWrapper.AGENT_METADATA,
-                kv_caches_base_addr=[0],
                 device_id=0,
                 num_blocks=1,
                 # prefill TP=1, decode TP=2, remote block_lens is double to local
-                block_lens=[i * 2 for i in worker.block_len_per_layer],
+                block_lens=remote_block_lens,
                 kv_cache_layout="HND",
                 block_size=worker.block_size,
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker.backend_name,
                 physical_blocks_per_logical_kv_block=1,
-                source_group_planes=(2,),
-                physical_group_token_capacities=(worker.block_size,),
+                **contract_fields,
             )
 
             # We don't check layout for homogeneous TP and MLA for now, as the
             # whole block is moved.
-            worker.add_remote_agent(meta, remote_tp_size=1)
+            _import_remote_agent_under_handshake(
+                worker,
+                meta,
+                remote_tp_size=1,
+            )
 
     @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
@@ -1139,22 +1321,30 @@ class TestNixlHandshake:
             # D_TP=2, P_TP=1 -> tp_ratio=2. SPLIT region scales by tp_ratio;
             # REPLICATE region is unchanged.
             tp_ratio = 2
+            remote_block_lens = [fa_len * tp_ratio, idx_len]
+            contract_fields = _install_test_handshake_contract(
+                worker,
+                remote_block_lens,
+            )
             meta = NixlAgentMetadata(
                 engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+                tp_rank=0,
                 agent_metadata=FakeNixlWrapper.AGENT_METADATA,
-                kv_caches_base_addr=[0, 0],
                 device_id=0,
                 num_blocks=1,
-                block_lens=[fa_len * tp_ratio, idx_len],
+                block_lens=remote_block_lens,
                 kv_cache_layout=worker.kv_cache_layout,
                 block_size=worker.block_size,
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker.backend_name,
                 physical_blocks_per_logical_kv_block=1,
-                source_group_planes=(2,),
-                physical_group_token_capacities=(worker.block_size,),
+                **contract_fields,
             )
-            worker.add_remote_agent(meta, remote_tp_size=1)
+            _import_remote_agent_under_handshake(
+                worker,
+                meta,
+                remote_tp_size=1,
+            )
             assert (
                 FakeNixlConnectorWorker.REMOTE_ENGINE_ID in worker.dst_xfer_side_handles
             )
@@ -1166,23 +1356,30 @@ class TestNixlHandshake:
             worker2._region_is_mla = [False, True]
             worker2.num_blocks = 1
             worker2.dst_num_blocks[worker2.engine_id] = worker2.num_blocks
+            bad_remote_block_lens = [
+                fa_len * tp_ratio,
+                idx_len * tp_ratio,
+            ]
+            bad_contract_fields = _install_test_handshake_contract(
+                worker2,
+                bad_remote_block_lens,
+            )
             bad_meta = NixlAgentMetadata(
                 engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+                tp_rank=0,
                 agent_metadata=FakeNixlWrapper.AGENT_METADATA,
-                kv_caches_base_addr=[0, 0],
                 device_id=0,
                 num_blocks=1,
                 # WRONG: MLA region scaled by tp_ratio (it should be replicated).
-                block_lens=[fa_len * tp_ratio, idx_len * tp_ratio],
+                block_lens=bad_remote_block_lens,
                 kv_cache_layout=worker2.kv_cache_layout,
                 block_size=worker2.block_size,
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker2.backend_name,
                 physical_blocks_per_logical_kv_block=1,
-                source_group_planes=(2,),
-                physical_group_token_capacities=(worker2.block_size,),
+                **bad_contract_fields,
             )
-            with pytest.raises(AssertionError):
+            with pytest.raises(RuntimeError, match="remote row length"):
                 worker2.add_remote_agent(bad_meta, remote_tp_size=1)
 
     @patch(
@@ -1228,24 +1425,32 @@ class TestNixlHandshake:
 
             # Remote P with TP=8 also has 1 head/rank -> identical
             # block_len despite tp_ratio == 2.
+            remote_block_lens = list(worker.block_len_per_layer)
+            contract_fields = _install_test_handshake_contract(
+                worker,
+                remote_block_lens,
+            )
             meta = NixlAgentMetadata(
                 engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+                tp_rank=0,
                 agent_metadata=FakeNixlWrapper.AGENT_METADATA,
-                kv_caches_base_addr=[0],
                 device_id=0,
                 num_blocks=1,
-                block_lens=list(worker.block_len_per_layer),
+                block_lens=remote_block_lens,
                 kv_cache_layout="HND",
                 block_size=worker.block_size,
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker.backend_name,
                 physical_blocks_per_logical_kv_block=1,
-                source_group_planes=(2,),
-                physical_group_token_capacities=(worker.block_size,),
+                **contract_fields,
             )
 
             # Must validate cleanly (used to raise AssertionError).
-            worker.add_remote_agent(meta, remote_tp_size=8)
+            _import_remote_agent_under_handshake(
+                worker,
+                meta,
+                remote_tp_size=8,
+            )
 
     @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
@@ -1287,24 +1492,201 @@ class TestNixlHandshake:
             # Remote P_TP=2 has 16 heads/rank -> head_ratio = 16/8 = 2.
             # Correct remote block_len = local * 2.  Send local * 1
             # (wrong) to verify rejection.
+            bad_remote_block_lens = list(worker.block_len_per_layer)
+            bad_contract_fields = _install_test_handshake_contract(
+                worker,
+                bad_remote_block_lens,
+            )
             bad_meta = NixlAgentMetadata(
                 engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+                tp_rank=0,
                 agent_metadata=FakeNixlWrapper.AGENT_METADATA,
-                kv_caches_base_addr=[0],
                 device_id=0,
                 num_blocks=1,
-                block_lens=list(worker.block_len_per_layer),
+                block_lens=bad_remote_block_lens,
                 kv_cache_layout="HND",
                 block_size=worker.block_size,
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker.backend_name,
                 physical_blocks_per_logical_kv_block=1,
-                source_group_planes=(2,),
-                physical_group_token_capacities=(worker.block_size,),
+                **bad_contract_fields,
             )
 
-            with pytest.raises(AssertionError):
+            with pytest.raises(RuntimeError, match="remote row length"):
                 worker.add_remote_agent(bad_meta, remote_tp_size=2)
+
+    @pytest.mark.parametrize(
+        ("mutation", "error_match"),
+        [
+            ("missing_regions", "region descriptor list is empty"),
+            ("unordered_owners", "owners must be sorted and unique"),
+            ("incomplete_coverage", "do not cover every cache group"),
+            ("semantic_identity", "ordered semantic identity differs"),
+            ("row_geometry", "does not match block_lens"),
+            ("registration_bounds", "exceeds the uint64 address space"),
+            ("plane_geometry", "plane semantics differ"),
+            ("capacity_geometry", "token capacity does not scale"),
+        ],
+    )
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_handshake_rejects_malformed_region_contract_before_nixl_import(
+        self,
+        default_vllm_config,
+        dist_init,
+        mutation,
+        error_match,
+    ):
+        vllm_config = create_vllm_config()
+        kv_cache_config = make_kv_cache_config(block_size=16, swa_enabled=True)
+        connector = NixlConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            kv_cache_config,
+        )
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config,
+            connector.engine_id,
+            hand_shake_latency=0,
+            kv_cache_config=kv_cache_config,
+        )
+        worker = connector.connector_worker
+        worker.block_len_per_layer = [4096 * worker.block_size]
+        worker.num_blocks = 1
+        worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
+        metadata = _make_test_agent_metadata(worker)
+        region = metadata.regions[0]
+
+        if mutation == "missing_regions":
+            metadata = replace(metadata, regions=())
+        elif mutation == "unordered_owners":
+            bad_region = msgspec.structs.replace(
+                region,
+                group_indices=(1, 0),
+                group_semantic_names=((1, "group_1"), (0, "group_0")),
+            )
+            metadata = replace(metadata, regions=(bad_region,))
+        elif mutation == "incomplete_coverage":
+            bad_region = msgspec.structs.replace(
+                region,
+                group_indices=(0,),
+                group_semantic_names=((0, "group_0"),),
+            )
+            metadata = replace(metadata, regions=(bad_region,))
+        elif mutation == "semantic_identity":
+            bad_region = msgspec.structs.replace(
+                region,
+                semantic_name="wrong_region",
+            )
+            metadata = replace(metadata, regions=(bad_region,))
+        elif mutation == "row_geometry":
+            bad_region = msgspec.structs.replace(
+                region,
+                row_bytes=region.row_bytes + 1,
+            )
+            metadata = replace(metadata, regions=(bad_region,))
+        elif mutation == "registration_bounds":
+            bad_region = msgspec.structs.replace(
+                region,
+                base_address=(1 << 64) - region.registered_bytes + 1,
+            )
+            metadata = replace(
+                metadata,
+                kv_caches_base_addr=[bad_region.base_address],
+                regions=(bad_region,),
+            )
+        elif mutation == "plane_geometry":
+            metadata = replace(metadata, source_group_planes=(1, 2))
+        elif mutation == "capacity_geometry":
+            capacities = list(metadata.physical_group_token_capacities)
+            capacities[0] += 1
+            metadata = replace(
+                metadata,
+                physical_group_token_capacities=tuple(capacities),
+            )
+        else:
+            raise AssertionError(f"unhandled mutation {mutation}")
+
+        with patch.object(
+            worker.nixl_wrapper,
+            "add_remote_agent",
+            wraps=worker.nixl_wrapper.add_remote_agent,
+        ) as add_remote_agent:
+            with pytest.raises(RuntimeError, match=error_match):
+                worker.add_remote_agent(metadata)
+            add_remote_agent.assert_not_called()
+
+        remote_engine_id = FakeNixlConnectorWorker.REMOTE_ENGINE_ID
+        assert remote_engine_id not in worker.dst_num_blocks
+        assert remote_engine_id not in worker._remote_regions
+        assert worker.transfer_topo is not None
+        with pytest.raises(KeyError):
+            worker.transfer_topo.get_engine_info(remote_engine_id)
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_handshake_rejects_cross_prefill_rank_geometry_disagreement(
+        self,
+        default_vllm_config,
+        dist_init,
+    ):
+        vllm_config = create_vllm_config()
+        connector = NixlConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            make_kv_cache_config(block_size=16),
+        )
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config,
+            connector.engine_id,
+            hand_shake_latency=0,
+        )
+        worker = connector.connector_worker
+        worker.block_len_per_layer = [4096 * worker.block_size]
+        worker.num_blocks = 1
+        worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
+        assert worker.transfer_topo is not None
+        remote_tp_size = 2
+        remote_heads = max(
+            1,
+            worker.transfer_topo.total_num_kv_heads // remote_tp_size,
+        )
+        remote_block_lens = [
+            block_len * remote_heads // worker.transfer_topo.local_physical_heads
+            for block_len in worker.block_len_per_layer
+        ]
+        rank_zero_metadata = _make_test_agent_metadata(
+            worker,
+            remote_block_lens,
+            device_id=0,
+        )
+        rank_one_metadata = _make_test_agent_metadata(
+            worker,
+            remote_block_lens,
+            remote_num_blocks=2,
+            device_id=1,
+        )
+        plan = compute_tp_mapping(
+            worker.transfer_topo,
+            remote_tp_size,
+            worker._group_spec_types,
+        )
+
+        with pytest.raises(RuntimeError, match="num_blocks"):
+            worker._validate_remote_handshake_roster(
+                {0: rank_zero_metadata, 1: rank_one_metadata},
+                remote_tp_size,
+                plan,
+            )
+
+        with pytest.raises(KeyError):
+            worker.transfer_topo.get_engine_info(
+                FakeNixlConnectorWorker.REMOTE_ENGINE_ID
+            )
 
 
 # NOTE: resource cleanup in mp backend is a bit finicky, so the order in which
@@ -2523,8 +2905,8 @@ def test_transfer_failure_logging(
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FailingNixlWrapper,
 )
-def test_handshake_failure_returns_finished(default_vllm_config, dist_init):
-    """Test that handshake failures mark blocks invalid and return via get_finished."""
+def test_post_mutation_handshake_failure_fail_stops(default_vllm_config, dist_init):
+    """A native import failure permanently fail-stops completion polling."""
     vllm_config = create_vllm_config()
 
     connector = NixlConnector(
@@ -2565,9 +2947,11 @@ def test_handshake_failure_returns_finished(default_vllm_config, dist_init):
     invalid_blocks = connector.get_block_ids_with_load_errors()
     assert invalid_blocks == {1, 2, 3}
 
-    # Check that request appears in get_finished
-    _, done_recving = connector.get_finished(finished_req_ids=set())
-    assert request_id in done_recving
+    with pytest.raises(
+        NixlHandshakeFailStopError,
+        match="partially imported remote state",
+    ):
+        connector.get_finished(finished_req_ids=set())
 
 
 @patch(
@@ -2851,20 +3235,30 @@ def test_compatibility_hash_validation(
         )
 
     prefill_block_size = config_overrides.get("block_size", 16)
+    prefill_block_lens = [
+        block_len * prefill_block_size // decode_worker.block_size
+        for block_len in decode_worker.block_len_per_layer
+    ]
+    contract_fields = _install_test_handshake_contract(
+        decode_worker,
+        prefill_block_lens,
+        remote_num_blocks=1,
+        remote_layout="HND",
+    )
+    contract_fields["physical_group_token_capacities"] = (prefill_block_size,)
     prefill_metadata = NixlAgentMetadata(
         engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+        tp_rank=0,
         agent_metadata=FakeNixlWrapper.AGENT_METADATA,
-        kv_caches_base_addr=[0],
         device_id=0,
         num_blocks=1,
-        block_lens=[4096 * prefill_block_size],  # slot_size * block_size
+        block_lens=prefill_block_lens,
         kv_cache_layout="HND",
         block_size=prefill_block_size,
         ssm_sizes=(0, 0),
         attn_backend_name=decode_worker.backend_name,
         physical_blocks_per_logical_kv_block=1,
-        source_group_planes=(2,),
-        physical_group_token_capacities=(prefill_block_size,),
+        **contract_fields,
     )
     handshake_payload = NixlHandshakePayload(
         compatibility_hash=remote_hash,

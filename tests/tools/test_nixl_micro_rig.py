@@ -1,3 +1,4 @@
+import hashlib
 import json
 import socket
 import struct
@@ -14,15 +15,23 @@ from tools.gemma4_pd.nixl_micro_rig.config import (
     load_config,
 )
 from tools.gemma4_pd.nixl_micro_rig.data import (
+    ObservationContext,
+    compact_digests,
     compute_rig_semantic_contract_digest,
+    destination_observations,
     expected_plane_bytes,
     fill_destination_canary_rows,
+    fill_source_rows,
+    source_observations,
+    staging_observations,
     verify_destination_canary_rows,
+    verify_destination_rows,
+    verify_staging_rows,
 )
 from tools.gemma4_pd.nixl_micro_rig.geometry import (
     ReplayGroup,
-    apply_group_prefix_trim,
     build_configured_plan,
+    build_group_rosters,
     build_plan,
     describe_plan,
 )
@@ -37,8 +46,17 @@ from tools.gemma4_pd.nixl_micro_rig.protocol import (
 )
 from tools.gemma4_pd.nixl_micro_rig.roles import (
     _prepared_descriptors,
+    _raw_descriptors,
+    _scatter,
     _staging_guard_ranges,
 )
+from vllm.distributed.kv_transfer.coalesced_layout import (
+    CoalescedTransferPlan,
+    GroupTransferRoster,
+    RegionOwnership,
+    build_coalesced_transfer_plan,
+)
+from vllm.distributed.kv_transfer.integrity import IntegrityPayloadKind
 from vllm.distributed.kv_transfer.staging_ownership import (
     StagingRangeAllocator,
     StagingSafetyError,
@@ -51,25 +69,137 @@ CONFIG_PATH = (
     / "nixl_micro_rig"
     / "gemma4_tp4_to_tp1.json"
 )
+PRODUCTION_CONFIG_PATH = CONFIG_PATH.with_name("gemma4_tp4_to_tp1_2k.json")
+
+EXPECTED_CONFIG_IDENTITIES = {
+    CONFIG_PATH.name: (
+        "b3fb21cb3e675f072e6937baee9c15e4b81d516f56e88cf19ce51002013682f7",
+        "95130eca063f580dd069759eff7b49df14cd8a4e7531a401101b8aec7ec8c6f0",
+    ),
+    PRODUCTION_CONFIG_PATH.name: (
+        "69489f6106a5269d3e60a10c907a8e06f6c5f268158f094f576d6becf42f5ebb",
+        "ccb718a5d689e7c8d63ce69d72ad11f1337de269ea4793a90dce8b68c3761e60",
+    ),
+}
 
 
-def test_default_geometry_matches_captured_storm37b_handshakes() -> None:
+def _allocator_layout(
+    rank_count: int, *, has_positions: bool = True
+) -> CoalescedTransferPlan:
+    block_ids = (0,) if has_positions else ()
+    return build_coalesced_transfer_plan(
+        source_tp_size=rank_count,
+        source_ranks=tuple(range(rank_count)),
+        rank_slots=tuple(range(rank_count)),
+        groups=(
+            GroupTransferRoster(
+                group_index=0,
+                source_position_start=0,
+                destination_plane_count=2,
+                local_block_ids=block_ids,
+                remote_block_ids=block_ids,
+            ),
+        ),
+        regions=(
+            RegionOwnership(
+                region_index=0,
+                group_indices=(0,),
+                source_row_count=1,
+                destination_row_count=1,
+                row_bytes=512 // rank_count,
+            ),
+        ),
+    )
+
+
+def test_default_geometry_matches_legacy_storm37b_physical_capture() -> None:
     config = load_config(CONFIG_PATH)
     scenario = config.scenario("starts_at_2gib")
     plan = build_plan(config, scenario)
 
-    assert plan.position_count == 2672
+    assert plan.logical_position_count == 2672
+    assert plan.region_position_count == 13360
     assert config.valid_token_extent == 16240
     assert tuple(group.token_capacity for group in config.groups) == (16,) * 13
     assert plan.rank_count == 4
-    assert plan.staging_bytes == 7_004_487_680
-    assert plan.staging_bytes // (1024 * 1024) == 6680
+    assert plan.staging_bytes == 3_502_243_840
+    assert plan.staging_bytes // (1024 * 1024) == 3340
     assert plan.source_registration_bytes_per_rank == 41_943_040_000
     assert plan.destination_registration_bytes == 167_772_160_000
-    assert plan.region_offsets == tuple(
-        region_index * 700_448_768 for region_index in range(10)
+    assert tuple(region.offset_within_rank for region in plan.transport.regions) == (
+        0,
+        174_981_120,
+        349_962_240,
+        524_943_360,
+        699_924_480,
+        874_905_600,
+        875_036_672,
+        875_167_744,
+        875_298_816,
+        875_429_888,
     )
+    assert plan.transport.rank_stride_bytes == 875_560_960
     assert plan.replay_manifest is None
+    evidence = describe_plan(config, scenario, plan)["handshake_evidence"]
+    assert evidence == {
+        "legacy_physical_capture": {
+            "source_manifest": "storm37b-p-handshake.json",
+            "destination_manifest": "storm37b-d1-handshake.json",
+            "sha256_authenticated": True,
+            "evidence_scope": "legacy_storm37b_physical_geometry_only",
+            "connector_v9_semantics_authenticated": False,
+        },
+        "connector_v9_semantic_fixture": {
+            "manifest": "connector-v9-semantic-fixtures.json",
+            "profile": "legacy-storm37b-roster-static-projection",
+            "sha256_authenticated": True,
+            "evidence_scope": "static_model_free_connector_v9_contract_fixture",
+            "runtime_capture_authenticated": False,
+        },
+    }
+
+
+def test_production_2k_profile_matches_exact_gemma_transport_geometry() -> None:
+    config = load_config(PRODUCTION_CONFIG_PATH)
+    scenario = config.scenario("production_2k_contiguous")
+    plan = build_plan(config, scenario)
+
+    assert config.valid_token_extent == 2048
+    assert tuple(group.remote_position_count for group in config.groups) == (
+        (64,) * 10 + (65, 65, 33)
+    )
+    assert tuple(group.local_position_count for group in config.groups) == (
+        (64,) * 10 + (65, 65, 33)
+    )
+    assert tuple(group.destination_plane_count for group in config.groups) == (
+        (2,) * 13
+    )
+    assert tuple(group.token_capacity for group in config.groups) == (
+        (32,) * 12 + (64,)
+    )
+    assert [len(region.positions) for region in plan.transport.regions] == [
+        770,
+        770,
+        770,
+        770,
+        770,
+        33,
+        33,
+        33,
+        33,
+        33,
+    ]
+    assert plan.logical_position_count == 803
+    assert plan.region_position_count == 4015
+    assert plan.staging_bytes == 1_052_508_160
+    assert plan.staging_bytes == 4015 * 4 * 65_536
+    assert describe_plan(config, scenario, plan)["staging_mib"] == 1003.75
+    assert plan.descriptors_per_handle == 10
+
+    dflash_positions = plan.transport.regions[5].positions
+    assert all(position.group_index == 12 for position in dflash_positions)
+    assert all(position.destination_half == -1 for position in dflash_positions)
+    assert len({position.local_block_id for position in dflash_positions}) == 33
 
 
 def test_semantic_contract_binds_group_region_and_ownership() -> None:
@@ -92,10 +222,10 @@ def test_semantic_contract_binds_group_region_and_ownership() -> None:
         ("starts_after_2gib", 1, 10, False, 35440),
         ("straddles_2gib", 1, 10, False, 34103),
         ("observed_high_contiguous", 1, 10, False, 54641),
-        ("observed_ceiling_102_runs", 102, 1020, False, 54641),
-        ("split_boundary_103_runs", 103, 1030, True, 54641),
-        ("observed_104_runs", 104, 1040, True, 54641),
-        ("low_split_boundary", 103, 1030, True, 3797),
+        ("owned_ceiling_203_runs", 203, 1020, False, 54641),
+        ("owned_split_boundary_204_runs", 204, 1025, True, 54641),
+        ("owned_205_runs", 205, 1030, True, 54641),
+        ("low_owned_split_boundary", 204, 1025, True, 3898),
     ],
 )
 def test_run_split_and_source_extent_geometry(
@@ -108,7 +238,8 @@ def test_run_split_and_source_extent_geometry(
     config = load_config(CONFIG_PATH)
     description = describe_plan(config, config.scenario(scenario_name))
 
-    assert description["run_count"] == run_count
+    assert config.scenario(scenario_name).run_count == run_count
+    assert description["region_run_count"] == descriptor_count
     assert description["descriptors_per_handle"] == descriptor_count
     assert description["crosses_nixl_1024_descriptor_split"] is split
     assert description["last_source_block"] == last_block
@@ -136,38 +267,59 @@ def test_group_prefix_trim_keeps_remote_suffix_and_original_local_pairing() -> N
         )
         local_cursor += len(local_ids)
 
-    pairings = apply_group_prefix_trim(config, tuple(replay))
+    rosters = build_group_rosters(config, tuple(replay))
 
-    assert pairings[0].remote_block_id == 1000
-    assert pairings[0].local_block_id == 0
-    assert pairings[0].source_position == 2
-    assert all(pair.remote_block_id not in {17, 19} for pair in pairings)
+    assert rosters[0].remote_block_ids[0] == 1000
+    assert rosters[0].local_block_ids[0] == 0
+    assert rosters[0].source_position_start == 2
+    assert all(
+        block_id not in {17, 19}
+        for roster in rosters
+        for block_id in roster.remote_block_ids
+    )
 
 
 def test_default_replay_exercises_stable_sort_and_high_scatter_rows() -> None:
     config = load_config(CONFIG_PATH)
     plan = build_plan(config, config.scenario("observed_high_contiguous"))
 
-    assert plan.original_pairings != plan.sorted_pairings
-    assert min(plan.local_block_ids) >= 49152
+    original_remote_ids = tuple(
+        block_id
+        for group in plan.transport.groups[:12]
+        for block_id in group.remote_block_ids
+    )
+    sorted_remote_ids = tuple(
+        position.remote_block_id for position in plan.transport.regions[0].positions
+    )
+    assert original_remote_ids != sorted_remote_ids
+    assert (
+        min(
+            block_id
+            for group in plan.transport.groups
+            for block_id in group.local_block_ids
+        )
+        >= 49152
+    )
     original_pairs = {
-        pair.remote_block_id: pair.local_block_id for pair in plan.original_pairings
+        remote_block_id: local_block_id
+        for group in plan.transport.groups
+        for remote_block_id, local_block_id in zip(
+            group.remote_block_ids, group.local_block_ids, strict=True
+        )
     }
     assert all(
-        original_pairs[pair.remote_block_id] == pair.local_block_id
-        for pair in plan.sorted_pairings
+        original_pairs[position.remote_block_id] == position.local_block_id
+        for region in plan.transport.regions
+        for position in region.positions
     )
 
 
-def test_duplicate_remote_ids_across_groups_retain_stable_pairing_order() -> None:
+def test_duplicate_remote_ids_across_owned_groups_are_rejected() -> None:
     config = load_config(CONFIG_PATH)
     scenario = config.scenario("starts_at_2gib")
     base = build_plan(config, scenario)
-    by_group: list[list] = [[] for _ in config.groups]
-    for pair in base.original_pairings:
-        by_group[pair.group_index].append(pair)
-    duplicate_id = by_group[0][0].remote_block_id
-    group_one_remote = [pair.remote_block_id for pair in by_group[1]]
+    duplicate_id = base.transport.groups[0].remote_block_ids[0]
+    group_one_remote = list(base.transport.groups[1].remote_block_ids)
     group_one_remote[0] = duplicate_id
     replay = tuple(
         ReplayGroup(
@@ -175,44 +327,15 @@ def test_duplicate_remote_ids_across_groups_retain_stable_pairing_order() -> Non
             remote_block_ids=tuple(
                 group_one_remote
                 if group.index == 1
-                else [pair.remote_block_id for pair in by_group[group.index]]
+                else base.transport.groups[group.index].remote_block_ids
             ),
-            local_block_ids=tuple(
-                pair.local_block_id for pair in by_group[group.index]
-            ),
+            local_block_ids=base.transport.groups[group.index].local_block_ids,
         )
         for group in config.groups
     )
     replay_scenario = replace(scenario, replay_manifest="capture.json")
-    plan = build_plan(config, replay_scenario, replay)
-    duplicates = [
-        pair for pair in plan.sorted_pairings if pair.remote_block_id == duplicate_id
-    ]
-
-    assert [pair.group_index for pair in duplicates] == [0, 1]
-    assert duplicates[0].local_block_id != duplicates[1].local_block_id
-    duplicate_positions = [
-        position
-        for position, pair in enumerate(plan.sorted_pairings)
-        if pair.remote_block_id == duplicate_id
-    ]
-    common = {
-        "plan": plan,
-        "position_count": 1,
-        "source_rank": 0,
-        "region_index": 0,
-        "plane_index": 0,
-        "iteration": 0,
-        "row_bytes": config.regions[0].row_bytes,
-        "device": torch.device("cpu"),
-    }
-    assert torch.equal(
-        expected_plane_bytes(position_start=duplicate_positions[0], **common),
-        expected_plane_bytes(position_start=duplicate_positions[1], **common),
-    )
-    description = describe_plan(config, replay_scenario, plan)
-    assert description["plan_provenance"] == "capture.json"
-    assert description["run_count"] == len(plan.runs)
+    with pytest.raises(ValueError, match="reads remote block"):
+        build_plan(config, replay_scenario, replay)
 
 
 def test_full_prefix_hit_is_zero_byte_and_non_evidentiary() -> None:
@@ -243,16 +366,14 @@ def test_configured_replay_is_loaded_for_plan_and_description(tmp_path: Path) ->
     config = load_config(CONFIG_PATH)
     scenario = config.scenario("starts_at_2gib")
     synthetic = build_plan(config, scenario)
-    by_group: list[list] = [[] for _ in config.groups]
-    for pairing in synthetic.original_pairings:
-        by_group[pairing.group_index].append(pairing)
     replay_groups = []
     replay = []
     for group in config.groups:
-        suffix = tuple(pair.remote_block_id for pair in by_group[group.index])
+        roster = synthetic.transport.groups[group.index]
+        suffix = roster.remote_block_ids
         prefix_count = group.remote_position_count - len(suffix)
         remote_ids = tuple(0 for _ in range(prefix_count)) + suffix
-        local_ids = tuple(pair.local_block_id for pair in by_group[group.index])
+        local_ids = roster.local_block_ids
         replay_groups.append(
             {
                 "group_index": group.index,
@@ -275,7 +396,10 @@ def test_configured_replay_is_loaded_for_plan_and_description(tmp_path: Path) ->
         tmp_path / "config.json", config, replay_scenario
     )
 
-    assert configured == build_plan(config, replay_scenario, tuple(replay))
+    rebuilt = build_plan(config, replay_scenario, tuple(replay))
+    assert configured.transport == rebuilt.transport
+    assert configured.scenario_name == rebuilt.scenario_name
+    assert configured.replay_manifest == rebuilt.replay_manifest
     assert (
         describe_plan(config, replay_scenario, configured)["plan_provenance"]
         == replay_path.name
@@ -288,32 +412,38 @@ def test_stable_source_sort_preserves_remote_local_pairing() -> None:
     config = load_config(CONFIG_PATH)
     scenario = config.scenario("starts_at_2gib")
     base = build_plan(config, scenario)
-    by_group: list[list] = [[] for _ in config.groups]
-    for pair in base.original_pairings:
-        by_group[pair.group_index].append(pair)
     replay = tuple(
         ReplayGroup(
             group_index=group.index,
             remote_block_ids=tuple(
-                pair.remote_block_id for pair in reversed(by_group[group.index])
+                reversed(base.transport.groups[group.index].remote_block_ids)
             ),
-            local_block_ids=tuple(
-                pair.local_block_id for pair in by_group[group.index]
-            ),
+            local_block_ids=base.transport.groups[group.index].local_block_ids,
         )
         for group in config.groups
     )
     plan = build_plan(config, replace(scenario, replay_manifest="capture.json"), replay)
     original_map = {
-        pair.remote_block_id: pair.local_block_id for pair in plan.original_pairings
+        remote_block_id: local_block_id
+        for group in plan.transport.groups
+        for remote_block_id, local_block_id in zip(
+            group.remote_block_ids, group.local_block_ids, strict=True
+        )
     }
 
-    assert tuple(pair.remote_block_id for pair in plan.sorted_pairings) == tuple(
-        sorted(original_map)
+    assert tuple(
+        position.remote_block_id for position in plan.transport.regions[0].positions
+    ) == tuple(
+        sorted(
+            remote_block_id
+            for group in plan.transport.groups[:12]
+            for remote_block_id in group.remote_block_ids
+        )
     )
     assert all(
-        original_map[pair.remote_block_id] == pair.local_block_id
-        for pair in plan.sorted_pairings
+        original_map[position.remote_block_id] == position.local_block_id
+        for region in plan.transport.regions
+        for position in region.positions
     )
 
 
@@ -323,6 +453,19 @@ def test_configuration_rejects_unknown_keys() -> None:
 
     with pytest.raises(ConfigError, match="unknown keys"):
         RigConfig.from_json(value)
+
+
+@pytest.mark.parametrize("config_path", [CONFIG_PATH, PRODUCTION_CONFIG_PATH])
+def test_configuration_identity_protects_unused_gpu_five(config_path: Path) -> None:
+    expected_file_sha256, expected_fingerprint = EXPECTED_CONFIG_IDENTITIES[
+        config_path.name
+    ]
+    payload = config_path.read_bytes()
+    config = load_config(config_path)
+
+    assert hashlib.sha256(payload).hexdigest() == expected_file_sha256
+    assert config.fingerprint == expected_fingerprint
+    assert config.protected_devices == (5, 6, 7)
 
 
 def test_configuration_rejects_protected_device() -> None:
@@ -344,8 +487,10 @@ def test_configuration_cannot_remove_immutable_gpu_denylist() -> None:
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("source_handshake_manifest", "../capture.json", "relative path"),
-        ("source_handshake_sha256", "A" * 64, "lowercase SHA-256"),
+        ("legacy_source_handshake_manifest", "../capture.json", "relative path"),
+        ("legacy_source_handshake_sha256", "A" * 64, "lowercase SHA-256"),
+        ("semantic_handshake_manifest", "../fixture.json", "relative path"),
+        ("semantic_handshake_sha256", "A" * 64, "lowercase SHA-256"),
         ("control_port", 65535, "exceed"),
     ],
 )
@@ -365,6 +510,7 @@ def test_configuration_rejects_handshake_transcription_drift(tmp_path: Path) -> 
     for manifest_name in (
         "storm37b-p-handshake.json",
         "storm37b-d1-handshake.json",
+        "connector-v9-semantic-fixtures.json",
     ):
         (tmp_path / manifest_name).write_bytes(
             (CONFIG_PATH.parent / manifest_name).read_bytes()
@@ -454,7 +600,9 @@ def test_destination_and_staging_canaries_detect_out_of_target_writes() -> None:
         destinations=destinations,
         value=0x5A,
     )
-    destination[plan.local_block_ids[0] * region.row_bytes] = 0
+    destination[
+        plan.transport.regions[0].positions[0].local_block_id * region.row_bytes
+    ] = 0
     with pytest.raises(RuntimeError, match="before scatter"):
         verify_destination_canary_rows(
             config=tiny,
@@ -468,6 +616,254 @@ def test_destination_and_staging_canaries_detect_out_of_target_writes() -> None:
         (60, 100),
     )
     assert _staging_guard_ranges(capacity=100, offset=0, size=40) == ((40, 100),)
+
+
+def test_rank_major_owned_staging_matches_source_integrity_leaves() -> None:
+    config = load_config(CONFIG_PATH)
+    regions = (
+        replace(config.regions[0], name="owned_0", row_bytes=16),
+        replace(config.regions[1], name="owned_1", row_bytes=16),
+    )
+    groups = (
+        replace(
+            config.groups[0],
+            index=0,
+            remote_position_count=2,
+            local_position_count=2,
+            owned_region_indices=(0,),
+        ),
+        replace(
+            config.groups[1],
+            index=1,
+            remote_position_count=2,
+            local_position_count=2,
+            owned_region_indices=(1,),
+        ),
+    )
+    scenario = replace(
+        config.scenarios[0],
+        name="owned_tiny",
+        source_start_block=0,
+        source_end_block=3,
+        run_count=1,
+        iterations=1,
+        staging_offsets_mib=(0,),
+        replay_manifest=None,
+    )
+    tiny = replace(
+        config,
+        producer_devices=(0, 1),
+        consumer_device=2,
+        source_block_count=16,
+        staging_capacity_mib=1,
+        regions=regions,
+        groups=groups,
+        scenarios=(scenario,),
+    )
+    plan = build_plan(tiny, scenario)
+    context = ObservationContext(
+        run_id="run-owned",
+        transport_arm="cuda_copy",
+        producer_engine_id="producer",
+        producer_request_id="producer-request",
+        offer_generation=1,
+        iteration=3,
+        child_request_id="child-request",
+        consumer_engine_id="consumer",
+    )
+    sources: list[tuple[torch.Tensor, ...]] = []
+    source_leaves = []
+    for source_rank in range(plan.rank_count):
+        source_regions = tuple(
+            torch.zeros(tiny.source_block_count * region.row_bytes, dtype=torch.uint8)
+            for region in tiny.regions
+        )
+        fill_source_rows(
+            config=tiny,
+            plan=plan,
+            source_rank=source_rank,
+            iteration=context.iteration,
+            regions=source_regions,
+        )
+        source_leaves.extend(
+            source_observations(
+                config=tiny,
+                plan=plan,
+                context=context,
+                source_rank=source_rank,
+                regions=source_regions,
+            )
+        )
+        sources.append(source_regions)
+
+    staging = torch.zeros(plan.staging_bytes, dtype=torch.uint8)
+    for source_rank, source_regions in enumerate(sources):
+        for region_index, region in enumerate(tiny.regions):
+            positions = plan.transport.regions[region_index].positions
+            block_ids = torch.tensor(
+                tuple(position.remote_block_id for position in positions),
+                dtype=torch.long,
+            )
+            selected = source_regions[region_index].view(
+                tiny.source_block_count, region.row_bytes
+            )[block_ids]
+            start = plan.transport.region_offset(source_rank, region_index)
+            staging[start : start + selected.numel()].copy_(selected.flatten())
+
+    verify_staging_rows(
+        config=tiny,
+        plan=plan,
+        iteration=context.iteration,
+        staging=staging,
+        staging_offset=0,
+    )
+    staged_leaves = staging_observations(
+        config=tiny,
+        plan=plan,
+        context=context,
+        staging=staging,
+        staging_offset=0,
+    )
+
+    assert [
+        tuple(position.group_index for position in region.positions)
+        for region in plan.transport.regions
+    ] == [(0, 0), (1, 1)]
+    assert sorted(compact_digests(source_leaves)) == sorted(
+        compact_digests(staged_leaves)
+    )
+
+
+def test_single_plane_scatter_and_integrity_use_absolute_position_halves() -> None:
+    config = load_config(PRODUCTION_CONFIG_PATH)
+    region = replace(config.regions[5], name="single_plane", row_bytes=16)
+    group = replace(
+        config.groups[12],
+        index=0,
+        destination_plane_count=1,
+        remote_position_count=3,
+        local_position_count=2,
+        owned_region_indices=(0,),
+    )
+    scenario = replace(
+        config.scenarios[0],
+        name="single_plane_tiny",
+        source_start_block=0,
+        source_end_block=2,
+        run_count=1,
+        iterations=1,
+        staging_offsets_mib=(0,),
+    )
+    tiny = replace(
+        config,
+        source_block_count=8,
+        staging_capacity_mib=1,
+        regions=(region,),
+        groups=(group,),
+        scenarios=(scenario,),
+    )
+    plan = build_plan(tiny, scenario)
+    context = ObservationContext(
+        run_id="run-single-plane",
+        transport_arm="cuda_ipc",
+        producer_engine_id="producer",
+        producer_request_id="producer-request",
+        offer_generation=2,
+        iteration=5,
+        child_request_id="child-request",
+        consumer_engine_id="consumer",
+    )
+    source_leaves = []
+    staging = torch.zeros(plan.staging_bytes, dtype=torch.uint8)
+    for source_rank in range(plan.rank_count):
+        source_regions = (
+            torch.zeros(tiny.source_block_count * region.row_bytes, dtype=torch.uint8),
+        )
+        fill_source_rows(
+            config=tiny,
+            plan=plan,
+            source_rank=source_rank,
+            iteration=context.iteration,
+            regions=source_regions,
+        )
+        source_leaves.extend(
+            source_observations(
+                config=tiny,
+                plan=plan,
+                context=context,
+                source_rank=source_rank,
+                regions=source_regions,
+            )
+        )
+        positions = plan.transport.regions[0].positions
+        block_ids = torch.tensor(
+            tuple(position.remote_block_id for position in positions),
+            dtype=torch.long,
+        )
+        selected = source_regions[0].view(tiny.source_block_count, region.row_bytes)[
+            block_ids
+        ]
+        start = plan.transport.region_offset(source_rank, 0)
+        staging[start : start + selected.numel()].copy_(selected.flatten())
+    destination = torch.zeros(
+        tiny.source_block_count * plan.rank_count * region.row_bytes,
+        dtype=torch.uint8,
+    )
+
+    _scatter(
+        plan=plan,
+        staging=staging,
+        staging_offset=0,
+        destinations=(destination,),
+    )
+    verify_destination_rows(
+        config=tiny,
+        plan=plan,
+        iteration=context.iteration,
+        destinations=(destination,),
+    )
+    staged_leaves = staging_observations(
+        config=tiny,
+        plan=plan,
+        context=context,
+        staging=staging,
+        staging_offset=0,
+    )
+    destination_leaves = destination_observations(
+        config=tiny,
+        plan=plan,
+        context=context,
+        destinations=(destination,),
+    )
+
+    positions = plan.transport.regions[0].positions
+    assert sorted(
+        (position.source_position, position.destination_half) for position in positions
+    ) == [(0, 0), (1, 1), (2, 0)]
+    assert all(
+        leaf.identity.byte_length == region.row_bytes // 2 for leaf in source_leaves
+    )
+    assert all(leaf.identity.plane_index == 0 for leaf in source_leaves)
+    assert all(
+        leaf.identity.payload_kind is IntegrityPayloadKind.COMMIT
+        for leaf in source_leaves
+    )
+    assert sorted(compact_digests(source_leaves)) == sorted(
+        compact_digests(staged_leaves)
+    )
+    assert sorted(compact_digests(source_leaves)) == sorted(
+        compact_digests(destination_leaves)
+    )
+    trailing_position = next(
+        position for position in positions if position.source_position == 2
+    )
+    destination_rows = destination.view(
+        tiny.source_block_count,
+        plan.rank_count,
+        2,
+        region.row_bytes // 2,
+    )
+    assert torch.all(destination_rows[trailing_position.local_block_id, :, 1] == 0)
 
 
 def test_prepared_descriptor_geometry_matches_tp4_to_tp1_mapping() -> None:
@@ -502,6 +898,46 @@ def test_prepared_descriptor_geometry_matches_tp4_to_tp1_mapping() -> None:
         [1032, 32, 2],
         [1096, 32, 2],
     ]
+
+
+def test_raw_descriptors_use_canonical_rank_major_region_runs() -> None:
+    config = load_config(CONFIG_PATH)
+    plan = build_plan(config, config.scenario("starts_at_2gib"))
+    staging = torch.empty(1, dtype=torch.uint8)
+    staging_offset = 4096
+    remote_bases = [10_000_000_000 + index * 1_000_000 for index in range(10)]
+
+    local, remote = _raw_descriptors(
+        config=config,
+        plan=plan,
+        staging=staging,
+        staging_offset=staging_offset,
+        rank=2,
+        remote_bases=remote_bases,
+        remote_device=2,
+    )
+
+    assert len(local) == plan.descriptors_per_handle == 10
+    assert local[0] == (
+        staging.data_ptr() + staging_offset + plan.transport.region_offset(2, 0),
+        2670 * 65_536,
+        -1,
+    )
+    assert local[5] == (
+        staging.data_ptr() + staging_offset + plan.transport.region_offset(2, 5),
+        2 * 65_536,
+        -1,
+    )
+    assert remote[0] == (
+        remote_bases[0] + 32_768 * 65_536,
+        2670 * 65_536,
+        2,
+    )
+    assert remote[5] == (
+        remote_bases[5] + 35_438 * 65_536,
+        2 * 65_536,
+        2,
+    )
 
 
 def test_preflight_rejects_foreign_compute_pid(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -540,8 +976,8 @@ def test_partial_post_failure_never_reuses_live_staging_generation() -> None:
         request_id="request-7",
         generation=7,
         offset=0,
-        size=512,
-        source_ranks=(0, 1, 2, 3),
+        layout=_allocator_layout(4),
+        layout_duration_seconds=0.001,
     )
     assert ownership is not None
     for rank, status in ((0, "DONE"), (1, "PROC"), (2, "ERR")):
@@ -562,8 +998,8 @@ def test_partial_post_failure_never_reuses_live_staging_generation() -> None:
             request_id="request-8",
             generation=8,
             offset=0,
-            size=512,
-            source_ranks=(0, 1, 2, 3),
+            layout=_allocator_layout(4),
+            layout_duration_seconds=0.001,
         )
         is None
     )
@@ -578,8 +1014,8 @@ def test_post_after_sealed_failure_boundary_is_rejected() -> None:
     ownership = allocator.create_plan(
         owner_id="plan-9",
         request_id="request-9",
-        size=512,
-        source_ranks=(0, 1, 2, 3),
+        layout=_allocator_layout(4),
+        layout_duration_seconds=0.001,
     )
     assert ownership is not None
     ownership.begin_prepare(0)
@@ -597,8 +1033,8 @@ def test_out_of_range_rank_cannot_extend_generation() -> None:
     ownership = allocator.create_plan(
         owner_id="plan-10",
         request_id="request-10",
-        size=512,
-        source_ranks=(0, 1, 2, 3),
+        layout=_allocator_layout(4),
+        layout_duration_seconds=0.001,
     )
     assert ownership is not None
 
@@ -611,8 +1047,8 @@ def test_unknown_native_submission_remains_tombstoned_after_done() -> None:
     ownership = allocator.create_plan(
         owner_id="plan-unknown",
         request_id="request-unknown",
-        size=512,
-        source_ranks=(0,),
+        layout=_allocator_layout(1),
+        layout_duration_seconds=0.001,
     )
     assert ownership is not None
     ownership.begin_prepare(0)
@@ -633,8 +1069,8 @@ def test_successful_generation_requires_device_quiescence_after_scatter() -> Non
     ownership = allocator.create_plan(
         owner_id="plan-success",
         request_id="request-success",
-        size=512,
-        source_ranks=(0, 1),
+        layout=_allocator_layout(2),
+        layout_duration_seconds=0.001,
     )
     assert ownership is not None
     for rank in ownership.slots:
@@ -643,6 +1079,9 @@ def test_successful_generation_requires_device_quiescence_after_scatter() -> Non
         ownership.begin_post(rank)
         ownership.record_post_result(rank, "DONE")
     ownership.seal_posting()
+    for rank in ownership.slots:
+        ownership.record_native_telemetry(rank, {"rank": rank})
+        ownership.mark_native_released(rank)
 
     assert ownership.ready_to_scatter
     with pytest.raises(StagingSafetyError, match="no preceding device reader"):
@@ -656,14 +1095,14 @@ def test_successful_generation_requires_device_quiescence_after_scatter() -> Non
         allocator.require_active(ownership.lease.generation)
 
 
-def test_invalid_plan_does_not_consume_allocator_capacity() -> None:
+def test_zero_byte_plan_does_not_consume_allocator_capacity() -> None:
     allocator = StagingRangeAllocator(capacity=1024)
-    with pytest.raises(ValueError, match="source_ranks"):
+    with pytest.raises(ValueError, match="size"):
         allocator.create_plan(
             owner_id="invalid",
             request_id="invalid",
-            size=512,
-            source_ranks=(),
+            layout=_allocator_layout(1, has_positions=False),
+            layout_duration_seconds=0.001,
         )
     assert allocator.free_bytes == 1024
 
@@ -673,8 +1112,8 @@ def test_prepare_failure_is_quiescent_but_still_logically_failed() -> None:
     ownership = allocator.create_plan(
         owner_id="prepare-failure",
         request_id="prepare-failure",
-        size=512,
-        source_ranks=(0, 1),
+        layout=_allocator_layout(2),
+        layout_duration_seconds=0.001,
     )
     assert ownership is not None
     ownership.begin_prepare(0)

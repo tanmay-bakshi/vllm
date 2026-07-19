@@ -20,6 +20,7 @@ from vllm.distributed.kv_transfer.integrity import (
     IntegrityStage,
     compute_integrity_digest,
 )
+from vllm.distributed.kv_transfer.nixl_contracts import NixlRegionDescriptor
 
 LOCALIZATION_ARTIFACT_MAGIC = b"P2DLOC01"
 LOCALIZATION_FRAME_PERSON = b"vllm-p2d-frame"
@@ -69,6 +70,26 @@ def localization_fingerprint_size(
     if algorithm is LocalizationFingerprintAlgorithm.POSITION_WEIGHTED_WORDS_256_V1:
         return 32
     raise ValueError(f"unsupported localization fingerprint algorithm: {algorithm}")
+
+
+def localization_stage_barrier(stage: IntegrityStage) -> str:
+    """Return the ordering evidence required at one decoder capture stage.
+
+    :param stage: Decoder integrity capture stage.
+    :returns: Canonical barrier label emitted and validated for the stage.
+    :raises ValueError: If the stage has no decoder localization capture.
+    """
+    if stage is IntegrityStage.STAGING_RAW:
+        return "nixl_done_without_added_device_wide_sync"
+    if stage is IntegrityStage.STAGING_FENCED_CONTROL:
+        return "device_synchronize_observer_control_not_gdr_flush"
+    if stage is IntegrityStage.STAGING_POST_SCATTER:
+        return "scatter_completion_event_before_staging_release"
+    if stage is IntegrityStage.DESTINATION:
+        return "scatter_completion_event_before_publication"
+    if stage is IntegrityStage.PRE_READ:
+        return "after_transfer_phase_drain_before_model_forward"
+    raise ValueError(f"unsupported decoder localization stage: {stage}")
 
 
 class LocalizationError(RuntimeError):
@@ -351,22 +372,6 @@ class NixlSourceRoster(msgspec.Struct, array_like=True, frozen=True):
     block_ids: tuple[tuple[int, ...], ...]
 
 
-class NixlRegionDescriptor(msgspec.Struct, array_like=True, frozen=True):
-    """Semantic and physical identity of one registered KV region."""
-
-    semantic_name: str
-    group_indices: tuple[int, ...]
-    group_semantic_names: tuple[tuple[int, str], ...]
-    base_address: int
-    registered_bytes: int
-    row_bytes: int
-    shape: tuple[int, ...]
-    strides: tuple[int, ...]
-    dtype: str
-    element_size_bytes: int
-    layout: str
-
-
 class NixlSourceContract(msgspec.Struct, array_like=True, frozen=True):
     """Content-free identity and geometry of one producer-rank transfer."""
 
@@ -418,7 +423,7 @@ class NixlSourceManifest(msgspec.Struct, array_like=True, frozen=True):
 
 
 class NixlPlanPosition(msgspec.Struct, array_like=True, frozen=True):
-    """Canonical source-to-destination mapping for one transfer position."""
+    """Canonical source-to-destination mapping for one region position."""
 
     group_index: int
     source_position: int
@@ -426,7 +431,24 @@ class NixlPlanPosition(msgspec.Struct, array_like=True, frozen=True):
     valid_token_extent: int
     group_token_capacity: int
     local_block_id: int
-    plane_index: int
+    destination_half: int
+
+
+class NixlPlanRun(msgspec.Struct, array_like=True, frozen=True):
+    """One maximal consecutive source-row run within a planned region."""
+
+    remote_block_id: int
+    position_count: int
+    position_start: int
+
+
+class NixlRegionPlan(msgspec.Struct, array_like=True, frozen=True):
+    """One ownership-pruned region packed within every source-rank slab."""
+
+    region_index: int
+    offset_within_rank: int
+    positions: tuple[NixlPlanPosition, ...]
+    runs: tuple[NixlPlanRun, ...]
 
 
 class NixlCaptureRecord(msgspec.Struct, array_like=True, frozen=True):
@@ -458,12 +480,13 @@ class NixlCaptureRecord(msgspec.Struct, array_like=True, frozen=True):
 
 
 class NixlPlanRecord(msgspec.Struct, array_like=True, frozen=True):
-    """Exact raw and transfer-order mapping retained for placement checks."""
+    """Exact canonical coalesced transfer plan retained for placement checks."""
 
     RECORD_TYPE: ClassVar[str] = "plan"
 
     record_type: str
     schema_version: int
+    source_tp_size: int
     source_contracts: tuple[NixlSourceContract, ...]
     child_request_id: str
     observer_engine_id: str
@@ -476,9 +499,9 @@ class NixlPlanRecord(msgspec.Struct, array_like=True, frozen=True):
     skipped_groups: tuple[int, ...]
     selected_remote_groups: tuple[tuple[int, ...], ...]
     selected_local_groups: tuple[tuple[int, ...], ...]
-    transfer_order: tuple[NixlPlanPosition, ...]
-    runs: tuple[tuple[int, int, int], ...]
-    region_offsets: tuple[int, ...]
+    region_plans: tuple[NixlRegionPlan, ...]
+    rank_stride_bytes: int
+    layout_digest: str
     staging_offset: int
     staging_size: int
 
@@ -1094,9 +1117,9 @@ def validate_source_contract_structure(
     errors: list[str] = []
     if contract.schema_version != IntegrityIdentity.SCHEMA_VERSION:
         errors.append("source contract schema mismatch")
-    if contract.fingerprint_algorithm not in (
-        LocalizationFingerprintAlgorithm.BLAKE2B_128,
-        LocalizationFingerprintAlgorithm.POSITION_WEIGHTED_WORDS_256_V1,
+    if not isinstance(
+        contract.fingerprint_algorithm,
+        LocalizationFingerprintAlgorithm,
     ):
         errors.append("source contract fingerprint algorithm is unsupported")
     if (
@@ -1107,11 +1130,16 @@ def validate_source_contract_structure(
         or len(contract.registration_generation) == 0
     ):
         errors.append("source contract has incomplete lineage")
-    if contract.offer_generation < 0 or contract.iteration < 0:
+    if (
+        type(contract.offer_generation) is not int
+        or type(contract.iteration) is not int
+        or contract.offer_generation < 0
+        or contract.iteration < 0
+    ):
         errors.append("source contract has invalid generation lineage")
     if type(contract.expected_consumers) is not int or contract.expected_consumers < 1:
         errors.append("source contract has an invalid expected-consumer count")
-    if contract.source_rank < 0:
+    if type(contract.source_rank) is not int or contract.source_rank < 0:
         errors.append("source contract has invalid source rank")
     if len(contract.region_lengths) != len(contract.regions):
         errors.append("source contract region cardinality mismatch")
@@ -1120,48 +1148,113 @@ def validate_source_contract_structure(
         errors.append("source contract plane cardinality mismatch")
     if len(contract.group_token_capacities) != num_groups:
         errors.append("source contract token-capacity cardinality mismatch")
-    if any(planes not in (1, 2) for planes in contract.source_group_planes):
+    if any(
+        type(planes) is not int or planes not in (1, 2)
+        for planes in contract.source_group_planes
+    ):
         errors.append("source contract has an invalid source plane count")
-    if contract.valid_token_extent <= 0:
+    if type(contract.valid_token_extent) is not int or contract.valid_token_extent <= 0:
         errors.append("source contract has an invalid request token extent")
 
     owned_groups: set[int] = set()
+    region_semantic_names: set[str] = set()
+    registration_ranges: list[tuple[int, int, int]] = []
+    max_address = (1 << 64) - 1
     for region_index, region in enumerate(contract.regions):
+        if len(region.semantic_name) == 0:
+            errors.append(f"source region {region_index} has an empty semantic name")
+        elif region.semantic_name in region_semantic_names:
+            errors.append(f"source region {region_index} has a duplicate semantic name")
+        region_semantic_names.add(region.semantic_name)
         region_groups = tuple(sorted(set(region.group_indices)))
         if len(region.group_indices) == 0:
             errors.append(f"source region {region_index} has no semantic owners")
         if region.group_indices != region_groups:
             errors.append(f"source region {region_index} owners are not canonical")
-        if any(group < 0 or group >= num_groups for group in region.group_indices):
+        if any(
+            type(group) is not int or group < 0 or group >= num_groups
+            for group in region.group_indices
+        ):
             errors.append(f"source region {region_index} has an invalid owner")
-        semantic_names = tuple(sorted(region.group_semantic_names))
-        if region.group_semantic_names != semantic_names:
+        canonical_group_semantic_names = tuple(sorted(region.group_semantic_names))
+        if region.group_semantic_names != canonical_group_semantic_names:
             errors.append(
                 f"source region {region_index} semantic names are not canonical"
             )
-        if {group for group, _ in region.group_semantic_names} != set(
-            region.group_indices
-        ):
+        named_owners = tuple(group for group, _ in region.group_semantic_names)
+        if named_owners != region.group_indices:
             errors.append(
                 f"source region {region_index} semantic names differ from owners"
             )
         if any(len(name) == 0 for _, name in region.group_semantic_names):
             errors.append(f"source region {region_index} has an empty semantic name")
+        exact_geometry = (
+            type(region.base_address) is int
+            and type(region.registered_bytes) is int
+            and type(region.row_bytes) is int
+            and type(region.element_size_bytes) is int
+            and all(type(dimension) is int for dimension in region.shape)
+            and all(type(stride) is int for stride in region.strides)
+        )
+        if exact_geometry is False:
+            errors.append(
+                f"source region {region_index} geometry contains a non-integer"
+            )
         if (
-            len(region.shape) == 0
-            or len(region.shape) != len(region.strides)
+            exact_geometry is False
+            or region.base_address <= 0
+            or region.registered_bytes <= 0
+            or region.row_bytes <= 0
             or region.element_size_bytes <= 0
+            or len(region.shape) == 0
+            or len(region.shape) != len(region.strides)
+            or any(dimension <= 0 for dimension in region.shape)
+            or any(stride <= 0 for stride in region.strides)
+            or len(region.dtype) == 0
+            or len(region.layout) == 0
         ):
             errors.append(f"source region {region_index} has invalid tensor geometry")
         elif (
-            region.shape[0] <= 0
-            or region.registered_bytes != region.shape[0] * region.row_bytes
+            region.registered_bytes != region.shape[0] * region.row_bytes
             or region.strides[0] * region.element_size_bytes != region.row_bytes
         ):
             errors.append(
                 f"source region {region_index} physical geometry is not row canonical"
             )
+        else:
+            registration_end = region.base_address + region.registered_bytes
+            if (
+                registration_end <= region.base_address
+                or registration_end > max_address
+            ):
+                errors.append(
+                    f"source region {region_index} exceeds the uint64 address space"
+                )
+            else:
+                registration_ranges.append(
+                    (region.base_address, registration_end, region_index)
+                )
+            storage_elements = 1 + sum(
+                (dimension - 1) * stride
+                for dimension, stride in zip(
+                    region.shape,
+                    region.strides,
+                    strict=True,
+                )
+            )
+            if storage_elements * region.element_size_bytes > region.registered_bytes:
+                errors.append(
+                    f"source region {region_index} tensor view exceeds registration"
+                )
         owned_groups.update(region.group_indices)
+    registration_ranges.sort()
+    for previous, current in zip(
+        registration_ranges,
+        registration_ranges[1:],
+        strict=False,
+    ):
+        if previous[1] > current[0]:
+            errors.append(f"source regions {previous[2]} and {current[2]} overlap")
     if owned_groups != set(range(num_groups)):
         errors.append("source semantic regions do not cover every cache group")
 
@@ -1169,7 +1262,7 @@ def validate_source_contract_structure(
         if group_index >= len(contract.group_token_capacities):
             continue
         capacity = contract.group_token_capacities[group_index]
-        if capacity <= 0:
+        if type(capacity) is not int or capacity <= 0:
             errors.append(f"source group {group_index} has invalid token capacity")
         blocks = contract.block_ids[group_index]
         if any(type(block_id) is not int or block_id < 0 for block_id in blocks):
@@ -1177,10 +1270,16 @@ def validate_source_contract_structure(
         if len(set(blocks)) != len(blocks):
             errors.append(f"source group {group_index} has duplicate block ids")
         for region_index, region in enumerate(contract.regions):
-            if group_index in region.group_indices and any(
-                block_id >= region.shape[0]
-                for block_id in blocks
-                if type(block_id) is int and block_id >= 0
+            if (
+                group_index in region.group_indices
+                and len(region.shape) > 0
+                and type(region.shape[0]) is int
+                and region.shape[0] > 0
+                and any(
+                    block_id >= region.shape[0]
+                    for block_id in blocks
+                    if type(block_id) is int and block_id >= 0
+                )
             ):
                 errors.append(
                     f"source group {group_index} exceeds region {region_index}"
@@ -1190,7 +1289,11 @@ def validate_source_contract_structure(
             continue
         if region.row_bytes != contract.region_lengths[region_index]:
             errors.append(f"source region {region_index} row length mismatch")
-        if region.row_bytes <= 0 or region.row_bytes % 2 != 0:
+        if (
+            type(region.row_bytes) is not int
+            or region.row_bytes <= 0
+            or region.row_bytes % 2 != 0
+        ):
             errors.append(f"source region {region_index} has invalid row length")
     return tuple(errors)
 
@@ -1206,6 +1309,8 @@ def validate_source_manifest_structure(
     errors = list(
         validate_source_contract_structure(source_contract_from_manifest(manifest))
     )
+    if len(errors) > 0:
+        return tuple(errors)
     keys = [leaf_source_key(leaf) for leaf in manifest.leaves]
     if len(set(keys)) != len(keys):
         errors.append("source manifest contains duplicate leaves")

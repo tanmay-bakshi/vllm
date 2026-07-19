@@ -52,6 +52,10 @@ from tools.gemma4_pd.nixl_micro_rig.protocol import (
     StopPayload,
     StoppedPayload,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.coalesced_scatter import (
+    launch_coalesced_scatter,
+    scatter_coalesced_reference,
+)
 from vllm.distributed.kv_transfer.staging_ownership import (
     HandleState,
     StagingRangeAllocator,
@@ -356,7 +360,7 @@ def run_producer(
                         producer_request_id=producer_request_id,
                         child_request_id=child_request_id,
                     )
-                    if plan.position_count > 0:
+                    if plan.logical_position_count > 0:
                         fill_source_rows(
                             config=config,
                             plan=plan,
@@ -403,7 +407,7 @@ def run_producer(
                     notification_seen = _await_notification(
                         agent, notification_id, config.transfer_timeout_seconds
                     )
-                    if plan.position_count > 0:
+                    if plan.logical_position_count > 0:
                         verify_source_rows(
                             config=config,
                             plan=plan,
@@ -462,16 +466,16 @@ def _prepared_descriptors(
     :returns: Packed address, length, and device descriptor array.
     """
     descriptor_count = len(base_addresses) * _PREPARED_DESCRIPTOR_PLANES * block_count
-    descriptors = np.empty((descriptor_count, 3), dtype=np.uint64)
+    descriptors: np.ndarray = np.empty((descriptor_count, 3), dtype=np.uint64)
     cursor = 0
-    block_indices = np.arange(block_count, dtype=np.uint64)
+    block_indices: np.ndarray = np.arange(block_count, dtype=np.uint64)
     for base_address, remote_row_bytes in zip(base_addresses, row_bytes, strict=True):
         chunk = remote_row_bytes // 2
         if destination:
             local_row_bytes = remote_row_bytes * rank_count
             for plane in (0, 1):
                 plane_offset = plane * rank_count * chunk + rank * chunk
-                addresses = (
+                addresses: np.ndarray = (
                     base_address + block_indices * local_row_bytes + plane_offset
                 )
                 descriptors[cursor : cursor + block_count, 0] = addresses
@@ -630,24 +634,24 @@ def _raw_descriptors(
     local: list[tuple[int, int, int]] = []
     remote: list[tuple[int, int, int]] = []
     for region_index, region in enumerate(config.regions):
+        region_layout = plan.transport.regions[region_index]
         local_region = (
             staging.data_ptr()
             + staging_offset
-            + plan.region_offsets[region_index]
-            + rank * plan.position_count * region.row_bytes
+            + plan.transport.region_offset(rank, region_index)
         )
-        for run in plan.runs:
-            byte_count = run.block_count * region.row_bytes
+        for run in region_layout.runs:
+            byte_count = run.position_count * region.row_bytes
             local.append(
                 (
-                    local_region + run.position_offset * region.row_bytes,
+                    local_region + run.position_start * region.row_bytes,
                     byte_count,
                     staging.get_device(),
                 )
             )
             remote.append(
                 (
-                    remote_bases[region_index] + run.start_block * region.row_bytes,
+                    remote_bases[region_index] + run.remote_block_id * region.row_bytes,
                     byte_count,
                     remote_device,
                 )
@@ -719,40 +723,48 @@ def _telemetry(agent: nixl_agent, handle: nixl_xfer_handle) -> dict[str, object]
 
 def _scatter(
     *,
-    config: RigConfig,
     plan: TransferPlan,
     staging: torch.Tensor,
     staging_offset: int,
     destinations: tuple[torch.Tensor, ...],
-) -> None:
-    """Scatter staged producer rows into TP1 K/rank and V/rank slots.
+    stream: torch.cuda.Stream | None = None,
+) -> float:
+    """Execute the production scatter implementation against rig tensors.
 
-    :param config: Complete rig configuration.
-    :param plan: Exact stable-sorted transfer plan.
+    :param plan: Exact canonical region-owned transfer plan.
     :param staging: Registered raw transport destination.
     :param staging_offset: Active allocation-generation byte offset.
     :param destinations: Registered TP1 destination regions.
+    :param stream: Persistent CUDA stream used by the production scatter path.
+    :returns: CUDA event duration in milliseconds, or zero for the CPU reference.
     """
-    local_ids = torch.tensor(
-        plan.local_block_ids, dtype=torch.long, device=staging.device
-    )
-    for region_index, (region, destination) in enumerate(
-        zip(config.regions, destinations, strict=True)
-    ):
-        chunk = region.row_bytes // 2
-        start = staging_offset + plan.region_offsets[region_index]
-        byte_count = plan.rank_count * plan.position_count * region.row_bytes
-        source = staging[start : start + byte_count].view(
-            plan.rank_count, plan.position_count, 2, chunk
+    if staging.device.type == "cpu":
+        scatter_coalesced_reference(
+            staging,
+            destinations,
+            plan.transport,
+            staging_base_offset_bytes=staging_offset,
         )
-        target = destination.view(config.source_block_count, 2, plan.rank_count, chunk)
-        for rank in range(plan.rank_count):
-            target[:, :, rank, :][local_ids] = source[rank]
-    torch.cuda.synchronize(staging.device)
+        return 0.0
+    if staging.device.type != "cuda":
+        raise ValueError("the micro-rig scatter requires CPU or CUDA tensors")
+    if stream is None:
+        raise ValueError("the CUDA micro-rig scatter requires a persistent stream")
+
+    stream.wait_stream(torch.cuda.current_stream(staging.device))
+    launch = launch_coalesced_scatter(
+        staging,
+        destinations,
+        plan.transport,
+        stream,
+        staging_base_offset_bytes=staging_offset,
+    )
+    launch.completion_event.synchronize()
+    return launch.gpu_duration_ms()
 
 
 def _compare_compact(
-    expected_rows: list[list[object]], actual_rows: list[list[int | str]]
+    expected_rows: list[list[int | str]], actual_rows: list[list[int | str]]
 ) -> None:
     """Compare compact source and consumer leaves by exact identity.
 
@@ -858,6 +870,7 @@ def run_consumer(
     staging_registration = _register_regions(agent, (staging,))
     allocator = StagingRangeAllocator(capacity=staging.numel())
     victim = VictimCanary(config, torch.device("cuda:0"))
+    scatter_stream = torch.cuda.Stream(device=staging.device)
     attestation = collect_process_attestation(
         agent,
         role="consumer:0",
@@ -924,10 +937,16 @@ def run_consumer(
     try:
         for scenario in config.scenarios:
             plan = _plan(config_path, config, scenario.name)
-            if len(set(plan.local_block_ids)) != len(plan.local_block_ids):
-                raise RuntimeError(
-                    "production lane forbids duplicate local scatter rows"
+            for region in plan.transport.regions:
+                scatter_targets = tuple(
+                    (position.local_block_id, position.destination_half)
+                    for position in region.positions
                 )
+                if len(set(scatter_targets)) != len(scatter_targets):
+                    raise RuntimeError(
+                        "production lane forbids duplicate local scatter targets "
+                        f"within region {region.ownership.region_index}"
+                    )
             for scenario_iteration in range(scenario.iterations):
                 producer_request_id = f"p-{run_id}-{global_iteration}"
                 child_request_id = f"d-{run_id}-{global_iteration}"
@@ -943,14 +962,14 @@ def run_consumer(
                 )
                 for channel in channels:
                     channel.send(prepare_payload, iteration=global_iteration)
-                source_rows: list[list[object]] = []
+                source_rows: list[list[int | str]] = []
                 for channel in channels:
                     prepared = channel.receive(
                         PreparedPayload, iteration=global_iteration
                     )
                     source_rows.extend(row.to_json() for row in prepared.digests)
 
-                if plan.position_count == 0:
+                if plan.logical_position_count == 0:
                     for remote_agent in remote_agents:
                         agent.send_notif(
                             remote_agent, notification_id, backend=_UCX_BACKEND
@@ -988,8 +1007,8 @@ def run_consumer(
                         request_id=child_request_id,
                         generation=global_iteration,
                         offset=staging_offset,
-                        size=plan.staging_bytes,
-                        source_ranks=tuple(range(rank_count)),
+                        layout=plan.transport,
+                        layout_duration_seconds=plan.layout_duration_seconds,
                         remote_engine_id=f"micro-p-{run_id}",
                     )
                     if ownership is None:
@@ -1129,6 +1148,10 @@ def run_consumer(
                                 "remains tombstoned"
                             )
                         handle_records.append(_telemetry(agent, handle))
+                        ownership.record_native_telemetry(
+                            rank,
+                            handle_records[-1],
+                        )
                         if handle_records[-1]["backend"] != _UCX_BACKEND:
                             raise RuntimeError("NIXL selected a non-UCX backend")
                         try:
@@ -1155,12 +1178,12 @@ def run_consumer(
                             "INVALID arm: no PROC handle was observed while victim ran"
                         )
                     ownership.begin_device_read()
-                    _scatter(
-                        config=config,
+                    scatter_gpu_duration_ms = _scatter(
                         plan=plan,
                         staging=staging,
                         staging_offset=staging_offset,
                         destinations=destinations,
+                        stream=scatter_stream,
                     )
                     verify_staging_rows(
                         config=config,
@@ -1235,6 +1258,7 @@ def run_consumer(
                             "staging_observations": len(staged),
                             "destination_observations": len(committed),
                             "victim_duration_ms": victim_duration_ms,
+                            "scatter_gpu_duration_ms": scatter_gpu_duration_ms,
                             "transfer_bracket_ms": transfer_start.elapsed_time(
                                 transfer_done
                             ),

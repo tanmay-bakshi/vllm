@@ -749,20 +749,18 @@ class TestMultiConnectorStats:
 
     def test_reduce(self):
         """Test that reduce() correctly reduces all nested connector stats."""
-        stats = MultiKVConnectorStats(
-            data={
-                "NixlConnector": NixlKVConnectorStats(
-                    data={
-                        "transfer_duration": [1.0, 2.0],
-                        "post_duration": [0.1, 0.2],
-                        "bytes_transferred": [1024, 2048],
-                        "num_descriptors": [10, 20],
-                        "num_failed_transfers": [],
-                        "num_failed_notifications": [],
-                    }
-                )
+        nixl_stats = NixlKVConnectorStats()
+        nixl_stats.data.update(
+            {
+                "transfer_duration": [1.0, 2.0],
+                "post_duration": [0.1, 0.2],
+                "bytes_transferred": [1024, 2048],
+                "num_descriptors": [10, 20],
+                "num_failed_transfers": [],
+                "num_failed_notifications": [],
             }
         )
+        stats = MultiKVConnectorStats(data={"NixlConnector": nixl_stats})
 
         reduced = stats.reduce()
 

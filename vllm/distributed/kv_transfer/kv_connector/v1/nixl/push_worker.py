@@ -467,9 +467,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         """First-time P→D handshake. Blocking call on the writer thread.
 
         Returns True iff the handshake succeeded (or had already been
-        completed). Returns False if the handshake raised; the request is
-        skipped in that case, D's registration watchdog fails the receive,
-        and P retains producer ownership."""
+        completed). A pre-import failure returns False, skips the request, and
+        leaves D's registration watchdog to fail the receive while P retains
+        producer ownership. A post-import failure also returns False here but
+        permanently fail-stops the worker at completion polling."""
         if decode_engine_id in self._remote_agents:
             return True
         try:

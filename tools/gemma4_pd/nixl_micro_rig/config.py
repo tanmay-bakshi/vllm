@@ -5,6 +5,13 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from tools.gemma4_pd.nixl_micro_rig.handshake import (
+    SEMANTIC_HANDSHAKE_CONNECTOR_VERSION,
+    SemanticHandshakeError,
+    SemanticHandshakeProfile,
+    load_semantic_handshake_profile,
+)
+
 
 class ConfigError(ValueError):
     """Report an invalid or ambiguous micro-rig configuration."""
@@ -149,15 +156,17 @@ class GroupConfig:
     :ivar name: Human-readable group identity.
     :ivar token_capacity: Exact number of request tokens represented by one
         physical source block for this group.
+    :ivar destination_plane_count: One for packed single-plane destinations or
+        two for standard K/V destinations.
     :ivar remote_position_count: P positions before prefix trimming.
     :ivar local_position_count: D positions remaining after a prefix hit.
-    :ivar owned_region_indices: Semantically live regions for the group. The
-        current coalesced path still broadcasts every group through all regions.
+    :ivar owned_region_indices: Authoritative physical regions for the group.
     """
 
     index: int
     name: str
     token_capacity: int
+    destination_plane_count: int
     remote_position_count: int
     local_position_count: int
     owned_region_indices: tuple[int, ...]
@@ -169,13 +178,19 @@ class GroupConfig:
             raise ConfigError("group name must not be empty")
         if self.token_capacity <= 0:
             raise ConfigError("group token_capacity must be positive")
+        if self.destination_plane_count not in (1, 2):
+            raise ConfigError("group destination_plane_count must be one or two")
         if self.remote_position_count <= 0:
             raise ConfigError("group remote_position_count must be positive")
         if self.local_position_count < 0:
             raise ConfigError("group local_position_count must be non-negative")
-        if self.local_position_count > self.remote_position_count:
+        remote_positions_per_local = 2 if self.destination_plane_count == 1 else 1
+        local_capacity = (
+            self.remote_position_count + remote_positions_per_local - 1
+        ) // remote_positions_per_local
+        if self.local_position_count > local_capacity:
             raise ConfigError(
-                "group local_position_count must not exceed remote_position_count"
+                "group local_position_count exceeds its destination-plane capacity"
             )
         if len(self.owned_region_indices) == 0:
             raise ConfigError("group owned_region_indices must not be empty")
@@ -200,6 +215,7 @@ class GroupConfig:
                 "index",
                 "name",
                 "token_capacity",
+                "destination_plane_count",
                 "remote_position_count",
                 "local_position_count",
                 "owned_region_indices",
@@ -211,6 +227,10 @@ class GroupConfig:
             index=_as_int(obj["index"], f"{context}.index"),
             name=_as_str(obj["name"], f"{context}.name"),
             token_capacity=_as_int(obj["token_capacity"], f"{context}.token_capacity"),
+            destination_plane_count=_as_int(
+                obj["destination_plane_count"],
+                f"{context}.destination_plane_count",
+            ),
             remote_position_count=_as_int(
                 obj["remote_position_count"],
                 f"{context}.remote_position_count",
@@ -421,10 +441,15 @@ class RigConfig:
     """Describe one complete transport micro-rig campaign.
 
     :ivar schema_version: Configuration schema version.
-    :ivar source_handshake_manifest: Captured P handshake geometry manifest.
-    :ivar destination_handshake_manifest: Captured D handshake geometry manifest.
-    :ivar source_handshake_sha256: Expected source-manifest content identity.
-    :ivar destination_handshake_sha256: Expected destination-manifest identity.
+    :ivar legacy_source_handshake_manifest: Captured P physical-geometry manifest.
+    :ivar legacy_destination_handshake_manifest: Captured D physical-geometry
+        manifest.
+    :ivar legacy_source_handshake_sha256: Expected source-manifest identity.
+    :ivar legacy_destination_handshake_sha256: Expected destination-manifest
+        identity.
+    :ivar semantic_handshake_manifest: Static connector-v9 semantic fixture.
+    :ivar semantic_handshake_sha256: Expected semantic-fixture identity.
+    :ivar semantic_handshake_profile: Selected semantic projection identity.
     :ivar producer_devices: Physical GPUs used to emulate P TP ranks.
     :ivar consumer_device: Physical GPU used for D staging, scatter, and victim.
     :ivar protected_devices: Physical GPUs the rig must never select.
@@ -445,10 +470,13 @@ class RigConfig:
     """
 
     schema_version: int
-    source_handshake_manifest: str
-    destination_handshake_manifest: str
-    source_handshake_sha256: str
-    destination_handshake_sha256: str
+    legacy_source_handshake_manifest: str
+    legacy_destination_handshake_manifest: str
+    legacy_source_handshake_sha256: str
+    legacy_destination_handshake_sha256: str
+    semantic_handshake_manifest: str
+    semantic_handshake_sha256: str
+    semantic_handshake_profile: str
     producer_devices: tuple[int, ...]
     consumer_device: int
     protected_devices: tuple[int, ...]
@@ -469,27 +497,41 @@ class RigConfig:
     def __post_init__(self) -> None:
         immutable_allowed_devices = frozenset(range(6))
         immutable_denied_devices = frozenset({6, 7})
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise ConfigError(f"unsupported schema_version: {self.schema_version}")
-        if len(self.source_handshake_manifest) == 0:
-            raise ConfigError("source_handshake_manifest must not be empty")
-        if len(self.destination_handshake_manifest) == 0:
-            raise ConfigError("destination_handshake_manifest must not be empty")
         for context, path_text in (
-            ("source_handshake_manifest", self.source_handshake_manifest),
-            ("destination_handshake_manifest", self.destination_handshake_manifest),
+            (
+                "legacy_source_handshake_manifest",
+                self.legacy_source_handshake_manifest,
+            ),
+            (
+                "legacy_destination_handshake_manifest",
+                self.legacy_destination_handshake_manifest,
+            ),
+            ("semantic_handshake_manifest", self.semantic_handshake_manifest),
         ):
+            if len(path_text) == 0:
+                raise ConfigError(f"{context} must not be empty")
             path = Path(path_text)
             if path.is_absolute() or ".." in path.parts:
                 raise ConfigError(f"{context} must be a confined relative path")
         for context, digest in (
-            ("source_handshake_sha256", self.source_handshake_sha256),
-            ("destination_handshake_sha256", self.destination_handshake_sha256),
+            (
+                "legacy_source_handshake_sha256",
+                self.legacy_source_handshake_sha256,
+            ),
+            (
+                "legacy_destination_handshake_sha256",
+                self.legacy_destination_handshake_sha256,
+            ),
+            ("semantic_handshake_sha256", self.semantic_handshake_sha256),
         ):
             if len(digest) != 64 or any(
                 character not in "0123456789abcdef" for character in digest
             ):
                 raise ConfigError(f"{context} must contain lowercase SHA-256 hex")
+        if len(self.semantic_handshake_profile) == 0:
+            raise ConfigError("semantic_handshake_profile must not be empty")
         if len(self.producer_devices) == 0:
             raise ConfigError("producer_devices must not be empty")
         if len(set(self.producer_devices)) != len(self.producer_devices):
@@ -543,6 +585,18 @@ class RigConfig:
         for group in self.groups:
             if max(group.owned_region_indices) >= len(self.regions):
                 raise ConfigError(f"group {group.index} owns an out-of-range region")
+        for region_index in range(len(self.regions)):
+            plane_counts = {
+                group.destination_plane_count
+                for group in self.groups
+                if region_index in group.owned_region_indices
+            }
+            if len(plane_counts) == 0:
+                raise ConfigError(f"region {region_index} has no owning group")
+            if len(plane_counts) != 1:
+                raise ConfigError(
+                    f"region {region_index} mixes destination plane layouts"
+                )
         if len(self.scenarios) == 0:
             raise ConfigError("scenarios must not be empty")
         if len({scenario.name for scenario in self.scenarios}) != len(self.scenarios):
@@ -552,7 +606,20 @@ class RigConfig:
         if len({arm.name for arm in self.transport_arms}) != len(self.transport_arms):
             raise ConfigError("transport arm names must be unique")
 
-        position_count = sum(group.local_position_count for group in self.groups)
+        position_count = sum(
+            group.remote_position_count
+            - (2 if group.destination_plane_count == 1 else 1)
+            * (
+                (
+                    group.remote_position_count
+                    + (2 if group.destination_plane_count == 1 else 1)
+                    - 1
+                )
+                // (2 if group.destination_plane_count == 1 else 1)
+                - group.local_position_count
+            )
+            for group in self.groups
+        )
         for scenario in self.scenarios:
             if position_count == 0:
                 if scenario.run_count != 0:
@@ -584,17 +651,6 @@ class RigConfig:
                     f"outside source_block_count={self.source_block_count}"
                 )
 
-            request_bytes = position_count * len(self.producer_devices)
-            request_bytes *= sum(region.row_bytes for region in self.regions)
-            capacity_bytes = self.staging_capacity_mib * 1024 * 1024
-            for offset_mib in scenario.staging_offsets_mib:
-                end = offset_mib * 1024 * 1024 + request_bytes
-                if end > capacity_bytes:
-                    raise ConfigError(
-                        f"scenario {scenario.name!r} staging offset {offset_mib}MiB "
-                        f"ends at {end} bytes, past capacity {capacity_bytes}"
-                    )
-
     @classmethod
     def from_json(cls, value: object) -> "RigConfig":
         """Parse and validate a complete configuration.
@@ -605,10 +661,13 @@ class RigConfig:
         obj = _as_dict(value, "root")
         required = {
             "schema_version",
-            "source_handshake_manifest",
-            "destination_handshake_manifest",
-            "source_handshake_sha256",
-            "destination_handshake_sha256",
+            "legacy_source_handshake_manifest",
+            "legacy_destination_handshake_manifest",
+            "legacy_source_handshake_sha256",
+            "legacy_destination_handshake_sha256",
+            "semantic_handshake_manifest",
+            "semantic_handshake_sha256",
+            "semantic_handshake_profile",
             "producer_devices",
             "consumer_device",
             "protected_devices",
@@ -637,19 +696,33 @@ class RigConfig:
 
         return cls(
             schema_version=_as_int(obj["schema_version"], "schema_version"),
-            source_handshake_manifest=_as_relative_path(
-                obj["source_handshake_manifest"], "source_handshake_manifest"
+            legacy_source_handshake_manifest=_as_relative_path(
+                obj["legacy_source_handshake_manifest"],
+                "legacy_source_handshake_manifest",
             ),
-            destination_handshake_manifest=_as_relative_path(
-                obj["destination_handshake_manifest"],
-                "destination_handshake_manifest",
+            legacy_destination_handshake_manifest=_as_relative_path(
+                obj["legacy_destination_handshake_manifest"],
+                "legacy_destination_handshake_manifest",
             ),
-            source_handshake_sha256=_as_str(
-                obj["source_handshake_sha256"], "source_handshake_sha256"
+            legacy_source_handshake_sha256=_as_str(
+                obj["legacy_source_handshake_sha256"],
+                "legacy_source_handshake_sha256",
             ),
-            destination_handshake_sha256=_as_str(
-                obj["destination_handshake_sha256"],
-                "destination_handshake_sha256",
+            legacy_destination_handshake_sha256=_as_str(
+                obj["legacy_destination_handshake_sha256"],
+                "legacy_destination_handshake_sha256",
+            ),
+            semantic_handshake_manifest=_as_relative_path(
+                obj["semantic_handshake_manifest"],
+                "semantic_handshake_manifest",
+            ),
+            semantic_handshake_sha256=_as_str(
+                obj["semantic_handshake_sha256"],
+                "semantic_handshake_sha256",
+            ),
+            semantic_handshake_profile=_as_str(
+                obj["semantic_handshake_profile"],
+                "semantic_handshake_profile",
             ),
             producer_devices=tuple(
                 _as_int(item, f"producer_devices[{index}]")
@@ -728,6 +801,23 @@ class RigConfig:
                 return scenario
         raise ConfigError(f"unknown scenario: {name}")
 
+    def region_destination_plane_count(self, region_index: int) -> int:
+        """Return the unique destination plane layout for one region.
+
+        :param region_index: Canonical physical region index.
+        :returns: One for packed single-plane or two for standard K/V.
+        """
+        plane_counts = {
+            group.destination_plane_count
+            for group in self.groups
+            if region_index in group.owned_region_indices
+        }
+        if len(plane_counts) != 1:
+            raise ConfigError(
+                f"region {region_index} lacks one destination plane layout"
+            )
+        return next(iter(plane_counts))
+
 
 def _manifest_ranks(path: Path, expected_sha256: str) -> list[dict[str, object]]:
     """Load and authenticate one captured handshake manifest.
@@ -768,18 +858,25 @@ def _manifest_int_list(value: object, context: str) -> tuple[int, ...]:
     )
 
 
-def _validate_handshake_manifests(config: RigConfig, directory: Path) -> None:
-    """Require configuration geometry to match captured live handshakes.
+def _validate_legacy_handshake_manifests(
+    config: RigConfig,
+    directory: Path,
+) -> None:
+    """Require physical geometry to match the legacy storm37b captures.
 
     :param config: Parsed rig configuration.
     :param directory: Directory used to resolve manifest paths.
     :raises ConfigError: If any transcribed geometry differs from capture.
     """
-    source_path = directory / config.source_handshake_manifest
-    destination_path = directory / config.destination_handshake_manifest
-    source_ranks = _manifest_ranks(source_path, config.source_handshake_sha256)
+    source_path = directory / config.legacy_source_handshake_manifest
+    destination_path = directory / config.legacy_destination_handshake_manifest
+    source_ranks = _manifest_ranks(
+        source_path,
+        config.legacy_source_handshake_sha256,
+    )
     destination_ranks = _manifest_ranks(
-        destination_path, config.destination_handshake_sha256
+        destination_path,
+        config.legacy_destination_handshake_sha256,
     )
     if len(source_ranks) != len(config.producer_devices):
         raise ConfigError(
@@ -884,6 +981,63 @@ def _validate_handshake_manifests(config: RigConfig, directory: Path) -> None:
         raise ConfigError("P and D handshake compatibility hashes differ")
 
 
+def load_configured_semantic_handshake_profile(
+    config: RigConfig,
+    directory: Path,
+) -> SemanticHandshakeProfile:
+    """Load and bind the configured static semantic fixture.
+
+    :param config: Parsed rig configuration.
+    :param directory: Directory used to resolve the fixture path.
+    :returns: Authenticated semantic profile.
+    :raises ConfigError: If fixture identity or rig semantics differ.
+    """
+    path = directory / config.semantic_handshake_manifest
+    try:
+        profile = load_semantic_handshake_profile(
+            path,
+            config.semantic_handshake_sha256,
+            config.semantic_handshake_profile,
+        )
+        region_group_indices = tuple(
+            tuple(
+                group.index
+                for group in config.groups
+                if region_index in group.owned_region_indices
+            )
+            for region_index in range(len(config.regions))
+        )
+        profile.validate_rig_contract(
+            connector_version=SEMANTIC_HANDSHAKE_CONNECTOR_VERSION,
+            group_semantic_names=tuple(group.name for group in config.groups),
+            source_group_planes=tuple(
+                group.destination_plane_count for group in config.groups
+            ),
+            physical_group_token_capacities=tuple(
+                group.token_capacity for group in config.groups
+            ),
+            region_semantic_names=tuple(region.name for region in config.regions),
+            region_group_indices=region_group_indices,
+        )
+        source_row_bytes = tuple(region.row_bytes for region in config.regions)
+        profile.region_descriptors(
+            num_blocks=config.source_block_count,
+            row_bytes=source_row_bytes,
+            base_address=0x10000000000,
+        )
+        profile.region_descriptors(
+            num_blocks=config.source_block_count,
+            row_bytes=tuple(
+                row_bytes * len(config.producer_devices)
+                for row_bytes in source_row_bytes
+            ),
+            base_address=0x20000000000,
+        )
+    except SemanticHandshakeError as error:
+        raise ConfigError(str(error)) from error
+    return profile
+
+
 def load_config(path: Path) -> RigConfig:
     """Load a rig configuration from disk.
 
@@ -896,5 +1050,6 @@ def load_config(path: Path) -> RigConfig:
     except json.JSONDecodeError as error:
         raise ConfigError(f"invalid JSON in {path}: {error}") from error
     config = RigConfig.from_json(value)
-    _validate_handshake_manifests(config, path.parent)
+    _validate_legacy_handshake_manifests(config, path.parent)
+    load_configured_semantic_handshake_profile(config, path.parent)
     return config

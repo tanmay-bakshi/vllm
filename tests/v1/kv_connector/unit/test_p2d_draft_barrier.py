@@ -219,4 +219,5 @@ def test_targeted_read_path_has_no_pre_transfer_source_gate() -> None:
         for node in ast.walk(module)
     )
     assert contract_call.lineno < dispatch_call.lineno
-    assert _contains_call(coalesced_read, "_initialize_and_post_coalesced")
+    assert _contains_call(coalesced_read, "_prepare_coalesced_handle")
+    assert _contains_call(coalesced_read, "_post_prepared_coalesced")

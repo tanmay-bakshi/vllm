@@ -1,0 +1,73 @@
+{
+  "schema_version": 2,
+  "legacy_source_handshake_manifest": "storm37b-p-handshake.json",
+  "legacy_destination_handshake_manifest": "storm37b-d1-handshake.json",
+  "legacy_source_handshake_sha256": "68837b42b3449d16cbd159b93ce19a8b3abebd27cea880c64a22feb5f2ce0e5c",
+  "legacy_destination_handshake_sha256": "d4072378af250f27491232b9dd2b2b07c60bbf54fb00a5f28d1a6433cfef09f2",
+  "semantic_handshake_manifest": "connector-v9-semantic-fixtures.json",
+  "semantic_handshake_sha256": "7e0e36265f66509624d201163500484a0b63e75cef138ccd5b096ee80920f639",
+  "semantic_handshake_profile": "production-2k-rig-static-projection",
+  "producer_devices": [0, 1, 2, 3],
+  "consumer_device": 4,
+  "protected_devices": [5, 6, 7],
+  "source_block_count": 64000,
+  "valid_token_extent": 2048,
+  "staging_capacity_mib": 12288,
+  "nixl_num_threads": 4,
+  "pattern_chunk_bytes": 1048576,
+  "transfer_timeout_seconds": 900,
+  "control_host": "127.0.0.1",
+  "control_port": 18991,
+  "regions": [
+    {"name": "region_0", "row_bytes": 65536},
+    {"name": "region_1", "row_bytes": 65536},
+    {"name": "region_2", "row_bytes": 65536},
+    {"name": "region_3", "row_bytes": 65536},
+    {"name": "region_4", "row_bytes": 65536},
+    {"name": "region_5", "row_bytes": 65536},
+    {"name": "region_6", "row_bytes": 65536},
+    {"name": "region_7", "row_bytes": 65536},
+    {"name": "region_8", "row_bytes": 65536},
+    {"name": "region_9", "row_bytes": 65536}
+  ],
+  "groups": [
+    {"index": 0, "name": "sliding_0", "token_capacity": 32, "destination_plane_count": 2, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 1, "name": "sliding_1", "token_capacity": 32, "destination_plane_count": 2, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 2, "name": "sliding_2", "token_capacity": 32, "destination_plane_count": 2, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 3, "name": "sliding_3", "token_capacity": 32, "destination_plane_count": 2, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 4, "name": "sliding_4", "token_capacity": 32, "destination_plane_count": 2, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 5, "name": "sliding_5", "token_capacity": 32, "destination_plane_count": 2, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 6, "name": "sliding_6", "token_capacity": 32, "destination_plane_count": 2, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 7, "name": "sliding_7", "token_capacity": 32, "destination_plane_count": 2, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 8, "name": "sliding_8", "token_capacity": 32, "destination_plane_count": 2, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 9, "name": "sliding_9", "token_capacity": 32, "destination_plane_count": 2, "remote_position_count": 64, "local_position_count": 64, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 10, "name": "global_0", "token_capacity": 32, "destination_plane_count": 2, "remote_position_count": 65, "local_position_count": 65, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 11, "name": "global_1", "token_capacity": 32, "destination_plane_count": 2, "remote_position_count": 65, "local_position_count": 65, "owned_region_indices": [0, 1, 2, 3, 4]},
+    {"index": 12, "name": "dflash", "token_capacity": 64, "destination_plane_count": 2, "remote_position_count": 33, "local_position_count": 33, "owned_region_indices": [5, 6, 7, 8, 9]}
+  ],
+  "scenarios": [
+    {
+      "name": "production_2k_contiguous",
+      "source_start_block": 32768,
+      "source_end_block": 33570,
+      "run_count": 1,
+      "iterations": 4,
+      "staging_offsets_mib": [0, 1024, 4096, 0]
+    }
+  ],
+  "transport_arms": [
+    {
+      "name": "cuda_ipc",
+      "ucx_tls": "tcp,shm,cuda_copy,cuda_ipc"
+    },
+    {
+      "name": "cuda_copy",
+      "ucx_tls": "tcp,shm,cuda_copy"
+    }
+  ],
+  "victim": {
+    "matrix_order": 2048,
+    "rounds": 128,
+    "redzone_bytes": 4194304
+  }
+}

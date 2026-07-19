@@ -13,10 +13,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
 )
-from vllm.distributed.kv_transfer.nixl_localization import (
-    NixlRegionDescriptor,
-    NixlSourceRoster,
-)
+from vllm.distributed.kv_transfer.nixl_contracts import NixlRegionDescriptor
+from vllm.distributed.kv_transfer.nixl_localization import NixlSourceRoster
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -51,13 +49,15 @@ PULL_OFFER_CANCELLATION_CONTROL_PREFIX = b"PULL_OFFER_CANCELLATION:"
 #   6: Replace source gating with post-transfer source references
 #   7: Add producer-owned leases and idempotent pull completion proofs
 #   8: Add exact decoder-rank whole-offer cancellation proofs
+#   9: Require producer-rank, KV-region, and cache-group handshake contracts
 #
-NIXL_CONNECTOR_VERSION: int = 8
+NIXL_CONNECTOR_VERSION: int = 9
 
 
 @dataclass
 class NixlAgentMetadata:
     engine_id: str
+    tp_rank: int
     agent_metadata: bytes
     kv_caches_base_addr: list[int]
     device_id: int

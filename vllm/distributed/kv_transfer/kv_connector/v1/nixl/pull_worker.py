@@ -10,8 +10,14 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 import numpy as np
-import zmq
+from zmq.constants import SocketOption, SocketType
+from zmq.error import ZMQError
 
+from vllm.distributed.kv_transfer.coalesced_layout import (
+    GroupTransferRoster,
+    RegionOwnership,
+    build_coalesced_transfer_plan,
+)
 from vllm.distributed.kv_transfer.integrity import IntegrityIdentity
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
@@ -36,10 +42,11 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlEventRecord,
     NixlPlanPosition,
     NixlPlanRecord,
+    NixlPlanRun,
+    NixlRegionPlan,
     NixlSourceContract,
     localization_producer_target,
     localization_request_target,
-    locate_subsequence,
     validate_source_contract_structure,
 )
 from vllm.distributed.kv_transfer.staging_ownership import (
@@ -237,7 +244,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             producer_engine_id: str | None = None
             producer_request_id: str | None = None
             if pre_read_plan is not None:
-                contracts = tuple(pre_read_plan["source_contracts"])
+                contracts = pre_read_plan.source_contracts
                 if len(contracts) > 0:
                     producer_engine_id = contracts[0].producer_engine_id
                     producer_request_id = contracts[0].producer_request_id
@@ -527,13 +534,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         )
         path = make_zmq_path("tcp", producer_host, producer_port)
         try:
-            with zmq_ctx(zmq.REQ, path) as socket:
-                socket.setsockopt(zmq.IMMEDIATE, 1)
-                socket.setsockopt(zmq.SNDTIMEO, _OFFER_CANCELLATION_TIMEOUT_MS)
-                socket.setsockopt(zmq.RCVTIMEO, _OFFER_CANCELLATION_TIMEOUT_MS)
+            with zmq_ctx(SocketType.REQ, path) as socket:
+                socket.setsockopt(SocketOption.IMMEDIATE, 1)
+                socket.setsockopt(SocketOption.SNDTIMEO, _OFFER_CANCELLATION_TIMEOUT_MS)
+                socket.setsockopt(SocketOption.RCVTIMEO, _OFFER_CANCELLATION_TIMEOUT_MS)
                 socket.send(message)
                 response = socket.recv()
-        except zmq.ZMQError as error:
+        except ZMQError as error:
             stacktrace = traceback.format_exc()
             self._log_failure(
                 failure_type="offer_cancellation_control_failed",
@@ -1258,6 +1265,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             return False
         assert self.transfer_topo is not None
         remote_info = self.transfer_topo.get_engine_info(engine_id)
+        source_ranks = tuple(int(spec.remote_rank) for spec in read_specs)
+        if (
+            self.world_size != 1
+            or remote_info.remote_tp_size != 4
+            or tp_ratio != -4
+            or len(read_specs) != 4
+            or tuple(sorted(source_ranks)) != (0, 1, 2, 3)
+        ):
+            return False
         if self.transfer_topo.block_size_ratio(remote_info.remote_block_size) != 1:
             return False
         layout = self._remote_layout.get(engine_id)
@@ -1305,6 +1321,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             if res == "stock":
                 if (
                     self._localization_config.enabled_for(req_id)
+                    or any(self._sp_group_flags())
                     or self._no_stock_dma()
                 ):
                     logger.error(
@@ -1348,21 +1365,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         engine_id = meta.remote.engine_id
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         spec0 = read_specs[0]
-        untrimmed_local_groups = (
-            tuple(
-                tuple(int(block_id) for block_id in group)
-                for group in spec0.local_block_ids
-            )
-            if localization_enabled
-            else ()
+        untrimmed_local_groups = tuple(
+            tuple(int(block_id) for block_id in group)
+            for group in spec0.local_block_ids
         )
-        raw_remote_groups = (
-            tuple(
-                tuple(int(block_id) for block_id in group)
-                for group in spec0.remote_block_ids
-            )
-            if localization_enabled
-            else ()
+        raw_remote_groups = tuple(
+            tuple(int(block_id) for block_id in group)
+            for group in spec0.remote_block_ids
         )
         local_ids, remote_ids = self._apply_prefix_caching(
             [list(g) for g in spec0.local_block_ids],
@@ -1395,63 +1404,94 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             self._recving_transfers.setdefault(req_id, [])
             return "posted"
 
-        # HMA broadcast semantics (see _compute_desc_ids): every group's
-        # blocks are transferred across every region, position-ordered.
-        # F2b single-plane groups (kv_planes==1): local blocks hold 2x
-        # remote tokens, so remote block k of the request expands to
-        # scatter destination (local_ids[k//2], half k%2); the scatter
-        # keeps only the K half for those positions (sp_half >= 0).
         sp_flags = self._sp_group_flags()
-        lpos_l, rpos_l, half_l = [], [], []
-        group_l, source_position_l = [], []
-        for gi in range(len(local_ids)):
-            lg = np.asarray(local_ids[gi], dtype=np.int64)
-            rg = np.asarray(remote_ids[gi], dtype=np.int64)
-            if localization_enabled:
-                source_start = locate_subsequence(
-                    list(raw_remote_groups[gi]),
-                    [int(block_id) for block_id in rg],
-                )
-            if sp_flags[gi]:
-                if len(rg) > 2 * len(lg):
-                    return "stock"
-                k = np.arange(len(rg))
-                lpos_l.append(lg[k // 2])
-                rpos_l.append(rg)
-                half_l.append((k % 2).astype(np.int8))
-            else:
-                if len(lg) != len(rg):
-                    return "stock"
-                lpos_l.append(lg)
-                rpos_l.append(rg)
-                half_l.append(np.full(len(lg), -1, dtype=np.int8))
-            if localization_enabled:
-                group_l.append(np.full(len(rg), gi, dtype=np.int32))
-                source_position_l.append(
-                    np.arange(source_start, source_start + len(rg), dtype=np.int64)
-                )
-        lpos = np.concatenate(lpos_l) if lpos_l else np.zeros(0, dtype=np.int64)
-        rpos = np.concatenate(rpos_l) if rpos_l else np.zeros(0, dtype=np.int64)
-        halves = np.concatenate(half_l) if half_l else np.zeros(0, dtype=np.int8)
-        # Transfer order is free (the (remote, local) pairing is what
-        # matters): sort by remote id so run detection harvests all the
-        # adjacency the remote pool still has. The scatter index (lpos)
-        # is permuted identically, so placement is unchanged.
-        order = np.argsort(rpos, kind="stable")
-        rpos = rpos[order]
-        lpos = lpos[order]
-        halves = halves[order]
-        if localization_enabled:
-            group_ids = np.concatenate(group_l)[order]
-            source_positions = np.concatenate(source_position_l)[order]
-        n_pos = len(lpos)
         n_ranks = len(read_specs)
         blens = self._remote_layout[engine_id][spec0.remote_rank][0]
         n_regions = len(blens)
-        plan = self.tp_mappings[engine_id]
+        tp_mapping = self.tp_mappings[engine_id]
         source_ranks = tuple(int(spec.remote_rank) for spec in read_specs)
         if len(set(source_ranks)) != n_ranks:
             raise LocalizationError("coalesced plan contains duplicate source ranks")
+        if any(rank not in tp_mapping.rank_to_attention_slot for rank in source_ranks):
+            raise LocalizationError("coalesced plan is missing a source-rank slot")
+        slots = tuple(
+            int(tp_mapping.rank_to_attention_slot[rank]) for rank in source_ranks
+        )
+        if sorted(slots) != list(range(n_ranks)):
+            raise LocalizationError(
+                "coalesced source-rank slots must be a complete bijection"
+            )
+
+        group_rosters: list[GroupTransferRoster] = []
+        for group_index, (raw_remote, selected_remote, selected_local) in enumerate(
+            zip(raw_remote_groups, remote_ids, local_ids, strict=True)
+        ):
+            source_position_start = len(raw_remote) - len(selected_remote)
+            if source_position_start < 0 or tuple(
+                raw_remote[source_position_start:]
+            ) != tuple(selected_remote):
+                raise StagingSafetyError(
+                    f"request {req_id} group {group_index} is not a suffix trim"
+                )
+            group_rosters.append(
+                GroupTransferRoster(
+                    group_index=group_index,
+                    source_position_start=source_position_start,
+                    destination_plane_count=1 if sp_flags[group_index] else 2,
+                    local_block_ids=tuple(int(block_id) for block_id in selected_local),
+                    remote_block_ids=tuple(
+                        int(block_id) for block_id in selected_remote
+                    ),
+                )
+            )
+
+        remote_regions = self._remote_regions[engine_id][spec0.remote_rank]
+        if (
+            len(remote_regions) != n_regions
+            or len(self._region_descriptors) != n_regions
+        ):
+            raise StagingSafetyError(
+                f"request {req_id} region metadata changed after handshake"
+            )
+        region_ownership = tuple(
+            RegionOwnership(
+                region_index=region_index,
+                group_indices=remote_region.group_indices,
+                source_row_count=int(remote_region.shape[0]),
+                destination_row_count=int(
+                    self._region_descriptors[region_index].shape[0]
+                ),
+                row_bytes=int(blens[region_index]),
+            )
+            for region_index, remote_region in enumerate(remote_regions)
+        )
+        layout_started_ns = time.perf_counter_ns()
+        transfer_layout = build_coalesced_transfer_plan(
+            source_tp_size=int(remote_info.remote_tp_size),
+            source_ranks=source_ranks,
+            rank_slots=slots,
+            groups=tuple(group_rosters),
+            regions=region_ownership,
+        )
+        layout_duration_ns = time.perf_counter_ns() - layout_started_ns
+        logical_position_count = sum(
+            len(group.remote_block_ids) for group in transfer_layout.groups
+        )
+        logical_staging_size = (
+            logical_position_count * n_ranks * sum(int(blen) for blen in blens)
+        )
+        logger.info(
+            "[coalesced-layout] request=%s digest=%s logical_bytes=%d "
+            "wire_bytes=%d elided_bytes=%d regions=%d layout_ns=%d",
+            req_id,
+            transfer_layout.digest,
+            logical_staging_size,
+            transfer_layout.staging_size_bytes,
+            logical_staging_size - transfer_layout.staging_size_bytes,
+            n_regions,
+            layout_duration_ns,
+        )
+
         semantic_contract: NixlSourceContract | None = None
         if localization_enabled:
             if (
@@ -1471,81 +1511,55 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             raise LocalizationError(
                 f"request {req_id} carries contracts outside localization scope"
             )
-        if any(rank not in plan.rank_to_attention_slot for rank in source_ranks):
-            raise LocalizationError("coalesced plan is missing a source-rank slot")
-        slots = [int(plan.rank_to_attention_slot[rank]) for rank in source_ranks]
-        if sorted(slots) != list(range(n_ranks)):
-            raise LocalizationError(
-                "coalesced source-rank slots must be a complete bijection"
-            )
-        transfer_order: tuple[NixlPlanPosition, ...] = ()
+
+        region_plans: tuple[NixlRegionPlan, ...] = ()
         if localization_enabled:
             assert semantic_contract is not None
-            transfer_order = tuple(
-                NixlPlanPosition(
-                    group_index=int(group_ids[index]),
-                    source_position=int(source_positions[index]),
-                    remote_block_id=int(rpos[index]),
-                    valid_token_extent=semantic_contract.valid_token_extent,
-                    group_token_capacity=semantic_contract.group_token_capacities[
-                        int(group_ids[index])
-                    ],
-                    local_block_id=int(lpos[index]),
-                    plane_index=int(halves[index]),
-                )
-                for index in range(n_pos)
-            )
-            for position in transfer_order:
-                if sp_flags[position.group_index]:
-                    expected_half = position.source_position % 2
-                    if position.plane_index != expected_half:
-                        raise LocalizationError(
-                            "single-plane destination half is not derived from "
-                            "the absolute source position"
+            region_plans = tuple(
+                NixlRegionPlan(
+                    region_index=region.ownership.region_index,
+                    offset_within_rank=region.offset_within_rank,
+                    positions=tuple(
+                        NixlPlanPosition(
+                            group_index=position.group_index,
+                            source_position=position.source_position,
+                            remote_block_id=position.remote_block_id,
+                            valid_token_extent=(semantic_contract.valid_token_extent),
+                            group_token_capacity=(
+                                semantic_contract.group_token_capacities[
+                                    position.group_index
+                                ]
+                            ),
+                            local_block_id=position.local_block_id,
+                            destination_half=position.destination_half,
                         )
-                elif position.plane_index != -1:
-                    raise LocalizationError(
-                        "dual-plane transfer position carries a destination half"
-                    )
-        # maximal consecutive remote-id runs: (start_id, count, pos0)
-        runs: list[tuple[int, int, int]] = []
-        k0 = 0
-        for k in range(1, n_pos + 1):
-            if k == n_pos or rpos[k] != rpos[k - 1] + 1:
-                runs.append((int(rpos[k0]), k - k0, k0))
-                k0 = k
-
-        region_off = [0] * n_regions
-        acc = 0
-        for i in range(n_regions):
-            region_off[i] = acc
-            acc += n_pos * n_ranks * blens[i]
-        scatter_geometry: dict[str, object] = dict(
-            size=acc,
-            n_pos=n_pos,
-            n_ranks=n_ranks,
-            blens=blens,
-            region_off=region_off,
-            lpos=lpos.tolist(),
-            sp_half=halves.tolist(),
-            slots=slots,
-        )
-        if localization_enabled:
-            scatter_geometry.update(
-                source_ranks=list(source_ranks),
-                source_contracts=source_contracts,
-                transfer_order=transfer_order,
+                        for position in region.positions
+                    ),
+                    runs=tuple(
+                        NixlPlanRun(
+                            remote_block_id=run.remote_block_id,
+                            position_count=run.position_count,
+                            position_start=run.position_start,
+                        )
+                        for run in region.runs
+                    ),
+                )
+                for region in transfer_layout.regions
             )
-        if self._audit_enabled:
-            tail_exclude = self._audit_tail_exclude
-            audit_rows: list[int] = []
-            for group_index in sorted(self._audit_groups):
-                if group_index >= len(local_ids) or sp_flags[group_index]:
-                    continue
-                group_rows = list(local_ids[group_index])
-                if len(group_rows) > tail_exclude:
-                    audit_rows.extend(int(row) for row in group_rows[:-tail_exclude])
-            scatter_geometry["audit_rows"] = audit_rows
+            for region in region_plans:
+                for position in region.positions:
+                    if sp_flags[position.group_index]:
+                        expected_half = position.source_position % 2
+                        if position.destination_half != expected_half:
+                            raise LocalizationError(
+                                "single-plane destination half is not derived from "
+                                "the absolute source position"
+                            )
+                    elif position.destination_half != -1:
+                        raise LocalizationError(
+                            "dual-plane transfer position carries a destination half"
+                        )
+        acc = transfer_layout.staging_size_bytes
         if acc > self.coalesce_staging_mb * 1024 * 1024:
             logger.warning(
                 "coalesced pull: request %s needs %sMB staging (pool %sMB); stock path",
@@ -1556,10 +1570,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             return "stock"
         ownership = self._create_coalesced_plan(
             req_id,
-            acc,
-            source_ranks,
             engine_id,
-            scatter_geometry,
+            transfer_layout,
+            layout_duration_ns / 1_000_000_000,
         )
         if ownership is None:
             return "defer"
@@ -1575,11 +1588,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     NixlPlanRecord(
                         record_type=NixlPlanRecord.RECORD_TYPE,
                         schema_version=IntegrityIdentity.SCHEMA_VERSION,
+                        source_tp_size=transfer_layout.source_tp_size,
                         source_contracts=source_contracts,
                         child_request_id=req_id,
                         observer_engine_id=self.engine_id,
                         observer_rank=self.tp_rank,
-                        rank_slots=tuple(int(slot) for slot in slots),
+                        rank_slots=transfer_layout.rank_slots,
                         destination_group_planes=tuple(
                             1 if flag else 2 for flag in sp_flags
                         ),
@@ -1597,12 +1611,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             tuple(int(block_id) for block_id in group)
                             for group in local_ids
                         ),
-                        transfer_order=transfer_order,
-                        runs=tuple(runs),
-                        region_offsets=tuple(region_off),
+                        region_plans=region_plans,
+                        rank_stride_bytes=transfer_layout.rank_stride_bytes,
+                        layout_digest=transfer_layout.digest,
                         staging_offset=off,
-                        staging_size=acc,
+                        staging_size=transfer_layout.staging_size_bytes,
                     )
+                )
+                self._install_coalesced_localization_plan(
+                    req_id,
+                    transfer_layout,
+                    source_contracts,
                 )
             except Exception as error:
                 stacktrace = traceback.format_exc()
@@ -1621,7 +1640,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
         assert self._staging_buf is not None
         staging_base = self._staging_buf.data_ptr() + off
-        for ridx, s in enumerate(read_specs):
+        for rank_index, s in enumerate(read_specs):
             source_rank = int(s.remote_rank)
             ownership.begin_prepare(source_rank)
             try:
@@ -1629,12 +1648,32 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 assert blens_r == blens, "per-rank region layout mismatch"
                 rbases = self.kv_caches_base_addr[engine_id][s.remote_rank]
                 local_descs, remote_descs = [], []
-                for i in range(n_regions):
-                    base_i = staging_base + region_off[i] + ridx * n_pos * blens[i]
-                    for start, cnt, p0 in runs:
-                        ln = cnt * blens[i]
-                        local_descs.append((base_i + p0 * blens[i], ln, self.device_id))
-                        remote_descs.append((rbases[i] + start * blens[i], ln, rdev))
+                for region_index, region_layout in enumerate(transfer_layout.regions):
+                    row_bytes = region_layout.ownership.row_bytes
+                    region_base = staging_base + transfer_layout.region_offset(
+                        rank_index,
+                        region_index,
+                    )
+                    for run in region_layout.runs:
+                        length = run.position_count * row_bytes
+                        local_descs.append(
+                            (
+                                region_base + run.position_start * row_bytes,
+                                length,
+                                self.device_id,
+                            )
+                        )
+                        remote_descs.append(
+                            (
+                                rbases[region_index] + run.remote_block_id * row_bytes,
+                                length,
+                                rdev,
+                            )
+                        )
+                if len(local_descs) == 0:
+                    raise StagingSafetyError(
+                        f"request {req_id} produced no native descriptors"
+                    )
                 ld = self.nixl_wrapper.get_xfer_descs(
                     local_descs, self.nixl_memory_type
                 )
@@ -1659,7 +1698,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     notification_id,
                 )
                 return "posted"
-            posted = self._initialize_and_post_coalesced(
+            prepared = self._prepare_coalesced_handle(
                 ownership,
                 source_rank,
                 ld,
@@ -1667,13 +1706,31 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 agent,
                 notification_id,
             )
-            if posted is False:
+            if prepared is False:
                 self._notify_failed_coalesced_producer_ranks(
                     meta,
                     ownership,
                     notification_id,
                 )
                 return "posted"
+
+        try:
+            self._assert_transfer_phase_active(coalesced=True)
+        except Exception as error:
+            reason = "coalesced post phase rejected before native submission\n" + (
+                traceback.format_exc()
+            )
+            ownership.fail(reason)
+            self._finish_quiescent_coalesced_failure(ownership, reason, error)
+            self._notify_failed_coalesced_producer_ranks(
+                meta,
+                ownership,
+                notification_id,
+            )
+            return "posted"
+
+        for source_rank in transfer_layout.source_ranks:
+            self._post_prepared_coalesced(ownership, source_rank)
         self._notify_non_read_producer_ranks(meta, read_specs, notification_id)
         ownership.seal_posting()
         return "posted"
@@ -1902,12 +1959,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             if state is not None:
                 self._mark_pull_contract_conflicted(req_id, state)
 
-        for proof in read_proofs:
-            if self._record_pull_completion(proof, allow_buffer=True):
-                notified_req_ids.add(proof.producer_request_id)
-        for proof in cancellation_proofs:
-            if self._record_offer_cancellation(proof, allow_buffer=True):
-                notified_req_ids.add(proof.producer_request_id)
+        for read_proof in read_proofs:
+            if self._record_pull_completion(read_proof, allow_buffer=True):
+                notified_req_ids.add(read_proof.producer_request_id)
+        for cancellation_proof in cancellation_proofs:
+            if self._record_offer_cancellation(cancellation_proof, allow_buffer=True):
+                notified_req_ids.add(cancellation_proof.producer_request_id)
         return notified_req_ids
 
     def _record_pull_completion(

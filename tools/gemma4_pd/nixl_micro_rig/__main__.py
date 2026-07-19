@@ -27,6 +27,27 @@ def _parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run")
     run.add_argument("--config", type=Path, required=True)
     run.add_argument("--artifact-root", type=Path, required=True)
+    capture = subparsers.add_parser("capture-handshake")
+    capture.add_argument("--config", type=Path, required=True)
+    capture.add_argument("--code-root", type=Path, required=True)
+    capture.add_argument("--producer-host", required=True)
+    capture.add_argument("--producer-port", type=int, required=True)
+    capture.add_argument("--producer-engine-id")
+    capture.add_argument("--decoder-host", required=True)
+    capture.add_argument("--decoder-port", type=int, required=True)
+    capture.add_argument("--decoder-engine-id")
+    capture.add_argument("--model-config", type=Path, required=True)
+    capture.add_argument("--expected-model-config-sha256", required=True)
+    capture.add_argument("--output", type=Path, required=True)
+    capture.add_argument("--result-output", type=Path, required=True)
+    capture.add_argument("--timeout-seconds", type=float, default=5.0)
+    verify = subparsers.add_parser("verify-handshake")
+    verify.add_argument("--config", type=Path, required=True)
+    verify.add_argument("--code-root", type=Path, required=True)
+    verify.add_argument("--capture", type=Path, required=True)
+    verify.add_argument("--expected-sha256", required=True)
+    verify.add_argument("--expected-model-config-sha256", required=True)
+    verify.add_argument("--result-output", type=Path, required=True)
     return parser
 
 
@@ -52,6 +73,44 @@ def main() -> None:
         return
     if arguments.command == "self-test":
         print(json.dumps(integrity_contract_self_test(), indent=2, sort_keys=True))
+        return
+    if arguments.command in {"capture-handshake", "verify-handshake"}:
+        from tools.gemma4_pd.nixl_micro_rig.live_handshake import (
+            CaptureVerificationResult,
+            CaptureWriteResult,
+            capture_live_handshake,
+            verify_live_handshake_capture,
+            write_result_output,
+        )
+
+        result: CaptureWriteResult | CaptureVerificationResult
+        if arguments.command == "capture-handshake":
+            result = capture_live_handshake(
+                config_path=arguments.config,
+                config=config,
+                code_root=arguments.code_root,
+                producer_host=arguments.producer_host,
+                producer_port=arguments.producer_port,
+                producer_engine_id=arguments.producer_engine_id,
+                decoder_host=arguments.decoder_host,
+                decoder_port=arguments.decoder_port,
+                decoder_engine_id=arguments.decoder_engine_id,
+                model_config_path=arguments.model_config,
+                expected_model_config_sha256=(arguments.expected_model_config_sha256),
+                output_path=arguments.output,
+                timeout_seconds=arguments.timeout_seconds,
+            )
+        else:
+            result = verify_live_handshake_capture(
+                capture_path=arguments.capture,
+                expected_sha256=arguments.expected_sha256,
+                config_path=arguments.config,
+                config=config,
+                code_root=arguments.code_root,
+                expected_model_config_sha256=(arguments.expected_model_config_sha256),
+            )
+        write_result_output(arguments.result_output, result)
+        print(arguments.result_output)
         return
 
     from tools.gemma4_pd.nixl_micro_rig.launcher import run_campaign

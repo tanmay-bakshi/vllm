@@ -6,6 +6,7 @@ import hashlib
 import queue
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -13,10 +14,18 @@ import pytest
 import torch
 
 from vllm.config import KVTransferConfig
+from vllm.distributed.kv_transfer.coalesced_layout import (
+    GroupTransferRoster,
+    RegionOwnership,
+    build_coalesced_transfer_plan,
+)
 from vllm.distributed.kv_transfer.integrity import (
     IntegrityIdentity,
     IntegrityPayloadKind,
     IntegrityStage,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    _CoalescedLocalizationPlan,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     RemoteMeta,
@@ -29,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
     NixlPullConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpec
+from vllm.distributed.kv_transfer.nixl_contracts import NixlRegionDescriptor
 from vllm.distributed.kv_transfer.nixl_localization import (
     LocalizationArtifactWriter,
     LocalizationError,
@@ -40,7 +50,8 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlLocalizationConfig,
     NixlPlanPosition,
     NixlPlanRecord,
-    NixlRegionDescriptor,
+    NixlPlanRun,
+    NixlRegionPlan,
     NixlSourceContract,
     NixlSourceManifest,
     NixlSourceManifestRecord,
@@ -49,10 +60,12 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     build_integrity_identity,
     build_integrity_leaf,
     compute_semantic_contract_digest,
+    leaf_source_key,
     localization_child_index,
     localization_fingerprint_size,
     localization_producer_target,
     localization_request_target,
+    localization_stage_barrier,
     seal_source_manifest,
     source_contract_from_manifest,
     validate_source_contract_structure,
@@ -71,6 +84,51 @@ from vllm.v1.kv_cache_interface import (
 
 HTTP_TARGET_REQUEST_ID = "p2d-phase2db-separated-score2-20260713-p000-s000637"
 TARGET_REQUEST_ID_BASE = f"chatcmpl-{HTTP_TARGET_REQUEST_ID}"
+
+
+@pytest.mark.parametrize(
+    ("stage", "barrier"),
+    (
+        (
+            IntegrityStage.STAGING_RAW,
+            "nixl_done_without_added_device_wide_sync",
+        ),
+        (
+            IntegrityStage.STAGING_FENCED_CONTROL,
+            "device_synchronize_observer_control_not_gdr_flush",
+        ),
+        (
+            IntegrityStage.STAGING_POST_SCATTER,
+            "scatter_completion_event_before_staging_release",
+        ),
+        (
+            IntegrityStage.DESTINATION,
+            "scatter_completion_event_before_publication",
+        ),
+        (
+            IntegrityStage.PRE_READ,
+            "after_transfer_phase_drain_before_model_forward",
+        ),
+    ),
+)
+def test_localization_stage_barrier_is_canonical(
+    stage: IntegrityStage,
+    barrier: str,
+) -> None:
+    """Each decoder capture stage must have one exact ordering contract."""
+    assert localization_stage_barrier(stage) == barrier
+
+
+@pytest.mark.parametrize(
+    "stage",
+    (IntegrityStage.SOURCE_PRE, IntegrityStage.SOURCE_POST),
+)
+def test_localization_stage_barrier_rejects_source_stages(
+    stage: IntegrityStage,
+) -> None:
+    """Producer observations must not masquerade as decoder barriers."""
+    with pytest.raises(ValueError, match="unsupported decoder localization stage"):
+        localization_stage_barrier(stage)
 
 
 @pytest.mark.cpu_test
@@ -203,7 +261,7 @@ def _region(
     shape: tuple[int, ...] | None = None,
     strides: tuple[int, ...] | None = None,
 ) -> NixlRegionDescriptor:
-    region_shape = shape if shape is not None else (16, row_bytes)
+    region_shape = shape if shape is not None else (128, row_bytes)
     region_strides = strides if strides is not None else (row_bytes, 1)
     return NixlRegionDescriptor(
         semantic_name=group_semantic_name,
@@ -339,48 +397,76 @@ def _plan(
     local_region: NixlRegionDescriptor | None = None,
     child_request_id: str | None = None,
     observer_rank: int = 0,
+    source_tp_size: int | None = None,
 ) -> NixlPlanRecord:
     contracts = source_contracts if source_contracts is not None else (contract,)
     slots = rank_slots if rank_slots is not None else tuple(range(len(contracts)))
     remote = selected_remote if selected_remote is not None else contract.block_ids[0]
+    source_start = len(contract.block_ids[0]) - len(remote)
     if selected_local is None:
-        selected_local = tuple(100 + index for index in range(len(remote)))
-    source_start = (
-        list(contract.block_ids[0]).index(remote[0]) if len(remote) > 0 else 0
+        if destination_planes == 2 or len(remote) == 0:
+            local_count = len(remote)
+        else:
+            first_local_position = source_start // 2
+            final_source_position = source_start + len(remote) - 1
+            local_count = final_source_position // 2 - first_local_position + 1
+        selected_local = tuple(100 + index for index in range(local_count))
+    resolved_local_region = (
+        local_region if local_region is not None else contract.regions[0]
     )
-    if positions is None:
-        positions = tuple(
-            NixlPlanPosition(
+    resolved_source_tp_size = (
+        source_tp_size
+        if source_tp_size is not None
+        else max(source_contract.source_rank for source_contract in contracts) + 1
+    )
+    layout = build_coalesced_transfer_plan(
+        source_tp_size=resolved_source_tp_size,
+        source_ranks=tuple(
+            source_contract.source_rank for source_contract in contracts
+        ),
+        rank_slots=slots,
+        groups=(
+            GroupTransferRoster(
                 group_index=0,
-                source_position=source_start + index,
-                remote_block_id=block_id,
-                valid_token_extent=contract.valid_token_extent,
-                group_token_capacity=contract.group_token_capacities[0],
-                local_block_id=(
-                    selected_local[index]
-                    if destination_planes == 2
-                    else selected_local[index // 2]
+                source_position_start=source_start,
+                destination_plane_count=destination_planes,
+                local_block_ids=selected_local,
+                remote_block_ids=remote,
+            ),
+        ),
+        regions=(
+            RegionOwnership(
+                region_index=0,
+                group_indices=contract.regions[0].group_indices,
+                source_row_count=(
+                    contract.regions[0].registered_bytes
+                    // contract.regions[0].row_bytes
                 ),
-                plane_index=(
-                    -1 if destination_planes == 2 else (source_start + index) % 2
+                destination_row_count=(
+                    resolved_local_region.registered_bytes
+                    // resolved_local_region.row_bytes
                 ),
-            )
-            for index, block_id in enumerate(remote)
+                row_bytes=contract.regions[0].row_bytes,
+            ),
+        ),
+    )
+    region_layout = layout.regions[0]
+    canonical_positions = tuple(
+        NixlPlanPosition(
+            group_index=position.group_index,
+            source_position=position.source_position,
+            remote_block_id=position.remote_block_id,
+            valid_token_extent=contract.valid_token_extent,
+            group_token_capacity=contract.group_token_capacities[0],
+            local_block_id=position.local_block_id,
+            destination_half=position.destination_half,
         )
-    remote_order = [position.remote_block_id for position in positions]
-    runs: list[tuple[int, int, int]] = []
-    if len(remote_order) > 0:
-        start = 0
-        for index in range(1, len(remote_order) + 1):
-            if (
-                index == len(remote_order)
-                or remote_order[index] != remote_order[index - 1] + 1
-            ):
-                runs.append((remote_order[start], index - start, start))
-                start = index
+        for position in region_layout.positions
+    )
     return NixlPlanRecord(
         record_type=NixlPlanRecord.RECORD_TYPE,
         schema_version=IntegrityIdentity.SCHEMA_VERSION,
+        source_tp_size=resolved_source_tp_size,
         source_contracts=contracts,
         child_request_id=(
             child_request_id
@@ -392,18 +478,480 @@ def _plan(
         rank_slots=slots,
         destination_group_planes=(destination_planes,),
         destination_group_token_capacities=contract.group_token_capacities,
-        local_regions=(
-            local_region if local_region is not None else contract.regions[0],
-        ),
+        local_regions=(resolved_local_region,),
         untrimmed_local_groups=(selected_local,),
         skipped_groups=(),
         selected_remote_groups=(remote,),
         selected_local_groups=(selected_local,),
-        transfer_order=positions,
-        runs=tuple(runs),
-        region_offsets=(0,),
+        region_plans=(
+            NixlRegionPlan(
+                region_index=0,
+                offset_within_rank=region_layout.offset_within_rank,
+                positions=positions if positions is not None else canonical_positions,
+                runs=tuple(
+                    NixlPlanRun(
+                        remote_block_id=run.remote_block_id,
+                        position_count=run.position_count,
+                        position_start=run.position_start,
+                    )
+                    for run in region_layout.runs
+                ),
+            ),
+        ),
+        rank_stride_bytes=layout.rank_stride_bytes,
+        layout_digest=layout.digest,
         staging_offset=0,
-        staging_size=(len(positions) * len(contracts) * contract.region_lengths[0]),
+        staging_size=layout.staging_size_bytes,
+    )
+
+
+def _retained_localization_plan(
+    contract: NixlSourceContract,
+) -> _CoalescedLocalizationPlan:
+    """Build the typed runtime plan retained until the target model forward."""
+    groups: list[GroupTransferRoster] = []
+    for group_index, remote_block_ids in enumerate(contract.block_ids):
+        destination_plane_count = contract.source_group_planes[group_index]
+        local_count = (
+            len(remote_block_ids)
+            if destination_plane_count == 2
+            else (len(remote_block_ids) + 1) // 2
+        )
+        groups.append(
+            GroupTransferRoster(
+                group_index=group_index,
+                source_position_start=0,
+                destination_plane_count=destination_plane_count,
+                local_block_ids=tuple(range(local_count)),
+                remote_block_ids=remote_block_ids,
+            )
+        )
+    regions = tuple(
+        RegionOwnership(
+            region_index=region_index,
+            group_indices=region.group_indices,
+            source_row_count=region.shape[0],
+            destination_row_count=region.shape[0],
+            row_bytes=region.row_bytes,
+        )
+        for region_index, region in enumerate(contract.regions)
+    )
+    layout = build_coalesced_transfer_plan(
+        source_tp_size=max(contract.source_rank + 1, 1),
+        source_ranks=(contract.source_rank,),
+        rank_slots=(0,),
+        groups=tuple(groups),
+        regions=regions,
+    )
+    return _CoalescedLocalizationPlan(
+        layout=layout,
+        source_contracts=(contract,),
+    )
+
+
+def _runtime_region(
+    region_index: int,
+    group_index: int,
+    row_bytes: int,
+) -> NixlRegionDescriptor:
+    """Build one ownership-specific runtime capture region."""
+    semantic_name = f"group-{group_index}:transfer-region-{region_index}"
+    return NixlRegionDescriptor(
+        semantic_name=semantic_name,
+        group_indices=(group_index,),
+        group_semantic_names=((group_index, semantic_name),),
+        base_address=0x100000 + region_index * 0x10000,
+        registered_bytes=128 * row_bytes,
+        row_bytes=row_bytes,
+        shape=(128, row_bytes),
+        strides=(row_bytes, 1),
+        dtype="torch.uint8",
+        element_size_bytes=1,
+        layout="HND",
+    )
+
+
+def _runtime_contract(
+    config: NixlLocalizationConfig,
+    source_rank: int,
+    regions: tuple[NixlRegionDescriptor, ...],
+) -> NixlSourceContract:
+    """Build one complete two-group runtime localization contract."""
+    return NixlSourceContract(
+        schema_version=IntegrityIdentity.SCHEMA_VERSION,
+        fingerprint_algorithm=config.fingerprint_algorithm,
+        run_id=config.run_id,
+        transport_arm=config.transport_arm,
+        producer_engine_id="prefill",
+        producer_request_id=TARGET_REQUEST_ID_BASE,
+        registration_generation=f"registration-{source_rank}",
+        offer_generation=7,
+        iteration=3,
+        expected_consumers=1,
+        source_rank=source_rank,
+        region_lengths=tuple(region.row_bytes for region in regions),
+        regions=regions,
+        source_group_planes=(2, 1),
+        valid_token_extent=173,
+        group_token_capacities=(64, 32),
+        block_ids=((10, 11), (20, 21, 22, 23)),
+    )
+
+
+def _runtime_capture_worker(
+    tmp_path: Path,
+    mode: LocalizationMode = LocalizationMode.TRACE,
+) -> tuple[
+    NixlPullConnectorWorker,
+    SimpleNamespace,
+    _CoalescedLocalizationPlan,
+]:
+    """Build rank-major staging bytes for an ownership-pruned runtime plan."""
+    config = _config(tmp_path, mode=mode)
+    regions = (
+        _runtime_region(0, 0, 8),
+        _runtime_region(1, 1, 6),
+    )
+    contracts = tuple(
+        _runtime_contract(config, source_rank, regions) for source_rank in (2, 0)
+    )
+    layout = build_coalesced_transfer_plan(
+        source_tp_size=4,
+        source_ranks=(2, 0),
+        rank_slots=(1, 0),
+        groups=(
+            GroupTransferRoster(
+                group_index=0,
+                source_position_start=0,
+                destination_plane_count=2,
+                local_block_ids=(2, 3),
+                remote_block_ids=(10, 11),
+            ),
+            GroupTransferRoster(
+                group_index=1,
+                source_position_start=1,
+                destination_plane_count=1,
+                local_block_ids=(4, 5),
+                remote_block_ids=(21, 22, 23),
+            ),
+        ),
+        regions=(
+            RegionOwnership(
+                region_index=0,
+                group_indices=(0,),
+                source_row_count=128,
+                destination_row_count=8,
+                row_bytes=8,
+            ),
+            RegionOwnership(
+                region_index=1,
+                group_indices=(1,),
+                source_row_count=128,
+                destination_row_count=8,
+                row_bytes=6,
+            ),
+        ),
+    )
+    runtime_plan = _CoalescedLocalizationPlan(
+        layout=layout,
+        source_contracts=contracts,
+    )
+    ownership = SimpleNamespace(
+        layout=layout,
+        lease=SimpleNamespace(offset=11),
+    )
+    staging = torch.full(
+        (ownership.lease.offset + layout.staging_size_bytes + 7,),
+        0xEE,
+        dtype=torch.uint8,
+    )
+    for rank_index in range(len(layout.source_ranks)):
+        for region in layout.regions:
+            row_bytes = region.ownership.row_bytes
+            for position_index in range(len(region.positions)):
+                row_start = (
+                    ownership.lease.offset
+                    + layout.region_offset(
+                        rank_index,
+                        region.ownership.region_index,
+                    )
+                    + position_index * row_bytes
+                )
+                value = rank_index * 64 + region.ownership.region_index * 16
+                value += position_index * 4
+                staging[row_start : row_start + row_bytes] = (
+                    torch.arange(row_bytes, dtype=torch.uint8) + value
+                )
+
+    worker = object.__new__(NixlPullConnectorWorker)
+    worker._localization_config = config
+    worker._staging_buf = staging
+    worker._coalesced_localization_plans = {TARGET_REQUEST_ID_BASE: runtime_plan}
+    worker._localization_finish_capture = MagicMock()
+    if mode is LocalizationMode.FINGERPRINT:
+        fingerprinter = MagicMock()
+        fingerprinter.fingerprint_rows.side_effect = lambda rows: rows.clone()
+        fingerprinter.fingerprints_to_digests.side_effect = lambda batches: [
+            hashlib.sha256(bytes(row.tolist())).digest()
+            for batch in batches
+            for row in batch
+        ]
+        worker._localization_fingerprinter = fingerprinter
+    return worker, ownership, runtime_plan
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "mode",
+    [LocalizationMode.TRACE, LocalizationMode.FINGERPRINT],
+)
+def test_runtime_capture_uses_canonical_rank_major_region_layout(
+    tmp_path: Path,
+    mode: LocalizationMode,
+) -> None:
+    """Staging and destination captures agree on every committed payload."""
+    worker, ownership, runtime_plan = _runtime_capture_worker(tmp_path, mode)
+    layout = runtime_plan.layout
+
+    worker._localization_capture_staging(
+        TARGET_REQUEST_ID_BASE,
+        ownership,
+        IntegrityStage.STAGING_RAW,
+        "unit-test-staging-boundary",
+    )
+
+    staging_calls = worker._localization_finish_capture.call_args_list
+    assert len(staging_calls) == len(layout.source_ranks)
+    staging_leaves_by_rank = {
+        call.kwargs["contract"].source_rank: {
+            leaf_source_key(leaf): leaf for leaf in call.kwargs["leaves"]
+        }
+        for call in staging_calls
+    }
+    for source_rank, rank_slot in zip(
+        layout.source_ranks,
+        layout.rank_slots,
+        strict=True,
+    ):
+        leaves = tuple(staging_leaves_by_rank[source_rank].values())
+        assert len(leaves) == 8
+        assert {leaf.rank_slot for leaf in leaves} == {rank_slot}
+        single_plane = sorted(
+            (
+                leaf.source_position,
+                leaf.remote_block_id,
+                leaf.local_block_id,
+                leaf.destination_half,
+            )
+            for leaf in leaves
+            if leaf.region_index == 1
+            and leaf.payload_kind is IntegrityPayloadKind.COMMIT
+        )
+        assert single_plane == [
+            (1, 21, 4, 1),
+            (2, 22, 5, 0),
+            (3, 23, 5, 1),
+        ]
+
+    destination_rows = [
+        torch.zeros(
+            (
+                region.ownership.destination_row_count,
+                len(layout.source_ranks) * region.ownership.row_bytes,
+            ),
+            dtype=torch.uint8,
+        )
+        for region in layout.regions
+    ]
+    for rank_index, rank_slot in enumerate(layout.rank_slots):
+        for region in layout.regions:
+            region_index = region.ownership.region_index
+            row_bytes = region.ownership.row_bytes
+            chunk_bytes = row_bytes // 2
+            source_start = ownership.lease.offset + layout.region_offset(
+                rank_index,
+                region_index,
+            )
+            source_rows = worker._staging_buf[
+                source_start : source_start + region.size_bytes
+            ].view(len(region.positions), row_bytes)
+            for position_index, position in enumerate(region.positions):
+                if position.destination_half < 0:
+                    destination = destination_rows[region_index].view(
+                        region.ownership.destination_row_count,
+                        2,
+                        len(layout.source_ranks),
+                        chunk_bytes,
+                    )
+                    destination[
+                        position.local_block_id,
+                        :,
+                        rank_slot,
+                        :,
+                    ] = source_rows[position_index].view(2, chunk_bytes)
+                    continue
+                destination = destination_rows[region_index].view(
+                    region.ownership.destination_row_count,
+                    len(layout.source_ranks),
+                    2,
+                    chunk_bytes,
+                )
+                destination[
+                    position.local_block_id,
+                    rank_slot,
+                    position.destination_half,
+                    :,
+                ] = source_rows[position_index, :chunk_bytes]
+
+    worker._region_rows = destination_rows
+    worker._region_descriptors = tuple(
+        contract_region for contract_region in runtime_plan.source_contracts[0].regions
+    )
+    worker._localization_finish_capture.reset_mock()
+    worker._localization_capture_destination(
+        TARGET_REQUEST_ID_BASE,
+        runtime_plan,
+        IntegrityStage.DESTINATION,
+        "unit-test-scatter-boundary",
+    )
+
+    destination_calls = worker._localization_finish_capture.call_args_list
+    assert len(destination_calls) == len(layout.source_ranks)
+    for call in destination_calls:
+        source_rank = call.kwargs["contract"].source_rank
+        destination_leaves = call.kwargs["leaves"]
+        assert len(destination_leaves) == 5
+        staging_leaves = staging_leaves_by_rank[source_rank]
+        for leaf in destination_leaves:
+            staging_leaf = staging_leaves[leaf_source_key(leaf)]
+            assert leaf.digest == staging_leaf.digest
+            assert leaf.local_block_id == staging_leaf.local_block_id
+            assert leaf.destination_half == staging_leaf.destination_half
+            assert leaf.rank_slot == staging_leaf.rank_slot
+
+
+@pytest.mark.cpu_test
+def test_runtime_localization_install_rejects_contract_geometry_drift(
+    tmp_path: Path,
+) -> None:
+    """The retained runtime contract cannot diverge from canonical geometry."""
+    worker, _, runtime_plan = _runtime_capture_worker(tmp_path)
+    worker._coalesced_localization_plans = {}
+
+    worker._install_coalesced_localization_plan(
+        TARGET_REQUEST_ID_BASE,
+        runtime_plan.layout,
+        runtime_plan.source_contracts,
+    )
+    assert worker._coalesced_localization_plans == {
+        TARGET_REQUEST_ID_BASE: runtime_plan
+    }
+
+    worker._coalesced_localization_plans = {}
+    mismatched_regions = (
+        runtime_plan.source_contracts[0].regions[0],
+        _runtime_region(1, 1, 8),
+    )
+    mismatched_contracts = tuple(
+        _runtime_contract(
+            worker._localization_config,
+            source_rank,
+            mismatched_regions,
+        )
+        for source_rank in runtime_plan.layout.source_ranks
+    )
+    with pytest.raises(
+        LocalizationError,
+        match="region contract differs from canonical layout",
+    ):
+        worker._install_coalesced_localization_plan(
+            TARGET_REQUEST_ID_BASE,
+            runtime_plan.layout,
+            mismatched_contracts,
+        )
+    assert worker._coalesced_localization_plans == {}
+
+
+def _plan_from_layout(
+    contract: NixlSourceContract,
+    local_regions: tuple[NixlRegionDescriptor, ...],
+    groups: tuple[GroupTransferRoster, ...],
+) -> NixlPlanRecord:
+    """Encode one canonical transport layout as a diagnostic plan record."""
+    ownership = tuple(
+        RegionOwnership(
+            region_index=region_index,
+            group_indices=source_region.group_indices,
+            source_row_count=(
+                source_region.registered_bytes // source_region.row_bytes
+            ),
+            destination_row_count=(
+                local_region.registered_bytes // local_region.row_bytes
+            ),
+            row_bytes=source_region.row_bytes,
+        )
+        for region_index, (source_region, local_region) in enumerate(
+            zip(contract.regions, local_regions, strict=True)
+        )
+    )
+    layout = build_coalesced_transfer_plan(
+        source_tp_size=1,
+        source_ranks=(contract.source_rank,),
+        rank_slots=(0,),
+        groups=groups,
+        regions=ownership,
+    )
+    return NixlPlanRecord(
+        record_type=NixlPlanRecord.RECORD_TYPE,
+        schema_version=IntegrityIdentity.SCHEMA_VERSION,
+        source_tp_size=layout.source_tp_size,
+        source_contracts=(contract,),
+        child_request_id=contract.producer_request_id,
+        observer_engine_id="decoder",
+        observer_rank=0,
+        rank_slots=layout.rank_slots,
+        destination_group_planes=tuple(
+            group.destination_plane_count for group in groups
+        ),
+        destination_group_token_capacities=contract.group_token_capacities,
+        local_regions=local_regions,
+        untrimmed_local_groups=tuple(group.local_block_ids for group in groups),
+        skipped_groups=(),
+        selected_remote_groups=tuple(group.remote_block_ids for group in groups),
+        selected_local_groups=tuple(group.local_block_ids for group in groups),
+        region_plans=tuple(
+            NixlRegionPlan(
+                region_index=region.ownership.region_index,
+                offset_within_rank=region.offset_within_rank,
+                positions=tuple(
+                    NixlPlanPosition(
+                        group_index=position.group_index,
+                        source_position=position.source_position,
+                        remote_block_id=position.remote_block_id,
+                        valid_token_extent=contract.valid_token_extent,
+                        group_token_capacity=(
+                            contract.group_token_capacities[position.group_index]
+                        ),
+                        local_block_id=position.local_block_id,
+                        destination_half=position.destination_half,
+                    )
+                    for position in region.positions
+                ),
+                runs=tuple(
+                    NixlPlanRun(
+                        remote_block_id=run.remote_block_id,
+                        position_count=run.position_count,
+                        position_start=run.position_start,
+                    )
+                    for run in region.runs
+                ),
+            )
+            for region in layout.regions
+        ),
+        rank_stride_bytes=layout.rank_stride_bytes,
+        layout_digest=layout.digest,
+        staging_offset=0,
+        staging_size=layout.staging_size_bytes,
     )
 
 
@@ -422,7 +970,7 @@ def _mapped_wire_leaf(
         semantic_contract_digest=source_leaf.semantic_contract_digest,
         local_block_id=position.local_block_id,
         plane_index=source_leaf.plane_index,
-        destination_half=position.plane_index,
+        destination_half=position.destination_half,
         rank_slot=rank_slot,
         payload_kind=source_leaf.payload_kind,
         byte_length=source_leaf.byte_length,
@@ -438,7 +986,12 @@ def _capture(
     corrupt: bool = False,
 ) -> NixlCaptureRecord:
     source_wires = {
-        (leaf.source_position, leaf.remote_block_id): leaf
+        (
+            leaf.region_index,
+            leaf.group_index,
+            leaf.source_position,
+            leaf.remote_block_id,
+        ): leaf
         for leaf in manifest.leaves
         if leaf.payload_kind is IntegrityPayloadKind.WIRE
     }
@@ -446,11 +999,19 @@ def _capture(
     rank_slot = plan.rank_slots[source_ranks.index(manifest.source_rank)]
     leaves = tuple(
         _mapped_wire_leaf(
-            source_wires[(position.source_position, position.remote_block_id)],
+            source_wires[
+                (
+                    region_plan.region_index,
+                    position.group_index,
+                    position.source_position,
+                    position.remote_block_id,
+                )
+            ],
             position,
             rank_slot,
         )
-        for position in plan.transfer_order
+        for region_plan in plan.region_plans
+        for position in region_plan.positions
     )
     if corrupt:
         first = leaves[0]
@@ -473,20 +1034,11 @@ def _capture(
             ),
             *leaves[1:],
         )
-    barriers = {
-        IntegrityStage.STAGING_RAW: "nixl_done_without_added_device_wide_sync",
-        IntegrityStage.STAGING_FENCED_CONTROL: (
-            "device_synchronize_observer_control_not_gdr_flush"
-        ),
-        IntegrityStage.STAGING_POST_SCATTER: (
-            "post_scatter_device_synchronize_before_staging_release"
-        ),
-        IntegrityStage.DESTINATION: (
-            "post_scatter_device_synchronize_before_publication"
-        ),
-        IntegrityStage.PRE_READ: ("after_transfer_phase_drain_before_model_forward"),
-    }
-    copied_bytes = len(plan.transfer_order) * manifest.region_lengths[0]
+    copied_bytes = sum(
+        len(region_plan.positions) * manifest.region_lengths[region_plan.region_index]
+        for region_plan in plan.region_plans
+    )
+    hashed_bytes = copied_bytes
     if (
         manifest.fingerprint_algorithm
         is LocalizationFingerprintAlgorithm.POSITION_WEIGHTED_WORDS_256_V1
@@ -512,9 +1064,9 @@ def _capture(
         observer_rank=plan.observer_rank,
         observer=True,
         copied_bytes=copied_bytes,
-        hashed_bytes=len(plan.transfer_order) * manifest.region_lengths[0],
+        hashed_bytes=hashed_bytes,
         duration_ns=1000,
-        barrier=barriers[stage],
+        barrier=localization_stage_barrier(stage),
         leaves=leaves,
     )
 
@@ -523,6 +1075,7 @@ def _write_trace(
     artifact_dir: Path,
     *,
     corrupt_stage: IntegrityStage | None = None,
+    corrupt_barrier_stage: IntegrityStage | None = None,
     include_event: bool = True,
     producer_request_id: str | None = None,
     child_request_id: str | None = None,
@@ -533,6 +1086,7 @@ def _write_trace(
     mode: LocalizationMode = LocalizationMode.TRACE,
     target_request_ids: tuple[str, ...] = (TARGET_REQUEST_ID_BASE,),
     expected_consumers: int = 1,
+    recorded_source_tp_size: int | None = None,
 ) -> tuple[tuple[Path, ...], NixlSourceManifest, NixlPlanRecord]:
     config = _config(
         artifact_dir,
@@ -596,6 +1150,11 @@ def _write_trace(
             ),
             child_request_id=child_request_id,
             observer_rank=decoder_rank,
+            source_tp_size=(
+                recorded_source_tp_size
+                if recorded_source_tp_size is not None
+                else source_world_size
+            ),
         )
         plans.append(plan)
 
@@ -623,14 +1182,18 @@ def _write_trace(
         )
         for stage in capture_stages:
             for manifest in participating_manifests:
-                decoder_writer.write(
-                    _capture(
-                        manifest,
-                        plan,
-                        stage,
-                        corrupt=(manifest.source_rank == 0 and stage is corrupt_stage),
-                    )
+                capture = _capture(
+                    manifest,
+                    plan,
+                    stage,
+                    corrupt=(manifest.source_rank == 0 and stage is corrupt_stage),
                 )
+                if manifest.source_rank == 0 and stage is corrupt_barrier_stage:
+                    capture = msgspec.structs.replace(
+                        capture,
+                        barrier="stale_runtime_ordering_claim",
+                    )
+                decoder_writer.write(capture)
         if include_event:
             manifest = participating_manifests[0]
             decoder_writer.write(
@@ -847,9 +1410,7 @@ def test_pre_read_waits_for_the_target_forward(tmp_path: Path) -> None:
         producer_request_id=producer_request_id,
     )
     contract = source_contract_from_manifest(manifest)
-    plan: dict[str, object] = {
-        "source_contracts": (contract,),
-    }
+    plan = _retained_localization_plan(contract)
     worker = object.__new__(NixlPullConnectorWorker)
     worker._localization_config = _config(tmp_path)
     worker._localization_pre_read_plans = {child_request_id: plan}
@@ -895,9 +1456,9 @@ def test_pre_read_captures_all_scheduled_parallel_children(tmp_path: Path) -> No
         producer_request_id=producer_request_id,
     )
     contract = source_contract_from_manifest(manifest)
-    first_plan: dict[str, object] = {"source_contracts": (contract,)}
-    second_plan: dict[str, object] = {"source_contracts": (contract,)}
-    waiting_plan: dict[str, object] = {"source_contracts": (contract,)}
+    first_plan = _retained_localization_plan(contract)
+    second_plan = _retained_localization_plan(contract)
+    waiting_plan = _retained_localization_plan(contract)
     worker = object.__new__(NixlPullConnectorWorker)
     worker._localization_config = _config(tmp_path)
     worker._localization_pre_read_plans = {
@@ -1016,6 +1577,27 @@ def test_source_contract_is_built_from_request_and_handshake_lineage(
 
     assert contracts == (expected,)
     assert validate_source_contract_structure(contracts[0]) == ()
+
+
+@pytest.mark.cpu_test
+def test_source_contract_rejects_nonphysical_region_geometry(tmp_path: Path) -> None:
+    """Artifact validation independently rejects impossible registration facts."""
+    contract = source_contract_from_manifest(_manifest(_config(tmp_path)))
+    invalid_region = msgspec.structs.replace(
+        contract.regions[0],
+        base_address=True,
+        shape=(),
+        strides=(),
+    )
+    invalid_contract = msgspec.structs.replace(
+        contract,
+        regions=(invalid_region,),
+    )
+
+    errors = validate_source_contract_structure(invalid_contract)
+
+    assert any("geometry contains a non-integer" in error for error in errors)
+    assert any("invalid tensor geometry" in error for error in errors)
 
 
 @pytest.mark.cpu_test
@@ -1503,6 +2085,24 @@ def test_fingerprint_corruption_localizes_to_post_scatter_staging(
 
 
 @pytest.mark.cpu_test
+def test_validator_rejects_noncanonical_runtime_barrier(tmp_path: Path) -> None:
+    """A stale runtime ordering claim cannot validate as decoder evidence."""
+    paths, _, _ = _write_trace(
+        tmp_path,
+        corrupt_barrier_stage=IntegrityStage.DESTINATION,
+    )
+
+    report = validate_localization_artifacts(paths)
+
+    assert report.passed is False
+    assert len(report.divergences) == 1
+    assert report.divergences[0].edge == "staging_fenced_control->destination"
+    assert "capture barrier label differs from stage contract" in (
+        report.divergences[0].errors
+    )
+
+
+@pytest.mark.cpu_test
 def test_missing_terminal_child_outcome_is_not_clean(tmp_path: Path) -> None:
     """A process-terminal file cannot hide a missing per-child terminal result."""
     paths, _, _ = _write_trace(tmp_path, include_event=False)
@@ -1583,6 +2183,67 @@ def test_semantic_contract_detects_equal_size_region_substitution(
 
 
 @pytest.mark.cpu_test
+def test_plan_rejects_destination_row_width_different_from_source_partition(
+    tmp_path: Path,
+) -> None:
+    """The D row must contain exactly one shard from every participating P rank."""
+    config = _config(tmp_path)
+    first_manifest = _manifest(config, source_rank=0)
+    first_contract = source_contract_from_manifest(first_manifest)
+    second_contract = msgspec.structs.replace(
+        first_contract,
+        source_rank=1,
+        registration_generation="registration-1",
+        regions=(
+            msgspec.structs.replace(
+                first_contract.regions[0],
+                base_address=first_contract.regions[0].base_address + 0x10000,
+            ),
+        ),
+    )
+    plan = _plan(
+        first_contract,
+        source_contracts=(first_contract, second_contract),
+        local_region=_region(base_address=0x200000, row_bytes=8),
+        source_tp_size=2,
+    )
+
+    errors = validate_localization_plan(plan)
+
+    assert any("participating source-rank geometry" in error for error in errors)
+
+
+@pytest.mark.cpu_test
+def test_plan_rejects_rank_local_expected_consumer_drift(tmp_path: Path) -> None:
+    """Expected-consumer cardinality is one request contract across P ranks."""
+    config = _config(tmp_path)
+    first_manifest = _manifest(config, source_rank=0)
+    first_contract = source_contract_from_manifest(first_manifest)
+    second_contract = msgspec.structs.replace(
+        first_contract,
+        source_rank=1,
+        registration_generation="registration-1",
+        expected_consumers=2,
+        regions=(
+            msgspec.structs.replace(
+                first_contract.regions[0],
+                base_address=first_contract.regions[0].base_address + 0x10000,
+            ),
+        ),
+    )
+    plan = _plan(
+        first_contract,
+        source_contracts=(first_contract, second_contract),
+        local_region=_region(base_address=0x200000, row_bytes=16),
+        source_tp_size=2,
+    )
+
+    errors = validate_localization_plan(plan)
+
+    assert "plan source ranks disagree on transfer contract" in errors
+
+
+@pytest.mark.cpu_test
 def test_plan_rejects_odd_trim_relative_half_mapping(tmp_path: Path) -> None:
     """Single-plane halves derive from absolute source positions after trimming."""
     config = _config(tmp_path)
@@ -1595,7 +2256,7 @@ def test_plan_rejects_odd_trim_relative_half_mapping(tmp_path: Path) -> None:
             valid_token_extent=100,
             group_token_capacity=64,
             local_block_id=100,
-            plane_index=0,
+            destination_half=0,
         ),
         NixlPlanPosition(
             group_index=0,
@@ -1604,19 +2265,19 @@ def test_plan_rejects_odd_trim_relative_half_mapping(tmp_path: Path) -> None:
             valid_token_extent=100,
             group_token_capacity=64,
             local_block_id=100,
-            plane_index=1,
+            destination_half=1,
         ),
     )
     plan = _plan(
         source_contract_from_manifest(manifest),
         selected_remote=(11, 12),
-        selected_local=(100,),
+        selected_local=(100, 101),
         destination_planes=1,
         positions=relative_halves,
     )
 
     errors = validate_localization_plan(plan)
-    assert any("destination mapping mismatch" in error for error in errors)
+    assert any("ownership-filtered canonical layout" in error for error in errors)
 
 
 @pytest.mark.cpu_test
@@ -1634,7 +2295,7 @@ def test_plan_rejects_swapped_destinations_with_unchanged_source_contract(
             valid_token_extent=100,
             group_token_capacity=64,
             local_block_id=101,
-            plane_index=-1,
+            destination_half=-1,
         ),
         NixlPlanPosition(
             group_index=0,
@@ -1643,13 +2304,13 @@ def test_plan_rejects_swapped_destinations_with_unchanged_source_contract(
             valid_token_extent=100,
             group_token_capacity=64,
             local_block_id=100,
-            plane_index=-1,
+            destination_half=-1,
         ),
     )
     plan = _plan(source_contract_from_manifest(manifest), positions=swapped)
 
     errors = validate_localization_plan(plan)
-    assert any("destination mapping mismatch" in error for error in errors)
+    assert any("ownership-filtered canonical layout" in error for error in errors)
 
 
 @pytest.mark.cpu_test
@@ -1669,6 +2330,22 @@ def test_plan_rejects_rank_slot_swap_against_topology_contract(
 
 
 @pytest.mark.cpu_test
+def test_plan_rejects_source_tp_size_different_from_producer_session(
+    tmp_path: Path,
+) -> None:
+    """The producer session, not the plan itself, fixes source TP size."""
+    paths, _, _ = _write_trace(tmp_path, recorded_source_tp_size=3)
+
+    report = validate_localization_artifacts(paths)
+
+    assert report.passed is False
+    assert any(
+        "source TP size differs from producer session world size" in error
+        for error in report.errors
+    )
+
+
+@pytest.mark.cpu_test
 def test_plan_with_skipped_group_is_non_evidentiary(tmp_path: Path) -> None:
     """Partial group coverage cannot support a localization verdict."""
     manifest = _manifest(_config(tmp_path))
@@ -1680,6 +2357,158 @@ def test_plan_with_skipped_group_is_non_evidentiary(tmp_path: Path) -> None:
     errors = validate_localization_plan(plan)
 
     assert "plan skips cache groups and is non-evidentiary" in errors
+
+
+def _ownership_pruned_plan() -> NixlPlanRecord:
+    """Build a two-group plan whose regions own disjoint position subsets."""
+    source_regions = tuple(
+        NixlRegionDescriptor(
+            semantic_name=f"model.layers.{group_index}:transfer_region_0",
+            group_indices=(group_index,),
+            group_semantic_names=(
+                (
+                    group_index,
+                    f"model.layers.{group_index}:transfer_region_0",
+                ),
+            ),
+            base_address=0x300000 + group_index * 0x10000,
+            registered_bytes=128 * row_bytes,
+            row_bytes=row_bytes,
+            shape=(128, row_bytes),
+            strides=(row_bytes, 1),
+            dtype="torch.uint8",
+            element_size_bytes=1,
+            layout="HND",
+        )
+        for group_index, row_bytes in enumerate((8, 4))
+    )
+    local_regions = tuple(
+        msgspec.structs.replace(
+            region,
+            base_address=region.base_address + 0x100000,
+        )
+        for region in source_regions
+    )
+    contract = NixlSourceContract(
+        schema_version=IntegrityIdentity.SCHEMA_VERSION,
+        fingerprint_algorithm=LocalizationFingerprintAlgorithm.BLAKE2B_128,
+        run_id="rank-major-layout",
+        transport_arm="cuda-ipc",
+        producer_engine_id="prefill",
+        producer_request_id=TARGET_REQUEST_ID_BASE,
+        registration_generation="registration-0",
+        offer_generation=1,
+        iteration=0,
+        expected_consumers=1,
+        source_rank=0,
+        region_lengths=(8, 4),
+        regions=source_regions,
+        source_group_planes=(2, 1),
+        valid_token_extent=100,
+        group_token_capacities=(64, 64),
+        block_ids=((10, 11, 12), (20, 21)),
+    )
+    groups = (
+        GroupTransferRoster(
+            group_index=0,
+            source_position_start=0,
+            destination_plane_count=2,
+            local_block_ids=(30, 31, 32),
+            remote_block_ids=(10, 11, 12),
+        ),
+        GroupTransferRoster(
+            group_index=1,
+            source_position_start=0,
+            destination_plane_count=1,
+            local_block_ids=(40,),
+            remote_block_ids=(20, 21),
+        ),
+    )
+    return _plan_from_layout(contract, local_regions, groups)
+
+
+@pytest.mark.cpu_test
+def test_rank_major_region_pruned_plan_reconstructs_exactly() -> None:
+    """Region ownership controls positions, packed offsets, and staging size."""
+    plan = _ownership_pruned_plan()
+
+    assert validate_localization_plan(plan) == ()
+    assert tuple(
+        tuple(position.group_index for position in region.positions)
+        for region in plan.region_plans
+    ) == ((0, 0, 0), (1, 1))
+    assert tuple(region.offset_within_rank for region in plan.region_plans) == (0, 24)
+    assert plan.rank_stride_bytes == 32
+    assert plan.staging_size == 32
+    assert len(plan.layout_digest) == 64
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("mutation", "error_fragment"),
+    (
+        ("ownership", "ownership-filtered canonical layout"),
+        ("runs", "runs differ"),
+        ("offset", "packed offset"),
+        ("rank_stride", "rank stride"),
+        ("staging_size", "staging size"),
+        ("digest", "layout digest"),
+    ),
+)
+def test_rank_major_plan_rejects_noncanonical_layout_facts(
+    mutation: str,
+    error_fragment: str,
+) -> None:
+    """Every serialized layout fact is checked against reconstruction."""
+    plan = _ownership_pruned_plan()
+    if mutation == "ownership":
+        first_region = plan.region_plans[0]
+        bad_position = msgspec.structs.replace(
+            first_region.positions[0],
+            group_index=1,
+        )
+        bad_region = msgspec.structs.replace(
+            first_region,
+            positions=(bad_position, *first_region.positions[1:]),
+        )
+        plan = msgspec.structs.replace(
+            plan,
+            region_plans=(bad_region, *plan.region_plans[1:]),
+        )
+    elif mutation == "runs":
+        first_region = plan.region_plans[0]
+        bad_run = msgspec.structs.replace(
+            first_region.runs[0],
+            position_count=first_region.runs[0].position_count - 1,
+        )
+        bad_region = msgspec.structs.replace(first_region, runs=(bad_run,))
+        plan = msgspec.structs.replace(
+            plan,
+            region_plans=(bad_region, *plan.region_plans[1:]),
+        )
+    elif mutation == "offset":
+        second_region = msgspec.structs.replace(
+            plan.region_plans[1],
+            offset_within_rank=plan.region_plans[1].offset_within_rank + 1,
+        )
+        plan = msgspec.structs.replace(
+            plan,
+            region_plans=(plan.region_plans[0], second_region),
+        )
+    elif mutation == "rank_stride":
+        plan = msgspec.structs.replace(
+            plan,
+            rank_stride_bytes=plan.rank_stride_bytes + 1,
+        )
+    elif mutation == "staging_size":
+        plan = msgspec.structs.replace(plan, staging_size=plan.staging_size + 1)
+    elif mutation == "digest":
+        plan = msgspec.structs.replace(plan, layout_digest="0" * 64)
+    else:
+        raise AssertionError(f"unhandled mutation {mutation}")
+
+    errors = validate_localization_plan(plan)
+    assert any(error_fragment in error for error in errors)
 
 
 @pytest.mark.cpu_test

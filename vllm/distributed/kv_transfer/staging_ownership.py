@@ -2,10 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Generation-scoped ownership for coalesced NIXL staging memory."""
 
+import math
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
+
+from vllm.distributed.kv_transfer.coalesced_layout import (
+    CoalescedTransferPlan,
+)
 
 
 class StagingSafetyError(RuntimeError):
@@ -62,12 +67,14 @@ class StagingHandleSlot:
     :ivar state: Current safety state.
     :ivar native_handle: Strong reference to the NIXL handle, if prepared.
     :ivar native_released: Whether a DONE handle was released successfully.
+    :ivar terminal_telemetry: Retained DONE-handle telemetry, if captured.
     """
 
     source_rank: int
     state: HandleState = HandleState.NEVER_POSTED
     native_handle: Any | None = None
     native_released: bool = False
+    terminal_telemetry: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -78,12 +85,14 @@ class StagingHandleSnapshot:
     :ivar state: Safety-relevant handle state.
     :ivar native_handle_present: Whether the owner retains the opaque handle.
     :ivar native_released: Whether DONE handle resource release succeeded.
+    :ivar terminal_telemetry_present: Whether terminal telemetry was captured.
     """
 
     source_rank: int
     state: HandleState
     native_handle_present: bool
     native_released: bool
+    terminal_telemetry_present: bool
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable handle record.
@@ -95,6 +104,7 @@ class StagingHandleSnapshot:
             "state": self.state.value,
             "native_handle_present": self.native_handle_present,
             "native_released": self.native_released,
+            "terminal_telemetry_present": self.terminal_telemetry_present,
         }
 
 
@@ -106,6 +116,7 @@ class StagingOwnershipSnapshot:
     :ivar owner_id: Unique logical owner identity.
     :ivar request_id: Decoder request identifier.
     :ivar remote_engine_id: Remote engine whose resources back the transfer.
+    :ivar layout_digest: Canonical transfer-layout identity.
     :ivar offset: Registration-relative byte offset.
     :ivar size: Reserved byte count.
     :ivar age_s: Monotonic age at snapshot time.
@@ -125,6 +136,7 @@ class StagingOwnershipSnapshot:
     owner_id: str
     request_id: str
     remote_engine_id: str | None
+    layout_digest: str
     offset: int
     size: int
     age_s: float
@@ -149,6 +161,7 @@ class StagingOwnershipSnapshot:
             "owner_id": self.owner_id,
             "request_id": self.request_id,
             "remote_engine_id": self.remote_engine_id,
+            "layout_digest": self.layout_digest,
             "offset": self.offset,
             "size": self.size,
             "age_s": self.age_s,
@@ -173,7 +186,8 @@ class CoalescedStagingPlan:
     :ivar request_id: Decoder request identifier.
     :ivar remote_engine_id: Remote engine whose native resources back the plan.
     :ivar slots: Native handle slots keyed by producer rank.
-    :ivar scatter: Transfer geometry retained for the plan lifetime.
+    :ivar layout: Immutable transfer and placement geometry.
+    :ivar layout_duration_seconds: Wall time spent building ``layout``.
     :ivar created_at: Monotonic creation time.
     :ivar warn_after_s: Age at which a structured warning becomes due.
     :ivar fail_after_s: Age at which an in-progress plan must fail closed.
@@ -192,7 +206,8 @@ class CoalescedStagingPlan:
     request_id: str
     remote_engine_id: str | None
     slots: dict[int, StagingHandleSlot]
-    scatter: dict[str, Any]
+    layout: CoalescedTransferPlan
+    layout_duration_seconds: float
     created_at: float
     warn_after_s: float
     fail_after_s: float
@@ -212,8 +227,8 @@ class CoalescedStagingPlan:
         lease: StagingLease,
         request_id: str,
         remote_engine_id: str | None,
-        source_ranks: tuple[int, ...],
-        scatter: dict[str, Any] | None = None,
+        layout: CoalescedTransferPlan,
+        layout_duration_seconds: float,
         created_at: float | None = None,
         warn_after_s: float = 1.0,
         fail_after_s: float = 10.0,
@@ -223,8 +238,8 @@ class CoalescedStagingPlan:
         :param lease: Exact registered staging allocation.
         :param request_id: Decoder request identifier.
         :param remote_engine_id: Remote engine owning the source registration.
-        :param source_ranks: Complete set of independently posted P ranks.
-        :param scatter: Transfer geometry retained for the plan lifetime.
+        :param layout: Immutable transfer and placement geometry.
+        :param layout_duration_seconds: Wall time spent building ``layout``.
         :param created_at: Monotonic creation time.
         :param warn_after_s: Structured-warning threshold.
         :param fail_after_s: Fail-stop threshold for permanent progress.
@@ -234,18 +249,21 @@ class CoalescedStagingPlan:
             raise ValueError("request_id must not be empty")
         if remote_engine_id is not None and len(remote_engine_id) == 0:
             raise ValueError("remote_engine_id must be non-empty when present")
-        if len(source_ranks) == 0 or len(set(source_ranks)) != len(source_ranks):
-            raise ValueError("source_ranks must be non-empty and unique")
-        if any(type(rank) is not int or rank < 0 for rank in source_ranks):
-            raise ValueError("source_ranks must contain non-negative integers")
+        if lease.size != layout.staging_size_bytes:
+            raise ValueError("staging lease size must match its transfer layout")
+        if layout.staging_size_bytes <= 0:
+            raise ValueError("staging transfer layout must contain bytes")
+        if not math.isfinite(layout_duration_seconds) or layout_duration_seconds < 0:
+            raise ValueError("layout duration must be finite and non-negative")
         if warn_after_s <= 0 or fail_after_s <= warn_after_s:
             raise ValueError("fail_after_s must be greater than warn_after_s")
         return cls(
             lease=lease,
             request_id=request_id,
             remote_engine_id=remote_engine_id,
-            slots={rank: StagingHandleSlot(rank) for rank in source_ranks},
-            scatter={} if scatter is None else dict(scatter),
+            slots={rank: StagingHandleSlot(rank) for rank in layout.source_ranks},
+            layout=layout,
+            layout_duration_seconds=layout_duration_seconds,
             created_at=time.monotonic() if created_at is None else created_at,
             warn_after_s=warn_after_s,
             fail_after_s=fail_after_s,
@@ -416,7 +434,54 @@ class CoalescedStagingPlan:
         """
         slot = self._slot(source_rank)
         self._require_state(slot, HandleState.DONE)
+        if slot.native_released:
+            raise StagingSafetyError(
+                f"rank {source_rank} native handle was already released"
+            )
         slot.native_released = True
+
+    def record_native_telemetry(self, source_rank: int, telemetry: Any) -> None:
+        """Retain terminal native telemetry before releasing its handle.
+
+        :param source_rank: Producer rank whose handle reached ``DONE``.
+        :param telemetry: Native terminal telemetry record.
+        """
+        slot = self._slot(source_rank)
+        self._require_state(slot, HandleState.DONE)
+        if slot.terminal_telemetry is not None:
+            raise StagingSafetyError(
+                f"rank {source_rank} terminal telemetry was already recorded"
+            )
+        if telemetry is None:
+            raise ValueError("terminal telemetry must not be None")
+        slot.terminal_telemetry = telemetry
+
+    @property
+    def native_telemetry(self) -> tuple[Any, ...]:
+        """Return complete terminal telemetry in canonical source-rank order.
+
+        :returns: One record per canonical source rank.
+        :raises StagingSafetyError: If any terminal record is absent.
+        """
+        telemetry = tuple(
+            self.slots[source_rank].terminal_telemetry
+            for source_rank in self.layout.source_ranks
+        )
+        if any(record is None for record in telemetry):
+            raise StagingSafetyError("coalesced native telemetry is incomplete")
+        return telemetry
+
+    @property
+    def logical_size_bytes(self) -> int:
+        """Return the exact unpruned cross-product transfer size.
+
+        :returns: Bytes represented by the unpruned group-by-region cross product.
+        """
+        position_count = sum(
+            len(group.remote_block_ids) for group in self.layout.groups
+        )
+        row_bytes = sum(region.ownership.row_bytes for region in self.layout.regions)
+        return len(self.layout.source_ranks) * position_count * row_bytes
 
     def warning_due(self, now: float) -> bool:
         """Return whether the one-shot structured warning is due.
@@ -456,7 +521,12 @@ class CoalescedStagingPlan:
         return (
             self.posting_sealed
             and self.operation_failed is False
-            and all(slot.state is HandleState.DONE for slot in self.slots.values())
+            and all(
+                slot.state is HandleState.DONE
+                and slot.native_released
+                and slot.terminal_telemetry is not None
+                for slot in self.slots.values()
+            )
         )
 
     @property
@@ -511,6 +581,7 @@ class CoalescedStagingPlan:
             owner_id=self.lease.owner_id,
             request_id=self.request_id,
             remote_engine_id=self.remote_engine_id,
+            layout_digest=self.layout.digest,
             offset=self.lease.offset,
             size=self.lease.size,
             age_s=observed_at - self.created_at,
@@ -520,6 +591,7 @@ class CoalescedStagingPlan:
                     state=slot.state,
                     native_handle_present=slot.native_handle is not None,
                     native_released=slot.native_released,
+                    terminal_telemetry_present=(slot.terminal_telemetry is not None),
                 )
                 for rank, slot in sorted(self.slots.items())
             ),
@@ -582,10 +654,9 @@ class StagingRangeAllocator:
         *,
         owner_id: str,
         request_id: str,
-        size: int,
-        source_ranks: tuple[int, ...],
+        layout: CoalescedTransferPlan,
+        layout_duration_seconds: float,
         remote_engine_id: str | None = None,
-        scatter: dict[str, Any] | None = None,
         offset: int | None = None,
         generation: int | None = None,
         created_at: float | None = None,
@@ -596,10 +667,9 @@ class StagingRangeAllocator:
 
         :param owner_id: Unique logical plan identity.
         :param request_id: Decoder request identifier.
-        :param size: Required byte count.
-        :param source_ranks: Complete independently posted rank set.
+        :param layout: Immutable transfer layout and required byte count.
+        :param layout_duration_seconds: Wall time spent building ``layout``.
         :param remote_engine_id: Remote engine owning the source registration.
-        :param scatter: Transfer geometry retained for the plan lifetime.
         :param offset: Exact offset for deterministic rigs, or first fit.
         :param generation: Exact generation for deterministic rigs, or monotonic.
         :param created_at: Monotonic plan creation time.
@@ -609,6 +679,7 @@ class StagingRangeAllocator:
         """
         if len(owner_id) == 0:
             raise ValueError("owner_id must not be empty")
+        size = layout.staging_size_bytes
         if size <= 0 or size > self.capacity:
             raise ValueError("staging plan size lies outside allocator capacity")
         if any(plan.lease.owner_id == owner_id for plan in self.active.values()):
@@ -632,8 +703,8 @@ class StagingRangeAllocator:
             lease=lease,
             request_id=request_id,
             remote_engine_id=remote_engine_id,
-            source_ranks=source_ranks,
-            scatter=scatter,
+            layout=layout,
+            layout_duration_seconds=layout_duration_seconds,
             created_at=created_at,
             warn_after_s=warn_after_s,
             fail_after_s=fail_after_s,

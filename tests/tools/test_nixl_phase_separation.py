@@ -146,7 +146,7 @@ def test_start_load_brackets_every_possible_transfer_post() -> None:
     begin_lines = _attribute_call_lines(method, "_begin_transfer_phase")
     drain_lines = _attribute_call_lines(method, "_drain_transfer_phase")
     read_lines = _attribute_call_lines(method, "_read_blocks_for_req")
-    heartbeat_lines = _attribute_call_lines(method, "_send_heartbeats")
+    heartbeat_lines = _attribute_call_lines(method, "_service_heartbeats")
 
     assert len(begin_lines) == 1
     assert len(drain_lines) == 1
@@ -160,7 +160,7 @@ def test_native_posts_are_guarded_before_entering_nixl() -> None:
     coalesced = _production_method_node(
         BASE_WORKER_PATH,
         "NixlBaseConnectorWorker",
-        "_initialize_and_post_coalesced",
+        "_post_prepared_coalesced",
     )
     stock = _production_method_node(
         PULL_WORKER_PATH,
@@ -242,7 +242,10 @@ def test_begin_transfer_phase_resets_one_owned_epoch() -> None:
 
 def test_transfer_post_guard_rejects_compute_phase() -> None:
     """No native writer may start after the compute boundary opens."""
-    worker_type = _production_worker_methods("_assert_transfer_post_allowed")
+    worker_type = _production_worker_methods(
+        "_assert_transfer_phase_active",
+        "_assert_transfer_post_allowed",
+    )
     worker = worker_type()
     worker._phase_separate_transfer_decode = True
     worker._transfer_phase_active = False
@@ -264,7 +267,10 @@ def test_transfer_post_guard_allows_only_valid_boundaries(
     coalesced: bool,
 ) -> None:
     """Disabled mode and an active transfer phase preserve valid posts."""
-    worker_type = _production_worker_methods("_assert_transfer_post_allowed")
+    worker_type = _production_worker_methods(
+        "_assert_transfer_phase_active",
+        "_assert_transfer_post_allowed",
+    )
     worker = worker_type()
     worker._phase_separate_transfer_decode = enabled
     worker._transfer_phase_active = active
@@ -279,7 +285,10 @@ def test_transfer_post_guard_allows_only_valid_boundaries(
 
 def test_transfer_post_guard_rejects_stock_path() -> None:
     """Separated mode must reject posts without staging-plan ownership."""
-    worker_type = _production_worker_methods("_assert_transfer_post_allowed")
+    worker_type = _production_worker_methods(
+        "_assert_transfer_phase_active",
+        "_assert_transfer_post_allowed",
+    )
     worker = worker_type()
     worker._phase_separate_transfer_decode = True
     worker._transfer_phase_active = True
@@ -289,6 +298,21 @@ def test_transfer_post_guard_rejects_stock_path() -> None:
         worker._assert_transfer_post_allowed(coalesced=False)
 
     assert worker._transfer_phase_violation_count == 1
+
+
+def test_transfer_phase_preflight_does_not_count_a_native_handle() -> None:
+    """All-rank preflight validates the boundary without inflating telemetry."""
+    worker_type = _production_worker_methods("_assert_transfer_phase_active")
+    worker = worker_type()
+    worker._phase_separate_transfer_decode = True
+    worker._transfer_phase_active = True
+    worker._transfer_phase_violation_count = 0
+    worker._transfer_phase_handle_count = 0
+
+    worker._assert_transfer_phase_active(coalesced=True)
+
+    assert worker._transfer_phase_violation_count == 0
+    assert worker._transfer_phase_handle_count == 0
 
 
 def test_drain_collects_proc_to_done_before_compute_boundary() -> None:
@@ -517,6 +541,7 @@ def test_disabled_get_finished_preserves_pending_service() -> None:
     worker = worker_type()
     worker._phase_separate_transfer_decode = False
     worker._phase_separation_instrumented = False
+    worker._raise_if_handshake_fail_stopped = MagicMock()
     worker._get_finished = MagicMock(return_value=({"sent"}, {"received"}))
 
     assert worker.get_finished() == ({"sent"}, {"received"})
@@ -529,6 +554,7 @@ def test_separated_get_finished_publishes_deferred_completions_once() -> None:
     worker = worker_type()
     worker._phase_separate_transfer_decode = True
     worker._phase_separation_instrumented = False
+    worker._raise_if_handshake_fail_stopped = MagicMock()
     worker._transfer_phase_active = False
     worker._deferred_phase_sending = {"sent-during-drain"}
     worker._deferred_phase_recving = {"received-during-drain"}
@@ -576,6 +602,7 @@ def test_control_snapshot_is_buffered_until_after_model_execution() -> None:
     )
     worker = worker_type()
     worker._phase_separation_instrumented = True
+    worker._raise_if_handshake_fail_stopped = MagicMock()
     worker._phase_separate_transfer_decode = False
     worker._transfer_phase_records = []
     worker._coalesce_plans = {

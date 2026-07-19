@@ -10,11 +10,18 @@ from typing import BinaryIO, TypeAlias
 
 import msgspec
 
+from vllm.distributed.kv_transfer.coalesced_layout import (
+    CoalescedTransferPlan,
+    GroupTransferRoster,
+    RegionOwnership,
+    build_coalesced_transfer_plan,
+)
 from vllm.distributed.kv_transfer.integrity import (
     IntegrityIdentity,
     IntegrityPayloadKind,
     IntegrityStage,
 )
+from vllm.distributed.kv_transfer.nixl_contracts import NixlRegionDescriptor
 from vllm.distributed.kv_transfer.nixl_localization import (
     LOCALIZATION_ARTIFACT_MAGIC,
     LOCALIZATION_FRAME_PERSON,
@@ -27,7 +34,8 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlEventRecord,
     NixlPlanPosition,
     NixlPlanRecord,
-    NixlRegionDescriptor,
+    NixlPlanRun,
+    NixlRegionPlan,
     NixlSessionRecord,
     NixlSourceContract,
     NixlSourceManifest,
@@ -39,6 +47,7 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     localization_producer_target,
     localization_request_id_base,
     localization_request_target,
+    localization_stage_barrier,
     select_source_manifest,
     source_contract_from_manifest,
     validate_capture,
@@ -459,6 +468,7 @@ def _decoder_request_signature(plan: NixlPlanRecord) -> tuple[object, ...]:
     :returns: Semantic destination geometry and source-position selection.
     """
     return (
+        plan.source_tp_size,
         plan.destination_group_planes,
         plan.destination_group_token_capacities,
         tuple(_region_semantic_signature(region) for region in plan.local_regions),
@@ -468,16 +478,24 @@ def _decoder_request_signature(plan: NixlPlanRecord) -> tuple[object, ...]:
         tuple(len(group) for group in plan.selected_local_groups),
         tuple(
             (
-                position.group_index,
-                position.source_position,
-                position.remote_block_id,
-                position.valid_token_extent,
-                position.group_token_capacity,
-                position.plane_index,
+                region_plan.region_index,
+                region_plan.offset_within_rank,
+                tuple(
+                    (
+                        position.group_index,
+                        position.source_position,
+                        position.remote_block_id,
+                        position.valid_token_extent,
+                        position.group_token_capacity,
+                        position.destination_half,
+                    )
+                    for position in region_plan.positions
+                ),
+                region_plan.runs,
             )
-            for position in plan.transfer_order
+            for region_plan in plan.region_plans
         ),
-        plan.runs,
+        plan.rank_stride_bytes,
     )
 
 
@@ -511,6 +529,8 @@ def _plan_topology_errors(
     decoder_kv_heads = engine_total_num_kv_heads.get(plan.observer_engine_id)
     if source_world_size is None or decoder_world_size is None:
         return ("plan topology has no complete producer/decoder sessions",)
+    if plan.source_tp_size != source_world_size:
+        return ("plan source TP size differs from producer session world size",)
     if source_kv_heads is None or decoder_kv_heads is None:
         return ("plan topology has no producer/decoder KV-head contract",)
     if source_kv_heads != decoder_kv_heads:
@@ -942,74 +962,163 @@ def _artifact_chronology_errors(
     return tuple(errors)
 
 
-def _expected_plan_positions(
+def _coalesced_plan_inputs(
     plan: NixlPlanRecord,
-) -> tuple[dict[tuple[int, int, int], tuple[int, int]], tuple[str, ...]]:
-    """Reconstruct canonical mapping before transfer-order sorting.
+) -> tuple[
+    tuple[GroupTransferRoster, ...],
+    tuple[RegionOwnership, ...],
+    tuple[str, ...],
+]:
+    """Reconstruct canonical builder inputs from independent artifact facts.
 
     :param plan: Decoder transfer plan.
-    :returns: Source tuple to local block and destination half, plus errors.
+    :returns: Group rosters, region ownership, and structural errors.
     """
-    expected: dict[tuple[int, int, int], tuple[int, int]] = {}
     errors: list[str] = []
     if len(plan.source_contracts) == 0:
-        return {}, ("plan has no source contracts",)
-    raw_remote_groups = plan.source_contracts[0].block_ids
-    group_count = len(raw_remote_groups)
+        return (), (), ("plan has no source contracts",)
+    reference = plan.source_contracts[0]
+    group_count = len(reference.block_ids)
     if (
         len(plan.selected_remote_groups) != group_count
         or len(plan.selected_local_groups) != group_count
         or len(plan.untrimmed_local_groups) != group_count
         or len(plan.destination_group_planes) != group_count
+        or len(plan.destination_group_token_capacities) != group_count
     ):
-        return {}, ("plan group cardinality mismatch",)
+        return (), (), ("plan group cardinality mismatch",)
+
     skipped_groups = set(plan.skipped_groups)
+    groups: list[GroupTransferRoster] = []
     for group_index in range(group_count):
-        raw = list(raw_remote_groups[group_index])
-        untrimmed_local = list(plan.untrimmed_local_groups[group_index])
-        remote = list(plan.selected_remote_groups[group_index])
-        local = list(plan.selected_local_groups[group_index])
+        raw = reference.block_ids[group_index]
+        untrimmed_local = plan.untrimmed_local_groups[group_index]
+        remote = plan.selected_remote_groups[group_index]
+        local = plan.selected_local_groups[group_index]
+        planes = plan.destination_group_planes[group_index]
         if group_index in skipped_groups:
             if len(remote) > 0 or len(local) > 0:
                 errors.append(
                     f"plan group {group_index} is skipped but has selected blocks"
                 )
-            continue
-        planes = plan.destination_group_planes[group_index]
-        if planes not in (1, 2):
-            errors.append(f"plan group {group_index} has invalid plane contract")
-            continue
-        if local != untrimmed_local:
-            errors.append(f"plan group {group_index} changed its decoder allocation")
-        factor = 2 if planes == 1 else 1
-        expected_remote_count = min(len(raw), factor * len(untrimmed_local))
-        expected_remote = (
-            raw[-expected_remote_count:] if expected_remote_count > 0 else []
-        )
-        if remote != expected_remote:
-            errors.append(
-                f"plan group {group_index} remote selection is not the required suffix"
+        else:
+            if local != untrimmed_local:
+                errors.append(
+                    f"plan group {group_index} changed its decoder allocation"
+                )
+            factor = 2 if planes == 1 else 1
+            expected_remote_count = min(len(raw), factor * len(untrimmed_local))
+            expected_remote = (
+                raw[-expected_remote_count:] if expected_remote_count > 0 else ()
             )
-        source_start = len(raw) - len(remote)
-        if planes == 2:
-            if len(local) != len(remote):
-                errors.append(f"plan group {group_index} dual-plane length mismatch")
-                continue
-            local_for_position = local
-            halves = [-1] * len(remote)
-        elif planes == 1:
-            if len(local) != (len(remote) + 1) // 2:
-                errors.append(f"plan group {group_index} single-plane length mismatch")
-                continue
-            local_for_position = [local[index // 2] for index in range(len(remote))]
-            halves = [(source_start + index) % 2 for index in range(len(remote))]
-        for index, block_id in enumerate(remote):
-            key = (group_index, source_start + index, block_id)
-            if key in expected:
-                errors.append(f"plan contains duplicate canonical source tuple {key}")
-                continue
-            expected[key] = (local_for_position[index], halves[index])
-    return expected, tuple(errors)
+            if remote != expected_remote:
+                errors.append(
+                    f"plan group {group_index} remote selection is not the "
+                    "required suffix"
+                )
+        groups.append(
+            GroupTransferRoster(
+                group_index=group_index,
+                source_position_start=len(raw) - len(remote),
+                destination_plane_count=planes,
+                local_block_ids=local,
+                remote_block_ids=remote,
+            )
+        )
+
+    if len(plan.local_regions) != len(reference.regions):
+        errors.append("plan local region cardinality mismatch")
+        return tuple(groups), (), tuple(errors)
+    regions: list[RegionOwnership] = []
+    for region_index, (source_region, local_region) in enumerate(
+        zip(reference.regions, plan.local_regions, strict=True)
+    ):
+        if (
+            source_region.semantic_name != local_region.semantic_name
+            or source_region.group_indices != local_region.group_indices
+            or source_region.group_semantic_names != local_region.group_semantic_names
+            or source_region.dtype != local_region.dtype
+            or source_region.element_size_bytes != local_region.element_size_bytes
+            or source_region.layout != local_region.layout
+        ):
+            errors.append("plan local/source semantic region mismatch")
+        row_counts: list[int] = []
+        for role, region in (
+            ("source", source_region),
+            ("local", local_region),
+        ):
+            if (
+                len(region.shape) == 0
+                or len(region.shape) != len(region.strides)
+                or region.row_bytes <= 0
+                or region.registered_bytes <= 0
+                or region.registered_bytes != region.shape[0] * region.row_bytes
+                or region.strides[0] * region.element_size_bytes != region.row_bytes
+            ):
+                errors.append(f"plan {role} region is not row canonical")
+                row_counts.append(0)
+            else:
+                row_counts.append(region.registered_bytes // region.row_bytes)
+        if 0 in row_counts:
+            continue
+        expected_local_row_bytes = len(plan.source_contracts) * source_region.row_bytes
+        if local_region.row_bytes != expected_local_row_bytes:
+            errors.append(
+                f"plan local region {region_index} row length differs from the "
+                "participating source-rank geometry"
+            )
+        regions.append(
+            RegionOwnership(
+                region_index=region_index,
+                group_indices=source_region.group_indices,
+                source_row_count=row_counts[0],
+                destination_row_count=row_counts[1],
+                row_bytes=source_region.row_bytes,
+            )
+        )
+    return tuple(groups), tuple(regions), tuple(errors)
+
+
+def _artifact_region_plans(
+    plan: NixlPlanRecord,
+    rebuilt: CoalescedTransferPlan,
+) -> tuple[NixlRegionPlan, ...]:
+    """Convert a rebuilt canonical plan into its artifact representation.
+
+    :param plan: Decoder transfer plan carrying token semantics.
+    :param rebuilt: Independently rebuilt transport layout.
+    :returns: Exact typed region plans expected in the artifact.
+    """
+    reference = plan.source_contracts[0]
+    return tuple(
+        NixlRegionPlan(
+            region_index=region.ownership.region_index,
+            offset_within_rank=region.offset_within_rank,
+            positions=tuple(
+                NixlPlanPosition(
+                    group_index=position.group_index,
+                    source_position=position.source_position,
+                    remote_block_id=position.remote_block_id,
+                    valid_token_extent=reference.valid_token_extent,
+                    group_token_capacity=(
+                        reference.group_token_capacities[position.group_index]
+                    ),
+                    local_block_id=position.local_block_id,
+                    destination_half=position.destination_half,
+                )
+                for position in region.positions
+            ),
+            runs=tuple(
+                NixlPlanRun(
+                    remote_block_id=run.remote_block_id,
+                    position_count=run.position_count,
+                    position_start=run.position_start,
+                )
+                for run in region.runs
+            ),
+        )
+        for region in rebuilt.regions
+    )
 
 
 def _plan_errors(
@@ -1030,9 +1139,15 @@ def _plan_errors(
     if len(plan.rank_slots) != rank_count:
         errors.append("plan source-rank cardinality mismatch")
         return tuple(errors)
+    source_contracts_valid = True
     for index, contract in enumerate(plan.source_contracts):
-        for contract_error in validate_source_contract_structure(contract):
+        contract_errors = validate_source_contract_structure(contract)
+        if len(contract_errors) > 0:
+            source_contracts_valid = False
+        for contract_error in contract_errors:
             errors.append(f"plan source contract {index}: {contract_error}")
+    if source_contracts_valid is False:
+        return tuple(errors)
 
     source_ranks = tuple(contract.source_rank for contract in plan.source_contracts)
     if len(set(source_ranks)) != rank_count:
@@ -1058,8 +1173,6 @@ def _plan_errors(
         errors.append("plan source contract has no registered regions")
     if not any(len(group) > 0 for group in reference.block_ids):
         errors.append("plan source contract has no physical source blocks")
-    if len(plan.transfer_order) == 0:
-        errors.append("physical transfer plan has no transfer positions")
     reference_region_semantics = tuple(
         (
             region.semantic_name,
@@ -1078,11 +1191,14 @@ def _plan_errors(
     for source_contract in plan.source_contracts[1:]:
         if (
             source_contract.run_id != reference.run_id
+            or source_contract.fingerprint_algorithm
+            is not reference.fingerprint_algorithm
             or source_contract.transport_arm != reference.transport_arm
             or source_contract.producer_engine_id != reference.producer_engine_id
             or source_contract.producer_request_id != reference.producer_request_id
             or source_contract.offer_generation != reference.offer_generation
             or source_contract.iteration != reference.iteration
+            or source_contract.expected_consumers != reference.expected_consumers
             or source_contract.region_lengths != reference.region_lengths
             or source_contract.source_group_planes != reference.source_group_planes
             or source_contract.valid_token_extent != reference.valid_token_extent
@@ -1114,97 +1230,66 @@ def _plan_errors(
         errors.append("plan destination/source token capacities differ")
     if len(plan.destination_group_planes) != len(reference.group_token_capacities):
         errors.append("plan destination plane-contract cardinality mismatch")
-
-    expected_positions, mapping_errors = _expected_plan_positions(plan)
-    errors.extend(mapping_errors)
-    actual_positions: dict[tuple[int, int, int], NixlPlanPosition] = {}
-    for position in plan.transfer_order:
-        key = (
-            position.group_index,
-            position.source_position,
-            position.remote_block_id,
-        )
-        if key in actual_positions:
-            errors.append(f"plan transfer order duplicates source tuple {key}")
-            continue
-        actual_positions[key] = position
-    if set(actual_positions) != set(expected_positions):
-        errors.append("plan transfer order differs from selected group rosters")
-    for key in set(actual_positions) & set(expected_positions):
-        position = actual_positions[key]
-        if (position.local_block_id, position.plane_index) != expected_positions[key]:
-            errors.append(f"plan destination mapping mismatch {key}")
-        group_index = position.group_index
-        if group_index < 0 or group_index >= len(reference.group_token_capacities):
-            errors.append(f"plan transfer position has invalid group {key}")
-        elif (
-            position.valid_token_extent != reference.valid_token_extent
-            or position.group_token_capacity
-            != reference.group_token_capacities[group_index]
-        ):
-            errors.append(f"plan token contract mismatch {key}")
-
-    remote_order = [position.remote_block_id for position in plan.transfer_order]
-    if remote_order != sorted(remote_order):
-        errors.append("plan transfer order is not sorted by remote block id")
-    expected_runs: list[tuple[int, int, int]] = []
-    if len(remote_order) > 0:
-        run_start = 0
-        for index in range(1, len(remote_order) + 1):
-            if (
-                index == len(remote_order)
-                or remote_order[index] != remote_order[index - 1] + 1
-            ):
-                expected_runs.append(
-                    (remote_order[run_start], index - run_start, run_start)
-                )
-                run_start = index
-    if tuple(expected_runs) != plan.runs:
-        errors.append("plan coalesced runs do not match transfer order")
-
-    expected_offsets: list[int] = []
-    expected_size = 0
-    position_count = len(plan.transfer_order)
-    for row_bytes in reference.region_lengths:
-        expected_offsets.append(expected_size)
-        expected_size += position_count * rank_count * row_bytes
-    if tuple(expected_offsets) != plan.region_offsets:
-        errors.append("plan region offsets do not match transfer geometry")
-    if expected_size != plan.staging_size:
-        errors.append("plan staging size does not match transfer geometry")
+    if plan.source_tp_size <= 0:
+        errors.append("plan source TP size is not positive")
+    if any(
+        source_rank < 0 or source_rank >= plan.source_tp_size
+        for source_rank in source_ranks
+    ):
+        errors.append("plan source rank is outside source_tp_size")
     if plan.staging_offset < 0:
         errors.append("plan staging offset is negative")
-    if len(plan.local_regions) != len(reference.region_lengths):
-        errors.append("plan local region cardinality mismatch")
-    else:
-        for source_region, local_region in zip(
-            reference.regions,
-            plan.local_regions,
-            strict=True,
-        ):
-            if (
-                source_region.semantic_name != local_region.semantic_name
-                or source_region.group_indices != local_region.group_indices
-                or source_region.group_semantic_names
-                != local_region.group_semantic_names
-                or source_region.dtype != local_region.dtype
-                or source_region.element_size_bytes != local_region.element_size_bytes
-                or source_region.layout != local_region.layout
-            ):
-                errors.append("plan local/source semantic region mismatch")
-            if local_region.row_bytes != rank_count * source_region.row_bytes:
-                errors.append("plan local/source region row geometry mismatch")
-            for role, region in (
-                ("source", source_region),
-                ("local", local_region),
-            ):
-                if (
-                    len(region.shape) == 0
-                    or len(region.shape) != len(region.strides)
-                    or region.registered_bytes != region.shape[0] * region.row_bytes
-                    or region.strides[0] * region.element_size_bytes != region.row_bytes
+
+    groups, regions, input_errors = _coalesced_plan_inputs(plan)
+    errors.extend(input_errors)
+    if len(groups) > 0 and len(regions) == len(reference.regions):
+        try:
+            rebuilt = build_coalesced_transfer_plan(
+                source_tp_size=plan.source_tp_size,
+                source_ranks=source_ranks,
+                rank_slots=plan.rank_slots,
+                groups=groups,
+                regions=regions,
+            )
+        except ValueError as error:
+            errors.append(f"plan cannot reconstruct canonical layout: {error}")
+        else:
+            expected_region_plans = _artifact_region_plans(plan, rebuilt)
+            if len(plan.region_plans) != len(expected_region_plans):
+                errors.append("plan region-plan cardinality differs from ownership")
+            else:
+                for expected, actual in zip(
+                    expected_region_plans,
+                    plan.region_plans,
+                    strict=True,
                 ):
-                    errors.append(f"plan {role} region is not row canonical")
+                    if actual.region_index != expected.region_index:
+                        errors.append("plan region indices are not canonical")
+                    if actual.offset_within_rank != expected.offset_within_rank:
+                        errors.append(
+                            f"plan region {expected.region_index} packed offset "
+                            "differs from canonical rank slab"
+                        )
+                    if actual.positions != expected.positions:
+                        errors.append(
+                            f"plan region {expected.region_index} positions differ "
+                            "from ownership-filtered canonical layout"
+                        )
+                    if actual.runs != expected.runs:
+                        errors.append(
+                            f"plan region {expected.region_index} runs differ from "
+                            "its canonical positions"
+                        )
+            if plan.rank_stride_bytes != rebuilt.rank_stride_bytes:
+                errors.append("plan rank stride differs from packed region geometry")
+            if plan.staging_size != rebuilt.staging_size_bytes:
+                errors.append(
+                    "plan staging size differs from canonical rank-major size"
+                )
+            if plan.layout_digest != rebuilt.digest:
+                errors.append("plan layout digest differs from reconstructed layout")
+            if sum(len(region.positions) for region in rebuilt.regions) == 0:
+                errors.append("physical transfer plan has no transfer positions")
     return tuple(errors)
 
 
@@ -1244,10 +1329,9 @@ def _capture_contract(
     copied_bytes = 0
     hashed_bytes = 0
     for region_index, region in enumerate(source_contract.regions):
-        for position in plan.transfer_order:
+        region_plan = plan.region_plans[region_index]
+        for position in region_plan.positions:
             group_index = position.group_index
-            if group_index not in region.group_indices:
-                continue
             if stage in (
                 IntegrityStage.STAGING_RAW,
                 IntegrityStage.STAGING_FENCED_CONTROL,
@@ -1290,7 +1374,7 @@ def _capture_contract(
                 mapping[key] = (
                     position.local_block_id,
                     rank_slot,
-                    position.plane_index,
+                    position.destination_half,
                 )
                 hashed_bytes += (
                     region.row_bytes
@@ -1363,20 +1447,7 @@ def _capture_errors(
         errors.append("capture hashed-byte count differs from semantic contract")
     if capture.observer is False:
         errors.append("capture is not labeled as an observer")
-    expected_barriers = {
-        IntegrityStage.STAGING_RAW: "nixl_done_without_added_device_wide_sync",
-        IntegrityStage.STAGING_FENCED_CONTROL: (
-            "device_synchronize_observer_control_not_gdr_flush"
-        ),
-        IntegrityStage.STAGING_POST_SCATTER: (
-            "post_scatter_device_synchronize_before_staging_release"
-        ),
-        IntegrityStage.DESTINATION: (
-            "post_scatter_device_synchronize_before_publication"
-        ),
-        IntegrityStage.PRE_READ: ("after_transfer_phase_drain_before_model_forward"),
-    }
-    if capture.barrier != expected_barriers[capture.stage]:
+    if capture.barrier != localization_stage_barrier(capture.stage):
         errors.append("capture barrier label differs from stage contract")
     return tuple(errors)
 
@@ -1398,6 +1469,7 @@ def _first_divergence(
     :param compare_digests: Whether the arm carries content evidence.
     :returns: Earliest divergence, or ``None`` when all present stages match.
     """
+    ordered_edges: tuple[tuple[IntegrityStage, str], ...]
     if (
         source_contract.fingerprint_algorithm
         is LocalizationFingerprintAlgorithm.POSITION_WEIGHTED_WORDS_256_V1
@@ -1589,15 +1661,15 @@ def validate_localization_artifacts(
                 else:
                     source_post_by_lineage[lineage] = manifest
             elif isinstance(record, NixlPlanRecord):
-                key: ObserverKey = (
+                plan_key: ObserverKey = (
                     record.child_request_id,
                     record.observer_engine_id,
                     record.observer_rank,
                 )
-                if key in plans:
-                    errors.append(f"duplicate transfer plan {key}")
+                if plan_key in plans:
+                    errors.append(f"duplicate transfer plan {plan_key}")
                 else:
-                    plans[key] = record
+                    plans[plan_key] = record
             elif isinstance(record, NixlCaptureRecord):
                 if record.child_request_id is None:
                     errors.append("decoder capture has no child request id")
@@ -1618,28 +1690,28 @@ def validate_localization_artifacts(
                     record.observer_engine_id,
                     record.observer_rank,
                 )
-                key: CaptureKey = (
+                capture_key: CaptureKey = (
                     observer_key,
                     _capture_lineage(record),
                     record.stage,
                 )
-                if key in captures:
-                    errors.append(f"duplicate decoder capture {key}")
+                if capture_key in captures:
+                    errors.append(f"duplicate decoder capture {capture_key}")
                 else:
-                    captures[key] = record
+                    captures[capture_key] = record
             else:
                 if record.child_request_id is None:
                     errors.append("localization event has no child request id")
                     continue
-                key = (
+                event_key: ObserverKey = (
                     record.child_request_id,
                     record.observer_engine_id,
                     record.observer_rank,
                 )
-                if key in events:
-                    errors.append(f"duplicate child terminal event {key}")
+                if event_key in events:
+                    errors.append(f"duplicate child terminal event {event_key}")
                 else:
-                    events[key] = record
+                    events[event_key] = record
 
     for engine_id, world_size in engine_world_sizes.items():
         if world_size <= 0:
@@ -1711,15 +1783,15 @@ def validate_localization_artifacts(
                 f"plan {observer_key} terminal source differs from its contract"
             )
             continue
-        plan_verified = completed
+        plan_verified: bool = True
         for source_contract in plan.source_contracts:
             lineage = _contract_lineage(source_contract)
-            manifest = source_post_by_lineage.get(lineage)
-            if manifest is None:
+            source_manifest = source_post_by_lineage.get(lineage)
+            if source_manifest is None:
                 errors.append(f"plan {observer_key} has no SOURCE_POST for {lineage}")
                 plan_verified = False
                 continue
-            if source_contract_from_manifest(manifest) != source_contract:
+            if source_contract_from_manifest(source_manifest) != source_contract:
                 errors.append(
                     f"plan {observer_key} SOURCE_POST contract differs for {lineage}"
                 )
@@ -1728,7 +1800,7 @@ def validate_localization_artifacts(
             divergence = _first_divergence(
                 plan,
                 source_contract,
-                manifest,
+                source_manifest,
                 captures,
                 compare_digests=reference_session.mode is not LocalizationMode.SHAM,
             )
@@ -1737,27 +1809,34 @@ def validate_localization_artifacts(
                 plan_verified = False
             if completed:
                 for stage in capture_stages:
-                    capture_key: CaptureKey = (observer_key, lineage, stage)
-                    if capture_key not in captures:
+                    required_capture_key: CaptureKey = (
+                        observer_key,
+                        lineage,
+                        stage,
+                    )
+                    if required_capture_key not in captures:
                         errors.append(
-                            f"completed pull is missing capture {capture_key}"
+                            f"completed pull is missing capture {required_capture_key}"
                         )
                         plan_verified = False
         if plan_verified and reference_session.mode is not LocalizationMode.SHAM:
             verified_observers.add(observer_key)
 
-    for capture_key in captures:
-        observer_key, lineage, _ = capture_key
-        plan = plans.get(observer_key)
-        if plan is None:
-            errors.append(f"decoder capture has no canonical plan {capture_key}")
+    for indexed_capture_key in captures:
+        observer_key, lineage, _ = indexed_capture_key
+        capture_plan = plans.get(observer_key)
+        if capture_plan is None:
+            errors.append(
+                f"decoder capture has no canonical plan {indexed_capture_key}"
+            )
             continue
         plan_lineages = {
-            _contract_lineage(contract) for contract in plan.source_contracts
+            _contract_lineage(contract) for contract in capture_plan.source_contracts
         }
         if lineage not in plan_lineages:
             errors.append(
-                f"decoder capture source lineage is absent from its plan {capture_key}"
+                "decoder capture source lineage is absent from its plan "
+                f"{indexed_capture_key}"
             )
 
     referenced_source_lineages = {

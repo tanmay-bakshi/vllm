@@ -1,51 +1,32 @@
 """Pure transfer-plan construction for the NIXL transport micro-rig."""
 
 import json
+import math
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from tools.gemma4_pd.nixl_micro_rig.config import (
     ConfigError,
+    GroupConfig,
     RigConfig,
     ScenarioConfig,
 )
+from tools.gemma4_pd.nixl_micro_rig.handshake import (
+    STATIC_SEMANTIC_EVIDENCE_SCOPE,
+)
+from vllm.distributed.kv_transfer.coalesced_layout import (
+    CoalescedTransferPlan,
+    GroupTransferRoster,
+    RegionOwnership,
+    RemoteBlockRun,
+    build_coalesced_transfer_plan,
+)
 
 
-@dataclass(frozen=True)
-class BlockRun:
-    """Describe one maximal consecutive source block-ID run.
-
-    :ivar start_block: First source block ID.
-    :ivar block_count: Consecutive block count.
-    :ivar position_offset: First stable-sorted transfer position.
-    """
-
-    start_block: int
-    block_count: int
-    position_offset: int
-
-
-@dataclass(frozen=True)
-class GroupPairing:
-    """Preserve one original remote/local pair through source sorting.
-
-    :ivar group_index: KV-cache group that owns the pair.
-    :ivar group_position: Position ordinal after group-wise prefix trimming.
-    :ivar remote_block_id: P physical source block.
-    :ivar local_block_id: D physical destination block.
-    :ivar source_position: Position in the original flattened group roster.
-    """
-
-    group_index: int
-    group_position: int
-    remote_block_id: int
-    local_block_id: int
-    source_position: int
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReplayGroup:
-    """Captured group-wise block-ID pairing before prefix trimming.
+    """Captured group-wise block-ID roster before prefix trimming.
 
     :ivar group_index: KV-cache group index.
     :ivar remote_block_ids: P physical IDs before suffix trimming.
@@ -57,60 +38,64 @@ class ReplayGroup:
     local_block_ids: tuple[int, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TransferPlan:
-    """Describe one vLLM-compatible coalesced pull geometry.
+    """Rig metadata around the production canonical transport plan.
 
     :ivar scenario_name: Source scenario identity.
-    :ivar original_pairings: Post-trim pairs in group-flattened order.
-    :ivar sorted_pairings: Same pairs after stable remote-ID sorting.
-    :ivar runs: Maximal consecutive source-ID runs.
-    :ivar region_offsets: Byte offsets of regions within one staged plan.
-    :ivar staging_bytes: Exact bytes occupied by one request plan.
+    :ivar transport: Canonical rank-major, region-owned transport plan.
     :ivar source_registration_bytes_per_rank: Registered source bytes per P rank.
     :ivar destination_registration_bytes: Registered D destination bytes.
-    :ivar descriptors_per_handle: Raw descriptors in each P-rank NIXL handle.
-    :ivar rank_count: Independent P agents and TP ranks.
-    :ivar destination_block_count: Physical rows in every D region.
+    :ivar layout_duration_seconds: Wall time spent building ``transport``.
     :ivar replay_manifest: Captured plan source, absent for synthetic geometry.
     """
 
     scenario_name: str
-    original_pairings: tuple[GroupPairing, ...]
-    sorted_pairings: tuple[GroupPairing, ...]
-    runs: tuple[BlockRun, ...]
-    region_offsets: tuple[int, ...]
-    staging_bytes: int
+    transport: CoalescedTransferPlan
     source_registration_bytes_per_rank: int
     destination_registration_bytes: int
-    descriptors_per_handle: int
-    rank_count: int
-    destination_block_count: int
+    layout_duration_seconds: float
     replay_manifest: str | None
 
     @property
-    def position_count(self) -> int:
-        """Return the flattened post-trim position count.
+    def logical_position_count(self) -> int:
+        """Return selected positions across the group-local rosters.
 
-        :returns: Number of staged source rows per rank and region.
+        :returns: Logical positions before region ownership expansion.
         """
-        return len(self.sorted_pairings)
+        return sum(len(group.remote_block_ids) for group in self.transport.groups)
 
     @property
-    def block_ids(self) -> tuple[int, ...]:
-        """Return stable-sorted P source block IDs.
+    def region_position_count(self) -> int:
+        """Return positions physically transferred across all regions per rank.
 
-        :returns: Remote block IDs in staging order.
+        :returns: Sum of canonical per-region position counts.
         """
-        return tuple(pair.remote_block_id for pair in self.sorted_pairings)
+        return sum(len(region.positions) for region in self.transport.regions)
 
     @property
-    def local_block_ids(self) -> tuple[int, ...]:
-        """Return D scatter rows paired with sorted source IDs.
+    def descriptors_per_handle(self) -> int:
+        """Return canonical NIXL descriptors in each source-rank handle.
 
-        :returns: Local block IDs in staging order.
+        :returns: Sum of maximal runs across owned regions.
         """
-        return tuple(pair.local_block_id for pair in self.sorted_pairings)
+        return sum(len(region.runs) for region in self.transport.regions)
+
+    @property
+    def rank_count(self) -> int:
+        """Return participating producer rank count.
+
+        :returns: Number of rank-major staging slabs.
+        """
+        return len(self.transport.source_ranks)
+
+    @property
+    def staging_bytes(self) -> int:
+        """Return exact request staging size.
+
+        :returns: Canonical staging allocation size.
+        """
+        return self.transport.staging_size_bytes
 
 
 def _balanced_parts(total: int, part_count: int) -> tuple[int, ...]:
@@ -127,29 +112,35 @@ def _balanced_parts(total: int, part_count: int) -> tuple[int, ...]:
 
 
 def build_block_runs(
-    scenario: ScenarioConfig, position_count: int
-) -> tuple[BlockRun, ...]:
-    """Construct the requested exact source-ID span and run geometry.
+    scenario: ScenarioConfig,
+    position_count: int,
+) -> tuple[RemoteBlockRun, ...]:
+    """Construct an exact synthetic source-ID span and run geometry.
 
     :param scenario: Source geometry configuration.
-    :param position_count: Number of selected post-trim positions.
+    :param position_count: Number of selected positions.
     :returns: Maximal consecutive runs in ascending source order.
     """
     if position_count == 0:
         return ()
+    selected_run_count = scenario.run_count
+    if selected_run_count <= 0 or selected_run_count > position_count:
+        raise ConfigError("synthetic run count must be within the position count")
     span = scenario.source_end_block - scenario.source_start_block + 1
     gap_count = span - position_count
-    run_lengths = _balanced_parts(position_count, scenario.run_count)
-    gaps = _balanced_parts(gap_count, scenario.run_count - 1)
-    runs: list[BlockRun] = []
+    if gap_count < selected_run_count - 1:
+        raise ConfigError("synthetic source span cannot separate every run")
+    run_lengths = _balanced_parts(position_count, selected_run_count)
+    gaps = _balanced_parts(gap_count, selected_run_count - 1)
+    runs: list[RemoteBlockRun] = []
     source_block = scenario.source_start_block
     position_offset = 0
     for run_index, block_count in enumerate(run_lengths):
         runs.append(
-            BlockRun(
-                start_block=source_block,
-                block_count=block_count,
-                position_offset=position_offset,
+            RemoteBlockRun(
+                remote_block_id=source_block,
+                position_count=block_count,
+                position_start=position_offset,
             )
         )
         source_block += block_count
@@ -161,78 +152,133 @@ def build_block_runs(
     return tuple(runs)
 
 
+def _coprime_stride(position_count: int, preferred: int) -> int:
+    if position_count <= 1:
+        return 1
+    stride = min(preferred, position_count - 1)
+    while math.gcd(stride, position_count) != 1:
+        stride -= 1
+    return stride
+
+
+def _ownership_partitions(config: RigConfig) -> tuple[tuple[int, ...], ...]:
+    partitions: dict[tuple[int, ...], list[int]] = {}
+    for group in config.groups:
+        partitions.setdefault(group.owned_region_indices, []).append(group.index)
+    return tuple(tuple(group_indices) for group_indices in partitions.values())
+
+
+def _selected_remote_start(group: GroupConfig) -> int:
+    remote_positions_per_local = 2 if group.destination_plane_count == 1 else 1
+    total_local_positions = (
+        group.remote_position_count + remote_positions_per_local - 1
+    ) // remote_positions_per_local
+    cached_local_positions = total_local_positions - group.local_position_count
+    return remote_positions_per_local * cached_local_positions
+
+
+def _selected_remote_count(group: GroupConfig) -> int:
+    return group.remote_position_count - _selected_remote_start(group)
+
+
 def _synthetic_replay(
     config: RigConfig, scenario: ScenarioConfig
 ) -> tuple[ReplayGroup, ...]:
-    """Construct group-wise input while retaining the production trim shape.
+    """Construct deterministic group rosters for owned-region fragmentation.
 
-    Selected remote IDs are assigned in original group order. The plan builder
-    still carries every remote/local pair through the same stable sort used by
-    vLLM. Captured replay manifests can replace this synthetic assignment.
+    The configured run geometry is divided into contiguous source-ID slices by
+    ownership partition, then independently permuted before group assignment.
+    Stable region-local sorting reconstructs each partition's exact slice.
 
     :param config: Complete rig configuration.
     :param scenario: Selected source geometry scenario.
     :returns: Group inputs before remote suffix trimming.
     """
-    position_count = sum(group.local_position_count for group in config.groups)
-    runs = build_block_runs(scenario, position_count)
-    selected_ids_sorted = [
+    logical_position_count = sum(
+        _selected_remote_count(group) for group in config.groups
+    )
+    runs = build_block_runs(scenario, logical_position_count)
+    all_selected_ids = tuple(
         block_id
         for run in runs
-        for block_id in range(run.start_block, run.start_block + run.block_count)
-    ]
-    remote_stride = 1049
-    remote_rotation = 17
-    selected_ids = [
-        selected_ids_sorted[
-            (position * remote_stride + remote_rotation) % position_count
+        for block_id in range(
+            run.remote_block_id,
+            run.remote_block_id + run.position_count,
+        )
+    )
+    selected_by_group: list[tuple[int, ...]] = [() for _ in config.groups]
+    partition_cursor = 0
+    for partition_index, group_indices in enumerate(_ownership_partitions(config)):
+        partition_position_count = sum(
+            _selected_remote_count(config.groups[group_index])
+            for group_index in group_indices
+        )
+        partition_ids_sorted = all_selected_ids[
+            partition_cursor : partition_cursor + partition_position_count
         ]
-        for position in range(position_count)
-    ]
-    local_pool_start = config.source_block_count - position_count - 4096
+        partition_cursor += partition_position_count
+        if partition_position_count == 0:
+            continue
+        stride = _coprime_stride(partition_position_count, 1049)
+        rotation = (17 + partition_index * 31) % partition_position_count
+        selected_ids = tuple(
+            partition_ids_sorted[
+                (position * stride + rotation) % partition_position_count
+            ]
+            for position in range(partition_position_count)
+        )
+        cursor = 0
+        for group_index in group_indices:
+            count = _selected_remote_count(config.groups[group_index])
+            selected_by_group[group_index] = selected_ids[cursor : cursor + count]
+            cursor += count
+
+    total_local_position_count = sum(
+        group.local_position_count for group in config.groups
+    )
+    local_pool_start = config.source_block_count - total_local_position_count - 4096
     if local_pool_start < 0:
         local_pool_start = 0
-    local_ids_sorted = list(range(local_pool_start, local_pool_start + position_count))
-    local_stride = 791
-    local_rotation = 31
-    local_ids_all = [
-        local_ids_sorted[(position * local_stride + local_rotation) % position_count]
-        for position in range(position_count)
-    ]
-    selected = set(selected_ids_sorted)
+    local_ids_sorted = tuple(
+        range(local_pool_start, local_pool_start + total_local_position_count)
+    )
+    local_stride = _coprime_stride(total_local_position_count, 791)
+    local_rotation = 31 % max(1, total_local_position_count)
+    local_ids_all = tuple(
+        local_ids_sorted[
+            (position * local_stride + local_rotation) % total_local_position_count
+        ]
+        for position in range(total_local_position_count)
+    )
+
     prefix_cursor = config.source_block_count - 1
-    remote_cursor = 0
     local_cursor = 0
     replay: list[ReplayGroup] = []
     for group in config.groups:
-        prefix_count = group.remote_position_count - group.local_position_count
+        prefix_count = _selected_remote_start(group)
         prefix_ids: list[int] = []
         while len(prefix_ids) < prefix_count:
-            if prefix_cursor not in selected:
+            if prefix_cursor not in all_selected_ids:
                 prefix_ids.append(prefix_cursor)
             prefix_cursor -= 1
             if prefix_cursor < 0:
                 raise ConfigError("unable to allocate synthetic trimmed prefix IDs")
-        suffix_ids = selected_ids[
-            remote_cursor : remote_cursor + group.local_position_count
+        local_ids = local_ids_all[
+            local_cursor : local_cursor + group.local_position_count
         ]
-        local_ids = tuple(
-            local_ids_all[local_cursor : local_cursor + group.local_position_count]
-        )
         replay.append(
             ReplayGroup(
                 group_index=group.index,
-                remote_block_ids=tuple(prefix_ids) + tuple(suffix_ids),
+                remote_block_ids=tuple(prefix_ids) + selected_by_group[group.index],
                 local_block_ids=local_ids,
             )
         )
-        remote_cursor += group.local_position_count
         local_cursor += group.local_position_count
     return tuple(replay)
 
 
 def load_replay_manifest(path: Path) -> tuple[ReplayGroup, ...]:
-    """Load an actual group-wise remote/local pairing capture.
+    """Load an actual group-wise remote/local roster capture.
 
     :param path: Versioned JSON replay manifest.
     :returns: Captured group inputs before prefix trimming.
@@ -283,19 +329,20 @@ def load_replay_manifest(path: Path) -> tuple[ReplayGroup, ...]:
     return tuple(result)
 
 
-def apply_group_prefix_trim(
-    config: RigConfig, replay: tuple[ReplayGroup, ...]
-) -> tuple[GroupPairing, ...]:
-    """Apply vLLM's non-Mamba remote-suffix trim group by group.
+def build_group_rosters(
+    config: RigConfig,
+    replay: tuple[ReplayGroup, ...],
+) -> tuple[GroupTransferRoster, ...]:
+    """Build exact canonical group rosters after prefix trimming.
 
     :param config: Complete rig configuration.
     :param replay: Remote/local group IDs before prefix trimming.
-    :returns: Original flattened pairings after trimming.
-    :raises ConfigError: If the replay is inconsistent with the handshake shape.
+    :returns: Canonical selected group rosters.
+    :raises ConfigError: If the replay differs from the configured shape.
     """
     if len(replay) != len(config.groups):
         raise ConfigError("replay group count differs from configured groups")
-    result: list[GroupPairing] = []
+    rosters: list[GroupTransferRoster] = []
     for group, captured in zip(config.groups, replay, strict=True):
         if captured.group_index != group.index:
             raise ConfigError("replay groups must be contiguous and ordered")
@@ -307,62 +354,35 @@ def apply_group_prefix_trim(
             raise ConfigError(
                 f"group {group.index} local count differs from configuration"
             )
-        trim_offset = len(captured.remote_block_ids) - len(captured.local_block_ids)
-        if len(captured.local_block_ids) == 0:
-            remote_suffix: tuple[int, ...] = ()
-        else:
-            remote_suffix = captured.remote_block_ids[-len(captured.local_block_ids) :]
-        for group_position, (remote_id, local_id) in enumerate(
-            zip(remote_suffix, captured.local_block_ids, strict=True)
-        ):
-            if remote_id < 0 or remote_id >= config.source_block_count:
-                raise ConfigError(
-                    f"group {group.index} remote block ID is out of range"
-                )
-            if local_id < 0 or local_id >= config.source_block_count:
-                raise ConfigError(f"group {group.index} local block ID is out of range")
-            result.append(
-                GroupPairing(
-                    group_index=group.index,
-                    group_position=group_position,
-                    remote_block_id=remote_id,
-                    local_block_id=local_id,
-                    source_position=trim_offset + group_position,
-                )
+        trim_offset = _selected_remote_start(group)
+        remote_suffix = captured.remote_block_ids[trim_offset:]
+        rosters.append(
+            GroupTransferRoster(
+                group_index=group.index,
+                source_position_start=trim_offset,
+                destination_plane_count=group.destination_plane_count,
+                local_block_ids=captured.local_block_ids,
+                remote_block_ids=remote_suffix,
             )
-    return tuple(result)
+        )
+    return tuple(rosters)
 
 
-def _runs_from_sorted_pairs(
-    pairings: tuple[GroupPairing, ...],
-) -> tuple[BlockRun, ...]:
-    """Find maximal consecutive remote-ID runs after stable sorting.
-
-    :param pairings: Pairings in stable remote-ID order.
-    :returns: Maximal descriptor runs.
-    """
-    runs: list[BlockRun] = []
-    if len(pairings) == 0:
-        return ()
-    run_start = 0
-    for index in range(1, len(pairings) + 1):
-        at_end = index == len(pairings)
-        consecutive = False
-        if not at_end:
-            consecutive = (
-                pairings[index].remote_block_id
-                == pairings[index - 1].remote_block_id + 1
-            )
-        if at_end or not consecutive:
-            runs.append(
-                BlockRun(
-                    start_block=pairings[run_start].remote_block_id,
-                    block_count=index - run_start,
-                    position_offset=run_start,
-                )
-            )
-            run_start = index
-    return tuple(runs)
+def _region_ownership(config: RigConfig) -> tuple[RegionOwnership, ...]:
+    return tuple(
+        RegionOwnership(
+            region_index=region_index,
+            group_indices=tuple(
+                group.index
+                for group in config.groups
+                if region_index in group.owned_region_indices
+            ),
+            source_row_count=config.source_block_count,
+            destination_row_count=config.source_block_count,
+            row_bytes=region.row_bytes,
+        )
+        for region_index, region in enumerate(config.regions)
+    )
 
 
 def build_plan(
@@ -370,58 +390,52 @@ def build_plan(
     scenario: ScenarioConfig,
     replay: tuple[ReplayGroup, ...] | None = None,
 ) -> TransferPlan:
-    """Build the raw coalesced pull and exact destination-scatter plan.
+    """Build the canonical transport and destination-scatter plan.
 
     :param config: Complete rig configuration.
     :param scenario: Selected source geometry scenario.
-    :param replay: Optional captured group pairing before prefix trimming.
+    :param replay: Optional captured group roster before prefix trimming.
     :returns: Transfer plan used by every independent runtime role.
-    :raises ConfigError: If the replay or declared geometry is inconsistent.
+    :raises ConfigError: If geometry or capacity is inconsistent.
     """
+    layout_start = time.perf_counter()
     if replay is None:
         replay = _synthetic_replay(config, scenario)
-    original_pairings = apply_group_prefix_trim(config, replay)
-    sorted_pairings = tuple(
-        sorted(original_pairings, key=lambda pair: pair.remote_block_id)
-    )
-    runs = _runs_from_sorted_pairs(sorted_pairings)
-    if scenario.replay_manifest is None:
-        if len(runs) != scenario.run_count:
-            raise AssertionError("synthetic source construction changed run count")
-        if len(sorted_pairings) > 0:
-            if sorted_pairings[0].remote_block_id != scenario.source_start_block:
-                raise AssertionError(
-                    "synthetic source construction changed first block"
-                )
-            if sorted_pairings[-1].remote_block_id != scenario.source_end_block:
-                raise AssertionError("synthetic source construction changed last block")
-
+    group_rosters = build_group_rosters(config, replay)
     rank_count = len(config.producer_devices)
-    region_offsets: list[int] = []
-    staging_bytes = 0
-    source_registration_bytes_per_rank = 0
-    destination_registration_bytes = 0
-    for region in config.regions:
-        region_offsets.append(staging_bytes)
-        staging_bytes += len(sorted_pairings) * rank_count * region.row_bytes
-        source_registration_bytes_per_rank += (
-            config.source_block_count * region.row_bytes
+    try:
+        transport = build_coalesced_transfer_plan(
+            source_tp_size=rank_count,
+            source_ranks=tuple(range(rank_count)),
+            rank_slots=tuple(range(rank_count)),
+            groups=group_rosters,
+            regions=_region_ownership(config),
         )
-        destination_registration_bytes += (
-            config.source_block_count * rank_count * region.row_bytes
-        )
+    except ValueError as error:
+        raise ConfigError(f"canonical transport plan is invalid: {error}") from error
+
+    capacity_bytes = config.staging_capacity_mib * 1024 * 1024
+    for offset_mib in scenario.staging_offsets_mib:
+        end = offset_mib * 1024 * 1024 + transport.staging_size_bytes
+        if end > capacity_bytes:
+            raise ConfigError(
+                f"scenario {scenario.name!r} staging offset {offset_mib}MiB "
+                f"ends at {end} bytes, past capacity {capacity_bytes}"
+            )
+
+    source_registration_bytes_per_rank = sum(
+        config.source_block_count * region.row_bytes for region in config.regions
+    )
+    destination_registration_bytes = sum(
+        config.source_block_count * rank_count * region.row_bytes
+        for region in config.regions
+    )
     return TransferPlan(
         scenario_name=scenario.name,
-        original_pairings=original_pairings,
-        sorted_pairings=sorted_pairings,
-        runs=runs,
-        region_offsets=tuple(region_offsets),
-        staging_bytes=staging_bytes,
+        transport=transport,
         source_registration_bytes_per_rank=source_registration_bytes_per_rank,
         destination_registration_bytes=destination_registration_bytes,
-        descriptors_per_handle=len(runs) * len(config.regions),
-        rank_count=rank_count,
-        destination_block_count=config.source_block_count,
+        layout_duration_seconds=time.perf_counter() - layout_start,
         replay_manifest=scenario.replay_manifest,
     )
 
@@ -449,7 +463,7 @@ def describe_plan(
     scenario: ScenarioConfig,
     plan: TransferPlan | None = None,
 ) -> dict[str, object]:
-    """Build a JSON-serializable plan description.
+    """Build a JSON-serializable canonical plan description.
 
     :param config: Complete rig configuration.
     :param scenario: Selected source geometry scenario.
@@ -464,39 +478,66 @@ def describe_plan(
         plan = build_plan(config, scenario)
     if plan.scenario_name != scenario.name:
         raise ConfigError("described plan does not belong to the scenario")
+
+    transport = plan.transport
+    selected_remote_ids = tuple(
+        block_id for group in transport.groups for block_id in group.remote_block_ids
+    )
     two_gib = 2 * 1024**3
     source_region_ends = (
-        [(plan.block_ids[-1] + 1) * region.row_bytes for region in config.regions]
-        if plan.position_count > 0
+        [(max(selected_remote_ids) + 1) * region.row_bytes for region in config.regions]
+        if len(selected_remote_ids) > 0
         else []
     )
     staging_slabs: list[dict[str, int | str | bool]] = []
-    for region_index, region in enumerate(config.regions):
-        rank_slab_bytes = plan.position_count * region.row_bytes
-        for rank in range(plan.rank_count):
-            start = plan.region_offsets[region_index] + rank * rank_slab_bytes
+    for rank_index, source_rank in enumerate(transport.source_ranks):
+        for region_index, region in enumerate(config.regions):
+            region_layout = transport.regions[region_index]
+            start = transport.region_offset(rank_index, region_index)
             staging_slabs.append(
                 {
                     "region": region.name,
-                    "rank": rank,
+                    "rank": source_rank,
                     "start": start,
-                    "end": start + rank_slab_bytes,
+                    "end": start + region_layout.size_bytes,
                     "starts_above_2gib": start >= two_gib,
-                    "crosses_2gib": start < two_gib < start + rank_slab_bytes,
+                    "crosses_2gib": start < two_gib < start + region_layout.size_bytes,
                 }
             )
     return {
         "scenario": scenario.name,
+        "handshake_evidence": {
+            "legacy_physical_capture": {
+                "source_manifest": config.legacy_source_handshake_manifest,
+                "destination_manifest": (config.legacy_destination_handshake_manifest),
+                "sha256_authenticated": True,
+                "evidence_scope": "legacy_storm37b_physical_geometry_only",
+                "connector_v9_semantics_authenticated": False,
+            },
+            "connector_v9_semantic_fixture": {
+                "manifest": config.semantic_handshake_manifest,
+                "profile": config.semantic_handshake_profile,
+                "sha256_authenticated": True,
+                "evidence_scope": STATIC_SEMANTIC_EVIDENCE_SCOPE,
+                "runtime_capture_authenticated": False,
+            },
+        },
         "plan_provenance": (
             "synthetic" if plan.replay_manifest is None else plan.replay_manifest
         ),
-        "position_count": plan.position_count,
-        "run_count": len(plan.runs),
+        "plan_digest": transport.digest,
+        "position_count": plan.logical_position_count,
+        "region_position_count": plan.region_position_count,
+        "region_run_count": plan.descriptors_per_handle,
         "descriptors_per_handle": plan.descriptors_per_handle,
         "crosses_nixl_1024_descriptor_split": plan.descriptors_per_handle >= 1024,
-        "has_content_evidence": plan.position_count > 0,
-        "first_source_block": plan.block_ids[0] if plan.position_count > 0 else None,
-        "last_source_block": plan.block_ids[-1] if plan.position_count > 0 else None,
+        "has_content_evidence": plan.logical_position_count > 0,
+        "first_source_block": min(selected_remote_ids)
+        if len(selected_remote_ids) > 0
+        else None,
+        "last_source_block": max(selected_remote_ids)
+        if len(selected_remote_ids) > 0
+        else None,
         "source_registration_bytes_per_rank": plan.source_registration_bytes_per_rank,
         "destination_registration_bytes": plan.destination_registration_bytes,
         "source_region_ends": source_region_ends,
@@ -504,11 +545,19 @@ def describe_plan(
             1 for end in source_region_ends if end > two_gib
         ),
         "staging_bytes": plan.staging_bytes,
-        "staging_mib": plan.staging_bytes // (1024 * 1024),
+        "staging_mib": plan.staging_bytes / (1024 * 1024),
         "staging_capacity_mib": config.staging_capacity_mib,
         "staging_offsets_mib": list(scenario.staging_offsets_mib),
-        "region_offsets": list(plan.region_offsets),
-        "runs": [asdict(run) for run in plan.runs],
+        "rank_stride_bytes": transport.rank_stride_bytes,
+        "region_offsets_within_rank": [
+            region.offset_within_rank for region in transport.regions
+        ],
+        "region_position_counts": [
+            len(region.positions) for region in transport.regions
+        ],
+        "region_runs": [
+            [asdict(run) for run in region.runs] for region in transport.regions
+        ],
         "group_counts": [
             {
                 "group_index": group.index,
@@ -518,7 +567,18 @@ def describe_plan(
             }
             for group in config.groups
         ],
-        "original_pairing_head": [asdict(pair) for pair in plan.original_pairings[:8]],
-        "sorted_pairing_head": [asdict(pair) for pair in plan.sorted_pairings[:8]],
+        "group_roster_head": [
+            {
+                "group_index": group.group_index,
+                "source_position_start": group.source_position_start,
+                "remote_block_ids": list(group.remote_block_ids[:8]),
+                "local_block_ids": list(group.local_block_ids[:8]),
+            }
+            for group in transport.groups
+        ],
+        "region_position_head": [
+            [asdict(position) for position in region.positions[:8]]
+            for region in transport.regions
+        ],
         "staging_slabs": staging_slabs,
     }

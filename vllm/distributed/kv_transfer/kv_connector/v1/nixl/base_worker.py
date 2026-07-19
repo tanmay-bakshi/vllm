@@ -19,8 +19,11 @@ from typing import TYPE_CHECKING, Any, Never, cast
 import msgspec
 import numpy as np
 import torch
-import zmq
+from zmq.constants import SocketOption, SocketType
 
+from vllm.distributed.kv_transfer.coalesced_layout import (
+    CoalescedTransferPlan,
+)
 from vllm.distributed.kv_transfer.integrity import (
     IntegrityIdentity,
     IntegrityPayloadKind,
@@ -38,6 +41,12 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.coalesced_scatter import (
+    ScatterEnqueueError,
+    ScatterLaunch,
+    launch_coalesced_scatter,
+    validate_coalesced_scatter,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
     HeartbeatInfo,
@@ -50,6 +59,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     compute_nixl_compatibility_hash,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
+    NixlCoalescedPlanTelemetry,
     NixlKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
@@ -67,6 +77,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
     MambaConvSplitInfo,
     derive_mamba_conv_split,
 )
+from vllm.distributed.kv_transfer.nixl_contracts import NixlRegionDescriptor
 from vllm.distributed.kv_transfer.nixl_fingerprint import NixlDeviceFingerprinter
 from vllm.distributed.kv_transfer.nixl_localization import (
     IntegrityLeafKey,
@@ -77,7 +88,6 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlEventRecord,
     NixlIntegrityLeaf,
     NixlLocalizationConfig,
-    NixlRegionDescriptor,
     NixlSourceContract,
     NixlSourceManifest,
     NixlSourceManifestRecord,
@@ -87,6 +97,7 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     build_integrity_leaf,
     compute_semantic_contract_digest,
     leaf_source_key,
+    localization_stage_barrier,
     seal_source_manifest,
     validate_source_manifest_structure,
 )
@@ -131,6 +142,53 @@ class _LocalizationLeafSpec:
     local_block_id: int | None
     destination_half: int | None
     rank_slot: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CoalescedLocalizationPlan:
+    """Retain canonical placement and producer contracts for diagnostics."""
+
+    layout: CoalescedTransferPlan
+    source_contracts: tuple[NixlSourceContract, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingCoalescedScatter:
+    """Own one event-fenced scatter until safe publication or failure."""
+
+    plan: CoalescedStagingPlan
+    launch: ScatterLaunch
+    enqueued_at: float
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _HandshakePostprocessContract:
+    """Describe destination transforms required by one remote engine."""
+
+    enable_permute_local_kv: bool
+    enable_heterogeneous_attn_post_process: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RemoteRankHandshakeContract:
+    """Address-independent contract that every rank of an engine must share."""
+
+    engine_id: str
+    attn_backend_name: str
+    ssm_sizes: tuple[int, int]
+    kv_cache_layout: str
+    block_size: int
+    physical_blocks_per_logical_kv_block: int
+    block_lens: tuple[int, ...]
+    num_blocks: int
+    source_group_planes: tuple[int, ...]
+    physical_group_token_capacities: tuple[int, ...]
+    region_geometry: tuple[tuple[object, ...], ...]
+
+
+class NixlHandshakeFailStopError(StagingSafetyError):
+    """Signal that partial remote-handshake state forbids in-process reuse."""
 
 
 class NixlBaseConnectorWorker:
@@ -476,18 +534,11 @@ class NixlBaseConnectorWorker:
             )
         self.device_kv_caches: dict[str, torch.Tensor] = {}
 
-        # Coalesced pull path (VLLM_NIXL_COALESCED_PULL=1): with remote
-        # TP > local TP, the stock pull scatters one descriptor per
-        # (block, region, K/V, remote shard) -- the local head-slice
-        # destinations are strided, so descriptors bottom out at
-        # local_block_len/|tp_ratio| bytes (16KB here) and transfers run
-        # latency-bound at ~0.25% of fabric bandwidth, with descriptor
-        # posting/reaping stalling the engine thread. This path instead
-        # reads whole remote blocks in contiguous-run descriptors into a
-        # registered staging buffer (O(regions x runs) descriptors) and
-        # re-scatters into the real cache with one strided GPU copy per
-        # (region, shard) at completion, before the request is released
-        # to the scheduler. Byte placement is identical to stock.
+        # The coalesced path constructs one owner-aware canonical plan from the
+        # exact post-prefix group rosters. Each producer rank writes a compact
+        # rank-major staging slab through maximal per-region source runs. One
+        # event-owned Triton scatter then places those rows in the TP1 cache
+        # before scheduler publication.
         self.coalesce_pull = os.environ.get("VLLM_NIXL_COALESCED_PULL", "0") == "1"
         self.coalesce_staging_mb = int(
             os.environ.get("VLLM_NIXL_COALESCED_STAGING_MB", "12288")
@@ -512,18 +563,16 @@ class NixlBaseConnectorWorker:
             )
         self._staging_buf: torch.Tensor | None = None
         self._staging_allocator: StagingRangeAllocator | None = None
-        # Requests waiting for a staging range are serviced FIFO as completed
-        # plans free ranges. Parking is safe:
-        # to the rest of the engine a parked request is
-        # indistinguishable from an in-flight transfer (blocks stay
-        # held until we report done_recving), and it beats the
-        # alternative -- falling back to the stock path costs ~20x in
-        # transfer time, while a range frees in ~100-300ms.
+        self._coalesced_scatter_stream: torch.cuda.Stream | None = None
+        # A parked request remains indistinguishable from an in-flight receive:
+        # its destination blocks stay owned until authoritative completion.
+        # Strict FIFO prevents smaller plans from starving the head request.
         self._coalesce_pending: deque = deque()
         # Coalesced handles, scatter geometry, and staging lifetime have one
         # generation-scoped owner. Stock transfers remain in
         # _recving_transfers because they never write the staging registration.
         self._coalesce_plans: dict[ReqId, CoalescedStagingPlan] = {}
+        self._pending_coalesced_scatters: dict[ReqId, _PendingCoalescedScatter] = {}
         self._coalesce_owner_sequence = 0
         self._sp_flags_cache: list[bool] | None = None
         # canonicalized (nb, row_bytes) uint8 views of each region's
@@ -533,7 +582,10 @@ class NixlBaseConnectorWorker:
         self._region_rows: list[torch.Tensor] | None = None
         # engine_id -> rank -> (block_lens, num_blocks, device_id) from
         # the handshake metadata (needed to build raw range descriptors)
-        self._remote_layout: dict[EngineId, dict[int, tuple]] = defaultdict(dict)
+        self._remote_layout: dict[
+            EngineId,
+            dict[int, tuple[list[int], int, int]],
+        ] = defaultdict(dict)
         self._remote_regions: dict[
             EngineId, dict[int, tuple[NixlRegionDescriptor, ...]]
         ] = defaultdict(dict)
@@ -542,6 +594,9 @@ class NixlBaseConnectorWorker:
         )
         self._remote_source_semantics: dict[
             EngineId, dict[int, tuple[tuple[int, ...], tuple[int, ...]]]
+        ] = defaultdict(dict)
+        self._remote_rank_contracts: dict[
+            EngineId, dict[int, _RemoteRankHandshakeContract]
         ] = defaultdict(dict)
         # region index -> registered cache tensor (scatter destinations)
         self._region_tensors: list[torch.Tensor] = []
@@ -564,7 +619,8 @@ class NixlBaseConnectorWorker:
             else None
         )
         self._localization_source_rosters: dict[ReqId, NixlSourceRoster] = {}
-        self._localization_pre_read_plans: dict[ReqId, dict[str, Any]] = {}
+        self._coalesced_localization_plans: dict[ReqId, _CoalescedLocalizationPlan] = {}
+        self._localization_pre_read_plans: dict[ReqId, _CoalescedLocalizationPlan] = {}
         self._localization_zero_recorded: set[ReqId] = set()
         self._localization_terminal_recorded: set[ReqId] = set()
 
@@ -704,7 +760,10 @@ class NixlBaseConnectorWorker:
         )
         self._ready_requests = queue.Queue[tuple[ReqId, ReqMeta]]()
         self._handshake_futures: dict[EngineId, Future[dict[int, str]]] = {}
-        # Protects _handshake_futures and _remote_agents.
+        self._handshake_active_engine_id: EngineId | None = None
+        self._handshake_mutation_engine_id: EngineId | None = None
+        self._handshake_fail_stop_reason: str | None = None
+        # Protects handshake lifecycle state and _remote_agents.
         self._handshake_lock = threading.RLock()
 
         # TTL-based eviction of stale remote engine state.
@@ -794,6 +853,56 @@ class NixlBaseConnectorWorker:
             self.block_size = kernel_block_size
             self.num_blocks *= self._physical_blocks_per_logical_kv_block
 
+    def _raise_if_handshake_fail_stopped(self) -> None:
+        """Refuse work after a handshake left partially imported native state.
+
+        :raises NixlHandshakeFailStopError: If process replacement is required.
+        """
+        with self._handshake_lock:
+            reason = self._handshake_fail_stop_reason
+        if reason is not None:
+            raise NixlHandshakeFailStopError(reason)
+
+    def _latch_handshake_fail_stop(self, engine_id: EngineId, detail: str) -> str:
+        """Permanently poison this worker after partial handshake mutation.
+
+        :param engine_id: Remote engine whose import became partial.
+        :param detail: Exact failure evidence.
+        :returns: The first latched fail-stop reason.
+        """
+        if len(detail) == 0:
+            raise ValueError("handshake fail-stop detail must not be empty")
+        with self._handshake_lock:
+            if self._handshake_fail_stop_reason is None:
+                self._handshake_fail_stop_reason = (
+                    "NIXL handshake partially imported remote state; in-process "
+                    f"reuse is forbidden for engine {engine_id!r}. {detail}"
+                )
+            return self._handshake_fail_stop_reason
+
+    def _mark_handshake_mutation(self, engine_id: EngineId) -> None:
+        """Record the boundary before a background handshake first mutates state.
+
+        :param engine_id: Remote engine about to be imported.
+        :raises RuntimeError: If no handshake transaction owns the import.
+        :raises NixlHandshakeFailStopError: If active ownership is inconsistent.
+        """
+        with self._handshake_lock:
+            active_engine_id = self._handshake_active_engine_id
+            if active_engine_id is None:
+                raise RuntimeError(
+                    "remote NIXL state import requires an active handshake "
+                    f"transaction for engine {engine_id!r}"
+                )
+            if active_engine_id != engine_id:
+                reason = self._latch_handshake_fail_stop(
+                    engine_id,
+                    "the active handshake engine changed before remote import: "
+                    f"active={active_engine_id!r}",
+                )
+                raise NixlHandshakeFailStopError(reason)
+            self._handshake_mutation_engine_id = engine_id
+
     def _nixl_handshake(
         self,
         host: str,
@@ -801,7 +910,81 @@ class NixlBaseConnectorWorker:
         remote_tp_size: int,
         expected_engine_id: str,
     ) -> dict[int, str]:
-        """Do a NIXL handshake with a remote instance."""
+        """Run one all-rank handshake under a permanent mutation boundary.
+
+        Validation and wire failures remain request-scoped until the first remote
+        rank starts importing state. Once import begins, any failure can leave
+        topology, agents, or descriptor handles partially installed, so the worker
+        must be replaced instead of retrying in process.
+
+        :param host: Remote handshake host.
+        :param port: Remote handshake port.
+        :param remote_tp_size: Remote tensor-parallel world size.
+        :param expected_engine_id: Authenticated remote engine identity.
+        :returns: Remote rank-to-agent mapping.
+        :raises NixlHandshakeFailStopError: If a post-mutation failure occurs.
+        """
+        self._raise_if_handshake_fail_stopped()
+        with self._handshake_lock:
+            if self._handshake_active_engine_id is not None:
+                if self._handshake_mutation_engine_id is None:
+                    raise RuntimeError(
+                        "a second NIXL handshake entered while validation was "
+                        "already active for engine "
+                        f"{self._handshake_active_engine_id!r}"
+                    )
+                reason = self._latch_handshake_fail_stop(
+                    expected_engine_id,
+                    "a second handshake entered while another handshake owned the "
+                    "mutation boundary: "
+                    f"active={self._handshake_active_engine_id!r}",
+                )
+                raise NixlHandshakeFailStopError(reason)
+            self._handshake_active_engine_id = expected_engine_id
+
+        try:
+            result = self._perform_nixl_handshake(
+                host,
+                port,
+                remote_tp_size,
+                expected_engine_id,
+            )
+        except Exception as error:
+            failure_traceback = traceback.format_exc()
+            with self._handshake_lock:
+                mutation_started = (
+                    self._handshake_mutation_engine_id == expected_engine_id
+                )
+                self._handshake_active_engine_id = None
+            if mutation_started is False:
+                raise
+            reason = self._latch_handshake_fail_stop(
+                expected_engine_id,
+                "the handshake failed after its first remote-state mutation\n"
+                + failure_traceback,
+            )
+            raise NixlHandshakeFailStopError(reason) from error
+
+        with self._handshake_lock:
+            self._handshake_active_engine_id = None
+            self._handshake_mutation_engine_id = None
+        return result
+
+    def _perform_nixl_handshake(
+        self,
+        host: str,
+        port: int,
+        remote_tp_size: int,
+        expected_engine_id: str,
+    ) -> dict[int, str]:
+        """Exchange and import every remote rank in one handshake.
+
+        :param host: Remote handshake host.
+        :param port: Remote handshake port.
+        :param remote_tp_size: Remote tensor-parallel world size.
+        :param expected_engine_id: Authenticated remote engine identity.
+        :returns: Remote rank-to-agent mapping.
+        """
 
         # the first time we connect to a remote agent.
         # be careful, the handshake happens in a background thread.
@@ -813,7 +996,7 @@ class NixlBaseConnectorWorker:
         # explicitly to make sure the handshake background thread has a valid
         # cuda context.
         if not self.use_host_buffer:
-            current_platform.set_device(self.device_id)
+            current_platform.set_device(torch.device(self.device_type, self.device_id))
 
         # When target instance TP > local TP, we need to perform multiple
         # handshakes. Do it in a single background job for simplicity.
@@ -821,11 +1004,17 @@ class NixlBaseConnectorWorker:
         # local rank will read from. Note that With homogeneous TP,
         # this happens to be the same single rank_i.
         assert self.transfer_topo is not None
-        p_remote_ranks = self.transfer_topo.handshake_target_ranks(remote_tp_size)
-        remote_rank_to_agent_name = {}
+        self._validate_remote_tp_size(remote_tp_size)
+        handshake_plan = compute_tp_mapping(
+            transfer_topology=self.transfer_topo,
+            remote_tp_size=remote_tp_size,
+            group_spec_types=self._group_spec_types,
+        )
+        p_remote_ranks = handshake_plan.all_source_ranks
+        metadata_by_rank: dict[int, NixlAgentMetadata] = {}
         path = make_zmq_path("tcp", host, port)
 
-        with zmq_ctx(zmq.REQ, path) as sock:
+        with zmq_ctx(SocketType.REQ, path) as sock:
             for remote_rank in p_remote_ranks:
                 logger.debug(
                     "Querying metadata on path: %s at remote tp rank %s",
@@ -837,7 +1026,7 @@ class NixlBaseConnectorWorker:
                 # Send query for the request.
                 msg = msgspec.msgpack.encode((GET_META_MSG, remote_rank))
                 # Set receive timeout to 5 seconds to avoid hanging on dead server
-                sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
+                sock.setsockopt(SocketOption.RCVTIMEO, 5000)  # milliseconds
                 sock.send(msg)
                 handshake_bytes = sock.recv()
 
@@ -901,17 +1090,85 @@ class NixlBaseConnectorWorker:
                         f"received {metadata.engine_id}."
                     )
 
-                # Register Remote agent.
-                remote_agent_name = self.add_remote_agent(
-                    metadata, remote_rank, remote_tp_size
-                )
-                setup_agent_time = time.perf_counter()
-                logger.debug(
-                    "NIXL handshake: add agent took: %s",
-                    setup_agent_time - got_metadata_time,
-                )
-                remote_rank_to_agent_name[remote_rank] = remote_agent_name
+                metadata_by_rank[remote_rank] = metadata
+
+        self._validate_remote_handshake_roster(
+            metadata_by_rank,
+            remote_tp_size,
+            handshake_plan,
+        )
+        remote_rank_to_agent_name: dict[int, str] = {}
+        for remote_rank in p_remote_ranks:
+            setup_start_time = time.perf_counter()
+            remote_agent_name = self.add_remote_agent(
+                metadata_by_rank[remote_rank],
+                remote_rank,
+                remote_tp_size,
+            )
+            logger.debug(
+                "NIXL handshake: add agent took: %s",
+                time.perf_counter() - setup_start_time,
+            )
+            remote_rank_to_agent_name[remote_rank] = remote_agent_name
         return remote_rank_to_agent_name
+
+    def _validate_remote_handshake_roster(
+        self,
+        metadata_by_rank: dict[int, NixlAgentMetadata],
+        remote_tp_size: int,
+        plan: TPMapping,
+    ) -> None:
+        """Validate every participating rank before the first native import.
+
+        :param metadata_by_rank: Decoded metadata keyed by producer rank.
+        :param remote_tp_size: Producer tensor-parallel world size.
+        :param plan: Derived local-to-remote TP mapping.
+        :raises RuntimeError: If the roster is incomplete or ranks disagree.
+        """
+        expected_ranks = plan.all_source_ranks
+        actual_ranks = tuple(sorted(metadata_by_rank))
+        if actual_ranks != expected_ranks:
+            raise RuntimeError(
+                "NIXL handshake metadata roster differs from the transfer plan: "
+                f"expected={expected_ranks}, actual={actual_ranks}"
+            )
+
+        reference_rank = expected_ranks[0]
+        reference_metadata = metadata_by_rank[reference_rank]
+        reference_contract = self._rank_handshake_contract(reference_metadata)
+        reference_postprocess: _HandshakePostprocessContract | None = None
+        for remote_rank in expected_ranks:
+            metadata = metadata_by_rank[remote_rank]
+            postprocess = self._validate_remote_agent_handshake(
+                metadata,
+                remote_rank,
+                remote_tp_size,
+                plan,
+            )
+            current_contract = self._rank_handshake_contract(metadata)
+            differences = self._rank_handshake_contract_differences(
+                reference_contract,
+                current_contract,
+            )
+            if len(differences) > 0:
+                self._raise_handshake_contract_error(
+                    metadata,
+                    remote_rank,
+                    f"producer rank contract differs from rank {reference_rank} "
+                    f"in fields {differences}: first={reference_contract}, "
+                    f"current={current_contract}",
+                )
+            if reference_postprocess is None:
+                reference_postprocess = postprocess
+                continue
+            if postprocess != reference_postprocess:
+                self._raise_handshake_contract_error(
+                    metadata,
+                    remote_rank,
+                    "producer ranks require different destination "
+                    f"post-processing: first={reference_postprocess}, "
+                    f"current={postprocess}",
+                )
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """
@@ -922,7 +1179,7 @@ class NixlBaseConnectorWorker:
         inv_order = [0, 1, 3, 2, 4]
         try:
             for layer_name, kv_cache in kv_caches.items():
-                kv_shape = kv_cache.shape
+                kv_shape: tuple[int, ...] = tuple(kv_cache.shape)
                 kv_dtype = kv_cache.dtype
                 permute_shape = False
                 if (
@@ -1033,8 +1290,10 @@ class NixlBaseConnectorWorker:
         started), or ``None`` if the handshake already completed
         successfully.  Callers can attach per-request callbacks to the
         returned future.
-        Failures to handshake are logged and the request is marked as failed.
+        Pre-import failures are reported to the request. A failure after native
+        state mutation permanently fail-stops the worker.
         """
+        self._raise_if_handshake_fail_stopped()
         self._evict_stale_engines()
         with self._handshake_lock:
             if engine_id in self._remote_agents:
@@ -1193,6 +1452,7 @@ class NixlBaseConnectorWorker:
 
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
+            tp_rank=self.tp_rank,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
             device_id=self.device_id,
             kv_caches_base_addr=(
@@ -1505,6 +1765,7 @@ class NixlBaseConnectorWorker:
         # After KV Caches registered, listen for new connections.
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
+            tp_rank=self.tp_rank,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
             device_id=self.device_id,
             kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id][self.tp_rank],
@@ -1820,9 +2081,14 @@ class NixlBaseConnectorWorker:
             )
             return self._remote_agents[engine_id][remote_tp_rank]
 
-        ### Register remote engine in TransferTopology (idempotent).
-        assert self.transfer_topo is not None
+        if self.transfer_topo is None:
+            raise RuntimeError("NIXL remote handshake preceded local KV registration")
         transfer_topo = self.transfer_topo
+        self._validate_remote_handshake_envelope(
+            nixl_agent_meta,
+            remote_tp_rank,
+            remote_tp_size,
+        )
         physical_blocks_per_logical = (
             nixl_agent_meta.physical_blocks_per_logical_kv_block
         )
@@ -1832,15 +2098,22 @@ class NixlBaseConnectorWorker:
             remote_block_len=nixl_agent_meta.block_lens[0],
             remote_physical_blocks_per_logical=physical_blocks_per_logical,
         )
-        transfer_topo.register_remote_engine(engine_id, transfer_info)
-        logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
-
-        self.tp_mappings[engine_id] = compute_tp_mapping(
+        plan = compute_tp_mapping(
             transfer_topology=transfer_topo,
             remote_tp_size=remote_tp_size,
             group_spec_types=self._group_spec_types,
         )
+        postprocess_contract = self._validate_remote_agent_handshake(
+            nixl_agent_meta,
+            remote_tp_rank,
+            remote_tp_size,
+            plan,
+        )
 
+        self._mark_handshake_mutation(engine_id)
+        transfer_topo.register_remote_engine(engine_id, transfer_info)
+        self.tp_mappings[engine_id] = plan
+        logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
         )
@@ -1856,8 +2129,6 @@ class NixlBaseConnectorWorker:
 
         if engine_id not in self.dst_num_blocks:
             self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
-
-        self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
 
         # Keep track of remote agent kv caches base addresses.
         self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
@@ -1878,6 +2149,9 @@ class NixlBaseConnectorWorker:
             nixl_agent_meta.source_group_planes,
             nixl_agent_meta.physical_group_token_capacities,
         )
+        self._remote_rank_contracts[engine_id][remote_tp_rank] = (
+            self._rank_handshake_contract(nixl_agent_meta)
+        )
 
         # This is 1 when P and D `--tensor-parallel-size` match. Otherwise,
         # this is the ratio between the two sizes.
@@ -1889,8 +2163,6 @@ class NixlBaseConnectorWorker:
             remote_tp_rank,
             tp_ratio,
         )
-
-        plan = self.tp_mappings[engine_id]
 
         ### (Optional) Register local agent memory regions. MLA is not split.
         if (
@@ -1960,31 +2232,573 @@ class NixlBaseConnectorWorker:
                 self.register_local_xfer_handler(nixl_agent_meta.block_size)[0]
             )
 
+        if (
+            postprocess_contract.enable_permute_local_kv
+            and self.enable_permute_local_kv is False
+        ):
+            logger.info(
+                "Remote is HND and local is NHD; enabling local KV permutation."
+            )
+        if (
+            postprocess_contract.enable_heterogeneous_attn_post_process
+            and self.enable_heterogeneous_attn_post_process is False
+        ):
+            logger.info(
+                "[Experimental] CPU_ATTN uses heterogeneous attention "
+                "post-processing for this remote contract."
+            )
+        self.enable_permute_local_kv = postprocess_contract.enable_permute_local_kv
+        self.enable_heterogeneous_attn_post_process = (
+            postprocess_contract.enable_heterogeneous_attn_post_process
+        )
         return remote_agent_name
 
-    def _validate_remote_agent_handshake(
-        self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
-    ):
-        """
-        Validate the remote agent handshake metadata ensuring the
-        invariants hold true.
-        """
-        remote_engine_id = nixl_agent_meta.engine_id
+    def _raise_handshake_contract_error(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_rank: int,
+        detail: str,
+    ) -> Never:
+        """Raise a contextual fail-closed handshake error.
 
-        assert self.transfer_topo is not None
-        remote_info = self.transfer_topo.get_engine_info(remote_engine_id)
-        assert remote_info.remote_tp_size == remote_tp_size
-
-        tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
-        block_size_ratio = self.transfer_topo.block_size_ratio(
-            nixl_agent_meta.block_size
+        :param nixl_agent_meta: Remote wire metadata being validated.
+        :param remote_tp_rank: Remote tensor-parallel rank.
+        :param detail: Violated contract detail.
+        :raises RuntimeError: Always.
+        """
+        raise RuntimeError(
+            "NIXL handshake contract violation for "
+            f"engine {nixl_agent_meta.engine_id!r}, rank {remote_tp_rank}: "
+            f"{detail}"
         )
-        # num_kv_heads > tp_size with P_TP > D_TP not supported for non-mamba.
-        # Mamba models can have replicated FA KV with tp_ratio < 0.
-        # MLA models do not need to handle kv replication.
-        if not self.use_mla and not self._has_mamba:
-            assert not (
-                tp_ratio < 0 and self.transfer_topo.is_kv_replicated(remote_engine_id)
+
+    def _validate_remote_tp_size(self, remote_tp_size: int) -> None:
+        """Validate that local and remote tensor parallelism can be mapped.
+
+        :param remote_tp_size: Remote tensor-parallel world size.
+        :raises RuntimeError: If the TP sizes are invalid or not divisible.
+        """
+        if self.transfer_topo is None:
+            raise RuntimeError("NIXL handshake preceded local KV registration")
+        local_tp_size = self.transfer_topo.tp_size
+        if remote_tp_size <= 0 or local_tp_size <= 0:
+            raise RuntimeError(
+                "NIXL handshake requires positive local and remote TP sizes; "
+                f"local={local_tp_size}, remote={remote_tp_size}"
+            )
+        larger_tp = max(local_tp_size, remote_tp_size)
+        smaller_tp = min(local_tp_size, remote_tp_size)
+        if larger_tp % smaller_tp != 0:
+            raise RuntimeError(
+                "NIXL handshake requires divisible local and remote TP sizes; "
+                f"local={local_tp_size}, remote={remote_tp_size}"
+            )
+
+    def _validate_remote_handshake_envelope(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+    ) -> None:
+        """Validate fields needed before deriving or importing remote state.
+
+        :param nixl_agent_meta: Remote wire metadata.
+        :param remote_tp_rank: Remote tensor-parallel rank.
+        :param remote_tp_size: Remote tensor-parallel world size.
+        :raises RuntimeError: If any envelope field is unsafe.
+        """
+        self._validate_remote_tp_size(remote_tp_size)
+
+        def fail(detail: str) -> Never:
+            self._raise_handshake_contract_error(
+                nixl_agent_meta,
+                remote_tp_rank,
+                detail,
+            )
+
+        if remote_tp_rank < 0 or remote_tp_rank >= remote_tp_size:
+            fail(f"remote rank is outside [0, {remote_tp_size}); got {remote_tp_rank}")
+        if nixl_agent_meta.tp_rank != remote_tp_rank:
+            fail(
+                "metadata rank does not match the requested producer rank; "
+                f"metadata={nixl_agent_meta.tp_rank}, requested={remote_tp_rank}"
+            )
+        if len(nixl_agent_meta.engine_id) == 0:
+            fail("engine identity is empty")
+        if nixl_agent_meta.engine_id == self.engine_id:
+            fail("remote engine identity equals the local engine identity")
+        if len(nixl_agent_meta.agent_metadata) == 0:
+            fail("NIXL agent metadata is empty")
+        if nixl_agent_meta.device_id < 0:
+            fail(f"device ID must be non-negative; got {nixl_agent_meta.device_id}")
+        if nixl_agent_meta.num_blocks <= 0:
+            fail(f"num_blocks must be positive; got {nixl_agent_meta.num_blocks}")
+        if nixl_agent_meta.block_size <= 0:
+            fail(f"block_size must be positive; got {nixl_agent_meta.block_size}")
+        if self.block_size % nixl_agent_meta.block_size != 0:
+            fail(
+                "local block size must be an integer multiple of the remote "
+                f"block size; local={self.block_size}, "
+                f"remote={nixl_agent_meta.block_size}"
+            )
+        if nixl_agent_meta.physical_blocks_per_logical_kv_block <= 0:
+            fail(
+                "physical_blocks_per_logical_kv_block must be positive; got "
+                f"{nixl_agent_meta.physical_blocks_per_logical_kv_block}"
+            )
+        if len(nixl_agent_meta.block_lens) == 0:
+            fail("remote block_lens is empty")
+        if any(block_len <= 0 for block_len in nixl_agent_meta.block_lens):
+            fail(
+                f"remote block_lens contains a non-positive value: "
+                f"{nixl_agent_meta.block_lens}"
+            )
+        if any(size < 0 for size in nixl_agent_meta.ssm_sizes):
+            fail(
+                f"remote ssm_sizes contains a negative value: "
+                f"{nixl_agent_meta.ssm_sizes}"
+            )
+        if len(nixl_agent_meta.kv_cache_layout) == 0:
+            fail("remote KV-cache layout is empty")
+        if len(nixl_agent_meta.attn_backend_name) == 0:
+            fail("remote attention backend name is empty")
+        if len(nixl_agent_meta.registration_generation) == 0:
+            fail("remote registration generation is empty")
+
+    def _validate_region_descriptor_set(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_rank: int,
+        label: str,
+        regions: tuple[NixlRegionDescriptor, ...],
+        base_addresses: list[int],
+        block_lens: list[int],
+        num_blocks: int,
+        group_count: int,
+        kv_cache_layout: str,
+    ) -> None:
+        """Validate one rank's complete registered-region contract.
+
+        :param nixl_agent_meta: Remote wire metadata used for error context.
+        :param remote_tp_rank: Remote tensor-parallel rank.
+        :param label: Human-readable side being validated.
+        :param regions: Ordered region descriptors.
+        :param base_addresses: Ordered registered base addresses.
+        :param block_lens: Ordered bytes per physical cache row.
+        :param num_blocks: Number of physical cache rows.
+        :param group_count: Number of semantic cache groups.
+        :param kv_cache_layout: Advertised cache layout.
+        :raises RuntimeError: If the region contract is incomplete or unsafe.
+        """
+
+        def fail(detail: str) -> Never:
+            self._raise_handshake_contract_error(
+                nixl_agent_meta,
+                remote_tp_rank,
+                f"{label} {detail}",
+            )
+
+        region_count = len(regions)
+        if region_count == 0:
+            fail("region descriptor list is empty")
+        if region_count != len(base_addresses) or region_count != len(block_lens):
+            fail(
+                "region/address/row cardinalities differ: "
+                f"regions={region_count}, addresses={len(base_addresses)}, "
+                f"rows={len(block_lens)}"
+            )
+        if group_count <= 0:
+            fail(f"cache-group count must be positive; got {group_count}")
+
+        covered_groups: set[int] = set()
+        semantic_names: set[str] = set()
+        registration_ranges: list[tuple[int, int, int]] = []
+        max_address = (1 << 64) - 1
+        strict_tensor_rows = not self._has_mamba
+        for region_index, region in enumerate(regions):
+            if len(region.semantic_name) == 0:
+                fail(f"region {region_index} has an empty semantic name")
+            if region.semantic_name in semantic_names:
+                fail(
+                    f"region {region_index} duplicates semantic name "
+                    f"{region.semantic_name!r}"
+                )
+            semantic_names.add(region.semantic_name)
+
+            owners = region.group_indices
+            if len(owners) == 0:
+                fail(f"region {region_index} has no cache-group owner")
+            if owners != tuple(sorted(set(owners))):
+                fail(
+                    f"region {region_index} owners must be sorted and unique; "
+                    f"got {owners}"
+                )
+            if any(owner < 0 or owner >= group_count for owner in owners):
+                fail(
+                    f"region {region_index} owner is outside [0, {group_count}); "
+                    f"got {owners}"
+                )
+            owner_names = region.group_semantic_names
+            named_owners = tuple(owner for owner, _ in owner_names)
+            if named_owners != owners:
+                fail(
+                    f"region {region_index} semantic owners {named_owners} do not "
+                    f"exactly match physical owners {owners}"
+                )
+            if any(len(name) == 0 for _, name in owner_names):
+                fail(f"region {region_index} has an empty group semantic name")
+            covered_groups.update(owners)
+
+            expected_base = base_addresses[region_index]
+            expected_row_bytes = block_lens[region_index]
+            if region.base_address != expected_base:
+                fail(
+                    f"region {region_index} base {region.base_address} does not "
+                    f"match address roster {expected_base}"
+                )
+            if region.row_bytes != expected_row_bytes:
+                fail(
+                    f"region {region_index} row_bytes {region.row_bytes} does not "
+                    f"match block_lens {expected_row_bytes}"
+                )
+            if region.base_address <= 0:
+                fail(
+                    f"region {region_index} base address must be positive; "
+                    f"got {region.base_address}"
+                )
+            if region.row_bytes <= 0 or region.registered_bytes <= 0:
+                fail(
+                    f"region {region_index} has non-positive row or registration "
+                    f"size ({region.row_bytes}, {region.registered_bytes})"
+                )
+            expected_registered_bytes = num_blocks * region.row_bytes
+            if region.registered_bytes != expected_registered_bytes:
+                fail(
+                    f"region {region_index} registration is not exactly "
+                    f"num_blocks * row_bytes: {region.registered_bytes} != "
+                    f"{num_blocks} * {region.row_bytes}"
+                )
+            registration_end = region.base_address + region.registered_bytes
+            if (
+                registration_end <= region.base_address
+                or registration_end > max_address
+            ):
+                fail(
+                    f"region {region_index} registration exceeds the uint64 "
+                    f"address space: base={region.base_address}, "
+                    f"bytes={region.registered_bytes}"
+                )
+            registration_ranges.append(
+                (region.base_address, registration_end, region_index)
+            )
+
+            if len(region.shape) == 0 or len(region.shape) != len(region.strides):
+                fail(
+                    f"region {region_index} has invalid shape/stride rank: "
+                    f"shape={region.shape}, strides={region.strides}"
+                )
+            if any(dimension <= 0 for dimension in region.shape):
+                fail(f"region {region_index} has a non-positive shape: {region.shape}")
+            if any(stride <= 0 for stride in region.strides):
+                fail(
+                    f"region {region_index} has a non-positive stride: {region.strides}"
+                )
+            if region.element_size_bytes <= 0 or len(region.dtype) == 0:
+                fail(
+                    f"region {region_index} has invalid dtype geometry: "
+                    f"dtype={region.dtype!r}, "
+                    f"element_bytes={region.element_size_bytes}"
+                )
+            if len(region.layout) == 0:
+                fail(f"region {region_index} has an empty layout")
+            if region.layout != "packed" and region.layout != kv_cache_layout:
+                fail(
+                    f"region {region_index} layout {region.layout!r} does not "
+                    f"match advertised layout {kv_cache_layout!r}"
+                )
+
+            storage_elements = 1 + sum(
+                (dimension - 1) * stride
+                for dimension, stride in zip(region.shape, region.strides)
+            )
+            storage_bytes = storage_elements * region.element_size_bytes
+            if storage_bytes > region.registered_bytes:
+                fail(
+                    f"region {region_index} tensor view spans {storage_bytes} bytes "
+                    f"outside its {region.registered_bytes}-byte registration"
+                )
+            if strict_tensor_rows:
+                if region.shape[0] != num_blocks:
+                    fail(
+                        f"region {region_index} leading dimension "
+                        f"{region.shape[0]} does not match num_blocks {num_blocks}"
+                    )
+                stride_row_bytes = region.strides[0] * region.element_size_bytes
+                if stride_row_bytes != region.row_bytes:
+                    fail(
+                        f"region {region_index} leading stride spans "
+                        f"{stride_row_bytes} bytes, not row_bytes "
+                        f"{region.row_bytes}"
+                    )
+
+        expected_groups = set(range(group_count))
+        if covered_groups != expected_groups:
+            fail(
+                "regions do not cover every cache group exactly by identity; "
+                f"covered={sorted(covered_groups)}, "
+                f"expected={sorted(expected_groups)}"
+            )
+        registration_ranges.sort()
+        for previous, current in zip(
+            registration_ranges,
+            registration_ranges[1:],
+        ):
+            if previous[1] > current[0]:
+                fail(
+                    f"regions {previous[2]} and {current[2]} overlap registered "
+                    f"address ranges [{previous[0]}, {previous[1]}) and "
+                    f"[{current[0]}, {current[1]})"
+                )
+
+    @staticmethod
+    def _rank_region_contract(
+        regions: tuple[NixlRegionDescriptor, ...],
+    ) -> tuple[tuple[object, ...], ...]:
+        """Return address-independent region geometry for rank comparison.
+
+        :param regions: Ordered remote region descriptors.
+        :returns: Canonical structural contract for one producer rank.
+        """
+        return tuple(
+            (
+                region.semantic_name,
+                region.group_indices,
+                region.group_semantic_names,
+                region.registered_bytes,
+                region.row_bytes,
+                region.shape,
+                region.strides,
+                region.dtype,
+                region.element_size_bytes,
+                region.layout,
+            )
+            for region in regions
+        )
+
+    @classmethod
+    def _rank_handshake_contract(
+        cls,
+        metadata: NixlAgentMetadata,
+    ) -> _RemoteRankHandshakeContract:
+        """Return the exact address-independent contract for one producer rank.
+
+        :param metadata: Validated producer-rank metadata.
+        :returns: Canonical rank contract suitable for exact comparison.
+        """
+        return _RemoteRankHandshakeContract(
+            engine_id=metadata.engine_id,
+            attn_backend_name=metadata.attn_backend_name,
+            ssm_sizes=metadata.ssm_sizes,
+            kv_cache_layout=metadata.kv_cache_layout,
+            block_size=metadata.block_size,
+            physical_blocks_per_logical_kv_block=(
+                metadata.physical_blocks_per_logical_kv_block
+            ),
+            block_lens=tuple(metadata.block_lens),
+            num_blocks=metadata.num_blocks,
+            source_group_planes=metadata.source_group_planes,
+            physical_group_token_capacities=(metadata.physical_group_token_capacities),
+            region_geometry=cls._rank_region_contract(metadata.regions),
+        )
+
+    @staticmethod
+    def _rank_handshake_contract_differences(
+        reference: _RemoteRankHandshakeContract,
+        current: _RemoteRankHandshakeContract,
+    ) -> tuple[str, ...]:
+        """Name every cross-rank contract field that differs.
+
+        :param reference: Contract from the canonical producer rank.
+        :param current: Contract from another producer rank.
+        :returns: Ordered names of all differing fields.
+        """
+        fields = (
+            ("engine_id", reference.engine_id, current.engine_id),
+            (
+                "attn_backend_name",
+                reference.attn_backend_name,
+                current.attn_backend_name,
+            ),
+            ("ssm_sizes", reference.ssm_sizes, current.ssm_sizes),
+            (
+                "kv_cache_layout",
+                reference.kv_cache_layout,
+                current.kv_cache_layout,
+            ),
+            ("block_size", reference.block_size, current.block_size),
+            (
+                "physical_blocks_per_logical_kv_block",
+                reference.physical_blocks_per_logical_kv_block,
+                current.physical_blocks_per_logical_kv_block,
+            ),
+            ("block_lens", reference.block_lens, current.block_lens),
+            ("num_blocks", reference.num_blocks, current.num_blocks),
+            (
+                "source_group_planes",
+                reference.source_group_planes,
+                current.source_group_planes,
+            ),
+            (
+                "physical_group_token_capacities",
+                reference.physical_group_token_capacities,
+                current.physical_group_token_capacities,
+            ),
+            (
+                "region_geometry",
+                reference.region_geometry,
+                current.region_geometry,
+            ),
+        )
+        return tuple(name for name, first, second in fields if first != second)
+
+    def _validate_tp_mapping_contract(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+        plan: TPMapping,
+    ) -> None:
+        """Validate all rank-selection and attention-slot assumptions.
+
+        :param nixl_agent_meta: Remote wire metadata.
+        :param remote_tp_rank: Remote tensor-parallel rank.
+        :param remote_tp_size: Remote tensor-parallel world size.
+        :param plan: Derived local-to-remote TP mapping.
+        :raises RuntimeError: If the plan cannot safely index remote regions.
+        """
+
+        def fail(detail: str) -> Never:
+            self._raise_handshake_contract_error(
+                nixl_agent_meta,
+                remote_tp_rank,
+                f"TP mapping {detail}",
+            )
+
+        group_count = len(self._group_spec_types)
+        if len(plan.source_ranks_per_group) != group_count:
+            fail(
+                "group cardinality differs from the KV contract: "
+                f"mapping={len(plan.source_ranks_per_group)}, "
+                f"groups={group_count}"
+            )
+        all_ranks = plan.all_source_ranks
+        if len(all_ranks) == 0 or all_ranks != tuple(sorted(set(all_ranks))):
+            fail(f"all_source_ranks must be non-empty, sorted, and unique: {all_ranks}")
+        if any(rank < 0 or rank >= remote_tp_size for rank in all_ranks):
+            fail(
+                f"all_source_ranks contains a rank outside [0, {remote_tp_size}): "
+                f"{all_ranks}"
+            )
+        if remote_tp_rank not in all_ranks:
+            fail(
+                f"handshaken rank {remote_tp_rank} is not consumed by this local "
+                f"rank; expected one of {all_ranks}"
+            )
+
+        rank_union: set[int] = set()
+        for group_index, ranks in enumerate(plan.source_ranks_per_group):
+            if len(ranks) == 0 or ranks != tuple(sorted(set(ranks))):
+                fail(
+                    f"group {group_index} source ranks must be non-empty, sorted, "
+                    f"and unique: {ranks}"
+                )
+            if any(rank not in all_ranks for rank in ranks):
+                fail(
+                    f"group {group_index} references a rank outside "
+                    f"all_source_ranks: {ranks} versus {all_ranks}"
+                )
+            rank_union.update(ranks)
+            if _is_attention_spec(self._group_spec_types[group_index]):
+                slots = tuple(plan.rank_to_attention_slot[rank] for rank in ranks)
+                expected_slots = tuple(range(len(ranks)))
+                if slots != expected_slots:
+                    fail(
+                        f"attention group {group_index} rank slots are {slots}; "
+                        f"expected {expected_slots}"
+                    )
+        if rank_union != set(all_ranks):
+            fail(
+                "per-group rank union differs from all_source_ranks: "
+                f"union={sorted(rank_union)}, all={all_ranks}"
+            )
+        if set(plan.rank_to_attention_slot) != set(all_ranks):
+            fail(
+                "rank_to_attention_slot keys differ from all_source_ranks: "
+                f"keys={sorted(plan.rank_to_attention_slot)}, all={all_ranks}"
+            )
+        if any(slot < 0 for slot in plan.rank_to_attention_slot.values()):
+            fail(
+                "rank_to_attention_slot contains a negative slot: "
+                f"{plan.rank_to_attention_slot}"
+            )
+        if plan.rank_offset_factor < 0:
+            fail(f"rank_offset_factor is negative: {plan.rank_offset_factor}")
+        if self.transfer_topo is None:
+            fail("local transfer topology is unavailable")
+        if (
+            self.use_mla or self.transfer_topo.tp_size <= remote_tp_size
+        ) and plan.rank_offset_factor != 0:
+            fail(
+                "rank_offset_factor must be zero when remote head slicing is "
+                f"unused; got {plan.rank_offset_factor}"
+            )
+
+    def _validate_remote_agent_handshake(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+        plan: TPMapping,
+    ) -> _HandshakePostprocessContract:
+        """Validate the complete remote memory and transfer contract.
+
+        :param nixl_agent_meta: Remote wire metadata.
+        :param remote_tp_rank: Remote tensor-parallel rank.
+        :param remote_tp_size: Remote tensor-parallel world size.
+        :param plan: Derived local-to-remote TP mapping.
+        :returns: Destination transforms required by the validated remote.
+        :raises RuntimeError: If any transfer invariant is violated.
+        """
+        self._validate_remote_handshake_envelope(
+            nixl_agent_meta,
+            remote_tp_rank,
+            remote_tp_size,
+        )
+        if self.transfer_topo is None:
+            raise RuntimeError("NIXL handshake preceded local KV registration")
+        transfer_topo = self.transfer_topo
+
+        def fail(detail: str) -> Never:
+            self._raise_handshake_contract_error(
+                nixl_agent_meta,
+                remote_tp_rank,
+                detail,
+            )
+
+        remote_engine_id = nixl_agent_meta.engine_id
+        tp_ratio = transfer_topo.tp_ratio(remote_tp_size)
+        block_size_ratio = transfer_topo.block_size_ratio(nixl_agent_meta.block_size)
+        remote_kv_replicated = remote_tp_size > transfer_topo.total_num_kv_heads
+
+        if (
+            not self.use_mla
+            and not self._has_mamba
+            and tp_ratio < 0
+            and remote_kv_replicated
+        ):
+            fail(
+                "P TP greater than D TP with replicated GQA KV is unsupported "
+                "for non-Mamba models"
             )
 
         remote_physical_per_logical = (
@@ -1996,123 +2810,319 @@ class NixlBaseConnectorWorker:
             != self._physical_blocks_per_logical_kv_block
             and self.vllm_config.cache_config.enable_prefix_caching
         ):
-            raise RuntimeError(
-                "Prefix caching with heterogeneous physical_blocks_per_logical "
-                "is not supported for Mamba hybrid models. "
-                f"Local: {self._physical_blocks_per_logical_kv_block}, "
-                f"Remote: {remote_physical_per_logical}. "
-                "Disable prefix caching with --no-enable-prefix-caching."
+            fail(
+                "prefix caching with heterogeneous "
+                "physical_blocks_per_logical_kv_block is unsupported for "
+                "Mamba hybrid models; "
+                f"local={self._physical_blocks_per_logical_kv_block}, "
+                f"remote={remote_physical_per_logical}"
             )
 
-        if self._is_hma_required:
-            assert block_size_ratio == 1, (
-                "HMA does not support different remote block size yet"
-            )
-        kv_cache_layout = (
+        if self._is_hma_required and block_size_ratio != 1:
+            fail("HMA does not support different local and remote block sizes")
+        local_layout = (
             self.kv_cache_layout
             if not self.use_host_buffer
             else self.host_buffer_kv_cache_layout
         )
-        if not self.use_mla and nixl_agent_meta.kv_cache_layout != kv_cache_layout:
+        enable_permute_local_kv = False
+        if not self.use_mla and nixl_agent_meta.kv_cache_layout != local_layout:
             if (
                 self.kv_transfer_config.enable_permute_local_kv
                 and nixl_agent_meta.kv_cache_layout == "HND"
             ):
-                logger.info(
-                    "Remote is HND and local is NHD, enabled additional permute "
-                    "on local device KV."
-                )
-                assert not self._is_hma_required, (
-                    "HMA does not support block size post processing"
-                )
-                self.enable_permute_local_kv = True
+                if self._is_hma_required:
+                    fail("HMA does not support KV-cache layout post-processing")
+                enable_permute_local_kv = True
             else:
-                raise RuntimeError(
-                    "Heterogeneous TP expects same kv_cache_layout. "
-                    "Or enable experimental feature to use HND to NHD support by "
-                    "setting 'enable_permute_local_kv'=True in --kv-transfer-config."
+                fail(
+                    "heterogeneous TP expects the same KV-cache layout, or an "
+                    "HND remote with enable_permute_local_kv enabled"
                 )
-        # if remote_agent used attn is not same as local,
-        # hint heterogenuous attn post process
+
+        enable_heterogeneous_attn_post_process = False
         if (
             nixl_agent_meta.attn_backend_name != self.backend_name
-            and self.backend_name in ["CPU_ATTN"]
+            and self.backend_name == "CPU_ATTN"
         ):
             if self._is_hma_required:
-                raise RuntimeError(
-                    "heterogeneous attn post process is not supported with HMA"
-                )
-            logger.info(
-                "[Experimental] CPU_ATTN backend is used, "
-                "hint heterogeneous attn post process"
-            )
-            self.enable_heterogeneous_attn_post_process = True
+                fail("heterogeneous attention post-processing is unsupported with HMA")
+            enable_heterogeneous_attn_post_process = True
 
-        # Heterogeneous TP requires head-splitting, which only works with
-        # HND layout. MLA and replicated-KV cases don't split on heads.
-        # Mamba doesn't support heterogeneous TP.
         if (
             abs(tp_ratio) != 1
             and not self.use_mla
-            and not self.transfer_topo.is_kv_replicated(remote_engine_id)
-            and kv_cache_layout != "HND"
-            and not self.enable_permute_local_kv
+            and not remote_kv_replicated
+            and local_layout != "HND"
+            and not enable_permute_local_kv
         ):
-            raise RuntimeError(
-                "Heterogeneous TP head-dimension splitting requires contiguous heads. "
-                "Use HND layout on the prefill side."
+            fail(
+                "heterogeneous TP head splitting requires contiguous HND heads "
+                "on the prefill side"
             )
 
-        # Per-region block_len validation enforcing the P/D invariant.
-        # REPLICATE regions (MLA, or a whole-model MLA / replicated-KV transfer)
-        # only allow the number of blocks to differ; SPLIT regions scale with
-        # the per-rank KV head ratio rather than the raw tp_ratio, because GQA
-        # replication caps per-rank heads at 1 when tp > total_kv_heads
-        # (issue #45330). Mamba uses the ssm_sizes counterpart, so skip here.
+        group_count = len(self.kv_cache_config.kv_cache_groups)
+        local_planes = tuple(1 if flag else 2 for flag in self._sp_group_flags())
+        local_capacities = self._physical_group_token_capacities()
+        if len(nixl_agent_meta.source_group_planes) != group_count:
+            fail(
+                "source_group_planes cardinality differs from cache groups: "
+                f"planes={len(nixl_agent_meta.source_group_planes)}, "
+                f"groups={group_count}"
+            )
+        if any(plane not in (1, 2) for plane in nixl_agent_meta.source_group_planes):
+            fail(
+                "source_group_planes must contain only one- or two-plane "
+                f"groups: {nixl_agent_meta.source_group_planes}"
+            )
+        if nixl_agent_meta.source_group_planes != local_planes:
+            fail(
+                "ordered source-group plane semantics differ: "
+                f"local={local_planes}, "
+                f"remote={nixl_agent_meta.source_group_planes}"
+            )
+        if len(nixl_agent_meta.physical_group_token_capacities) != group_count:
+            fail(
+                "physical_group_token_capacities cardinality differs from cache "
+                f"groups: capacities="
+                f"{len(nixl_agent_meta.physical_group_token_capacities)}, "
+                f"groups={group_count}"
+            )
+        if any(
+            capacity <= 0
+            for capacity in nixl_agent_meta.physical_group_token_capacities
+        ):
+            fail(
+                "physical_group_token_capacities contains a non-positive value: "
+                f"{nixl_agent_meta.physical_group_token_capacities}"
+            )
+        for group_index, (local_capacity, remote_capacity) in enumerate(
+            zip(
+                local_capacities,
+                nixl_agent_meta.physical_group_token_capacities,
+            )
+        ):
+            expected_local_capacity = (
+                remote_capacity
+                if _is_ssm_spec(self._group_spec_types[group_index])
+                else remote_capacity * block_size_ratio
+            )
+            if local_capacity != expected_local_capacity:
+                fail(
+                    f"group {group_index} physical token capacity does not scale "
+                    f"with block geometry: local={local_capacity}, "
+                    f"remote={remote_capacity}, ratio={block_size_ratio}"
+                )
+
+        local_regions = self._region_descriptors
+        local_addresses = [region.base_address for region in local_regions]
+        self._validate_region_descriptor_set(
+            nixl_agent_meta,
+            remote_tp_rank,
+            "local",
+            local_regions,
+            local_addresses,
+            self.block_len_per_layer,
+            self.num_blocks,
+            group_count,
+            local_layout,
+        )
+        self._validate_region_descriptor_set(
+            nixl_agent_meta,
+            remote_tp_rank,
+            "remote",
+            nixl_agent_meta.regions,
+            nixl_agent_meta.kv_caches_base_addr,
+            nixl_agent_meta.block_lens,
+            nixl_agent_meta.num_blocks,
+            group_count,
+            nixl_agent_meta.kv_cache_layout,
+        )
+        if len(local_regions) != len(nixl_agent_meta.regions):
+            fail(
+                "ordered region cardinality differs: "
+                f"local={len(local_regions)}, remote={len(nixl_agent_meta.regions)}"
+            )
+        for region_index, (local_region, remote_region) in enumerate(
+            zip(local_regions, nixl_agent_meta.regions)
+        ):
+            local_identity = (
+                local_region.semantic_name,
+                local_region.group_indices,
+                local_region.group_semantic_names,
+                local_region.dtype,
+                local_region.element_size_bytes,
+            )
+            remote_identity = (
+                remote_region.semantic_name,
+                remote_region.group_indices,
+                remote_region.group_semantic_names,
+                remote_region.dtype,
+                remote_region.element_size_bytes,
+            )
+            if local_identity != remote_identity:
+                fail(
+                    f"ordered semantic identity differs at region {region_index}: "
+                    f"local={local_identity}, remote={remote_identity}"
+                )
+
         if not self._has_mamba:
-            assert len(self.block_len_per_layer) == len(nixl_agent_meta.block_lens), (
-                "Number of KV layers must match between prefill and decode"
-            )
-            model_replicated = self.use_mla or self.transfer_topo.is_kv_replicated(
-                remote_engine_id
-            )
-            total_kv_heads = self.transfer_topo.total_num_kv_heads
-            local_heads = self.transfer_topo.local_physical_heads
+            model_replicated = self.use_mla or remote_kv_replicated
+            total_kv_heads = transfer_topo.total_num_kv_heads
+            local_heads = transfer_topo.local_physical_heads
             remote_heads = max(1, total_kv_heads // remote_tp_size)
-            for i, local_len in enumerate(self.block_len_per_layer):
-                replicated = model_replicated or self._is_region_replicated(i)
-                remote_len = nixl_agent_meta.block_lens[i]
+            if local_heads <= 0:
+                fail(f"local physical KV-head count is invalid: {local_heads}")
+            for region_index, local_len in enumerate(self.block_len_per_layer):
+                remote_len = nixl_agent_meta.block_lens[region_index]
+                replicated = model_replicated or self._is_region_replicated(
+                    region_index
+                )
                 if replicated:
-                    assert local_len // block_size_ratio == remote_len, (
-                        "KV cache sizes must match between P and D when "
-                        f"replicated (region {i}: local={local_len}, "
-                        f"remote={remote_len}, bsr={block_size_ratio})."
-                    )
-                elif tp_ratio > 0:
-                    assert (
-                        remote_len
-                        == (local_len * remote_heads // local_heads) // block_size_ratio
-                    ), (
-                        f"SPLIT region {i}: remote P KV block_len {remote_len} "
-                        f"must equal local {local_len} * remote_heads "
-                        f"{remote_heads} // local_heads {local_heads} "
-                        f"// block_size_ratio {block_size_ratio}."
-                    )
+                    if local_len % block_size_ratio != 0:
+                        fail(
+                            f"replicated region {region_index} row length "
+                            f"{local_len} is not divisible by block-size ratio "
+                            f"{block_size_ratio}"
+                        )
+                    expected_remote_len = local_len // block_size_ratio
                 else:
-                    assert block_size_ratio == 1, (
-                        "Different local/remote block sizes are not supported "
-                        "when P TP > D TP."
-                    )
-                    assert remote_len == local_len * remote_heads // local_heads, (
-                        f"SPLIT region {i}: remote P KV block_len {remote_len} "
-                        f"must equal local {local_len} * remote_heads "
-                        f"{remote_heads} // local_heads {local_heads}."
+                    scaled_local_len = local_len * remote_heads
+                    if scaled_local_len % local_heads != 0:
+                        fail(
+                            f"split region {region_index} row length cannot be "
+                            "scaled by the P/D physical-head ratio"
+                        )
+                    expected_remote_len = scaled_local_len // local_heads
+                    if tp_ratio > 0:
+                        if expected_remote_len % block_size_ratio != 0:
+                            fail(
+                                f"split region {region_index} row length cannot "
+                                "be scaled by the block-size ratio"
+                            )
+                        expected_remote_len //= block_size_ratio
+                    elif block_size_ratio != 1:
+                        fail(
+                            "different local and remote block sizes are "
+                            "unsupported when P TP exceeds D TP"
+                        )
+                if remote_len != expected_remote_len:
+                    fail(
+                        f"region {region_index} remote row length {remote_len} "
+                        f"does not match expected {expected_remote_len} "
+                        f"(local={local_len}, local_heads={local_heads}, "
+                        f"remote_heads={remote_heads}, "
+                        f"block_ratio={block_size_ratio}, "
+                        f"replicated={replicated})"
                     )
 
-        # TP workers that handhshake with same remote have same #blocks.
-        assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
-        # Same number of regions/~layers.
-        assert len(nixl_agent_meta.kv_caches_base_addr) == len(self.block_len_per_layer)
+        self._validate_tp_mapping_contract(
+            nixl_agent_meta,
+            remote_tp_rank,
+            remote_tp_size,
+            plan,
+        )
+
+        if (
+            remote_engine_id in self.dst_num_blocks
+            and self.dst_num_blocks[remote_engine_id] != nixl_agent_meta.num_blocks
+        ):
+            fail(
+                "producer ranks disagree on num_blocks: "
+                f"first={self.dst_num_blocks[remote_engine_id]}, "
+                f"rank_{remote_tp_rank}={nixl_agent_meta.num_blocks}"
+            )
+        existing_regions = self._remote_regions.get(remote_engine_id, {})
+        if len(existing_regions) > 0:
+            reference_rank = min(existing_regions)
+            reference_rank_contract = self._remote_rank_contracts[remote_engine_id][
+                reference_rank
+            ]
+            current_rank_contract = self._rank_handshake_contract(nixl_agent_meta)
+            rank_contract_differences = self._rank_handshake_contract_differences(
+                reference_rank_contract,
+                current_rank_contract,
+            )
+            if len(rank_contract_differences) > 0:
+                fail(
+                    f"producer rank contract differs from rank {reference_rank} "
+                    f"in fields {rank_contract_differences}: "
+                    f"first={reference_rank_contract}, "
+                    f"current={current_rank_contract}"
+                )
+            reference_layout = self._remote_layout[remote_engine_id][reference_rank]
+            remote_layout = (
+                list(nixl_agent_meta.block_lens),
+                nixl_agent_meta.num_blocks,
+                nixl_agent_meta.device_id,
+            )
+            if reference_layout[:2] != remote_layout[:2]:
+                fail(
+                    f"producer rank {remote_tp_rank} layout differs from rank "
+                    f"{reference_rank}: first={reference_layout[:2]}, "
+                    f"current={remote_layout[:2]}"
+                )
+            reference_contract = self._rank_region_contract(
+                existing_regions[reference_rank]
+            )
+            current_contract = self._rank_region_contract(nixl_agent_meta.regions)
+            if reference_contract != current_contract:
+                fail(
+                    f"producer rank {remote_tp_rank} region geometry differs from "
+                    f"rank {reference_rank}"
+                )
+            reference_semantics = self._remote_source_semantics[remote_engine_id][
+                reference_rank
+            ]
+            current_semantics = (
+                nixl_agent_meta.source_group_planes,
+                nixl_agent_meta.physical_group_token_capacities,
+            )
+            if reference_semantics != current_semantics:
+                fail(
+                    f"producer rank {remote_tp_rank} group geometry differs from "
+                    f"rank {reference_rank}: first={reference_semantics}, "
+                    f"current={current_semantics}"
+                )
+            remote_info = transfer_topo.get_engine_info(remote_engine_id)
+            current_topology = (
+                remote_tp_size,
+                nixl_agent_meta.block_size,
+                nixl_agent_meta.physical_blocks_per_logical_kv_block,
+            )
+            reference_topology = (
+                remote_info.remote_tp_size,
+                remote_info.remote_block_size,
+                remote_info.remote_physical_blocks_per_logical,
+            )
+            if current_topology != reference_topology:
+                fail(
+                    f"producer rank {remote_tp_rank} topology differs from rank "
+                    f"{reference_rank}: first={reference_topology}, "
+                    f"current={current_topology}"
+                )
+
+        postprocess_contract = _HandshakePostprocessContract(
+            enable_permute_local_kv=enable_permute_local_kv,
+            enable_heterogeneous_attn_post_process=(
+                enable_heterogeneous_attn_post_process
+            ),
+        )
+        has_existing_remote = any(
+            len(rank_agents) > 0 for rank_agents in self._remote_agents.values()
+        )
+        existing_contract = _HandshakePostprocessContract(
+            enable_permute_local_kv=self.enable_permute_local_kv,
+            enable_heterogeneous_attn_post_process=(
+                self.enable_heterogeneous_attn_post_process
+            ),
+        )
+        if has_existing_remote and postprocess_contract != existing_contract:
+            fail(
+                "remote engines require incompatible destination post-processing: "
+                f"existing={existing_contract}, current={postprocess_contract}"
+            )
+        return postprocess_contract
 
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta):
         """copy recved kv from host buffer to device."""
@@ -2703,68 +3713,69 @@ class NixlBaseConnectorWorker:
             return
         if self._staging_buf is None:
             raise LocalizationError("staging capture has no staging allocation")
-        plan = ownership.scatter
-        contracts = tuple(plan["source_contracts"])
-        positions = plan["transfer_order"]
-        n_pos = int(plan["n_pos"])
-        n_ranks = int(plan["n_ranks"])
+        plan = self._coalesced_localization_plans.get(req_id)
+        if plan is None:
+            raise LocalizationError(
+                f"staging capture has no retained localization plan for {req_id}"
+            )
+        layout = plan.layout
+        if layout != ownership.layout:
+            raise LocalizationError(
+                f"staging ownership differs from localization layout for {req_id}"
+            )
+        contracts = plan.source_contracts
+        n_ranks = len(layout.source_ranks)
         if len(contracts) != n_ranks:
             raise LocalizationError(f"staging capture lacks contracts for {req_id}")
         fingerprint_mode = (
             self._localization_config.mode is LocalizationMode.FINGERPRINT
         )
-        for rank_index, source_rank in enumerate(plan["source_ranks"]):
+        for rank_index, source_rank in enumerate(layout.source_ranks):
             start_ns = time.perf_counter_ns()
             contract = contracts[rank_index]
-            if contract.source_rank != int(source_rank):
+            if contract.source_rank != source_rank:
                 raise LocalizationError("staging contract rank order differs")
-            rank_slot = int(plan["slots"][rank_index])
+            rank_slot = layout.rank_slots[rank_index]
             leaves: list[NixlIntegrityLeaf] = []
             fingerprint_batches: list[torch.Tensor] = []
             fingerprint_specs: list[_LocalizationLeafSpec] = []
             mapping: dict[IntegrityLeafKey, tuple[int, int, int]] = {}
             copied_bytes = 0
             hashed_bytes = 0
-            for region_index, row_bytes_raw in enumerate(plan["blens"]):
-                row_bytes = int(row_bytes_raw)
-                region_start = ownership.lease.offset + int(
-                    plan["region_off"][region_index]
+            for region_layout in layout.regions:
+                region_index = region_layout.ownership.region_index
+                row_bytes = region_layout.ownership.row_bytes
+                region_start = ownership.lease.offset + layout.region_offset(
+                    rank_index,
+                    region_index,
                 )
-                region_size = n_ranks * n_pos * row_bytes
+                position_count = len(region_layout.positions)
+                region_size = position_count * row_bytes
                 region = self._staging_buf[
                     region_start : region_start + region_size
-                ].view(n_ranks, n_pos, row_bytes)[rank_index]
+                ].view(position_count, row_bytes)
                 rows_per_chunk = max(
                     1,
                     self._localization_config.copy_chunk_bytes // row_bytes,
                 )
-                descriptor = contract.regions[region_index]
-                owned_indices = [
-                    index
-                    for index, position in enumerate(positions)
-                    if int(position.group_index) in descriptor.group_indices
-                ]
-                for chunk_start in range(0, len(owned_indices), rows_per_chunk):
-                    selected = owned_indices[chunk_start : chunk_start + rows_per_chunk]
-                    selected_tensor = torch.tensor(
-                        selected,
-                        device=region.device,
-                        dtype=torch.long,
-                    )
-                    selected_rows = region.index_select(
-                        0,
-                        selected_tensor,
-                    )
+                for chunk_start in range(0, position_count, rows_per_chunk):
+                    chunk_end = min(chunk_start + rows_per_chunk, position_count)
+                    selected_rows = region[chunk_start:chunk_end]
                     host_rows = (
                         None if fingerprint_mode else selected_rows.cpu().contiguous()
                     )
                     if fingerprint_mode is False:
-                        copied_bytes += len(selected) * row_bytes
+                        copied_bytes += (chunk_end - chunk_start) * row_bytes
                     wire_specs: list[_LocalizationLeafSpec] = []
                     commit_specs: list[_LocalizationLeafSpec] = []
                     commit_row_indices: list[int] = []
-                    for row_index, position_index in enumerate(selected):
-                        position = positions[position_index]
+                    for row_index, position_index in enumerate(
+                        range(chunk_start, chunk_end)
+                    ):
+                        position = region_layout.positions[position_index]
+                        group_token_capacity = contract.group_token_capacities[
+                            position.group_index
+                        ]
                         payload = (
                             None
                             if host_rows is None
@@ -2772,10 +3783,10 @@ class NixlBaseConnectorWorker:
                         )
                         semantic_contract_digest = compute_semantic_contract_digest(
                             region=contract.regions[region_index],
-                            group_index=int(position.group_index),
-                            group_token_capacity=int(position.group_token_capacity),
+                            group_index=position.group_index,
+                            group_token_capacity=group_token_capacity,
                             source_plane_contract=(
-                                contract.source_group_planes[int(position.group_index)]
+                                contract.source_group_planes[position.group_index]
                             ),
                         )
                         wire_identity = build_integrity_identity(
@@ -2786,14 +3797,14 @@ class NixlBaseConnectorWorker:
                             semantic_contract_digest=semantic_contract_digest,
                             offer_generation=contract.offer_generation,
                             iteration=contract.iteration,
-                            source_rank=int(source_rank),
+                            source_rank=source_rank,
                             region_index=region_index,
-                            group_index=int(position.group_index),
+                            group_index=position.group_index,
                             plane_index=-1,
-                            source_position=int(position.source_position),
-                            remote_block_id=int(position.remote_block_id),
-                            valid_token_extent=int(position.valid_token_extent),
-                            group_token_capacity=int(position.group_token_capacity),
+                            source_position=position.source_position,
+                            remote_block_id=position.remote_block_id,
+                            valid_token_extent=contract.valid_token_extent,
+                            group_token_capacity=group_token_capacity,
                             payload_kind=IntegrityPayloadKind.WIRE,
                             byte_length=row_bytes,
                         )
@@ -2801,8 +3812,8 @@ class NixlBaseConnectorWorker:
                             wire_specs.append(
                                 _LocalizationLeafSpec(
                                     identity=wire_identity,
-                                    local_block_id=int(position.local_block_id),
-                                    destination_half=int(position.plane_index),
+                                    local_block_id=position.local_block_id,
+                                    destination_half=position.destination_half,
                                     rank_slot=rank_slot,
                                 )
                             )
@@ -2811,18 +3822,18 @@ class NixlBaseConnectorWorker:
                             wire_leaf = build_integrity_leaf(
                                 identity=wire_identity,
                                 payload=payload,
-                                local_block_id=int(position.local_block_id),
-                                destination_half=int(position.plane_index),
+                                local_block_id=position.local_block_id,
+                                destination_half=position.destination_half,
                                 rank_slot=rank_slot,
                             )
                             leaves.append(wire_leaf)
                             mapping[leaf_source_key(wire_leaf)] = (
-                                int(position.local_block_id),
+                                position.local_block_id,
                                 rank_slot,
-                                int(position.plane_index),
+                                position.destination_half,
                             )
                         hashed_bytes += row_bytes
-                        if int(position.plane_index) < 0:
+                        if position.destination_half < 0:
                             continue
                         commit_bytes = row_bytes // 2
                         commit_identity = build_integrity_identity(
@@ -2833,14 +3844,14 @@ class NixlBaseConnectorWorker:
                             semantic_contract_digest=semantic_contract_digest,
                             offer_generation=contract.offer_generation,
                             iteration=contract.iteration,
-                            source_rank=int(source_rank),
+                            source_rank=source_rank,
                             region_index=region_index,
-                            group_index=int(position.group_index),
+                            group_index=position.group_index,
                             plane_index=0,
-                            source_position=int(position.source_position),
-                            remote_block_id=int(position.remote_block_id),
-                            valid_token_extent=int(position.valid_token_extent),
-                            group_token_capacity=int(position.group_token_capacity),
+                            source_position=position.source_position,
+                            remote_block_id=position.remote_block_id,
+                            valid_token_extent=contract.valid_token_extent,
+                            group_token_capacity=group_token_capacity,
                             payload_kind=IntegrityPayloadKind.COMMIT,
                             byte_length=commit_bytes,
                         )
@@ -2848,8 +3859,8 @@ class NixlBaseConnectorWorker:
                             commit_specs.append(
                                 _LocalizationLeafSpec(
                                     identity=commit_identity,
-                                    local_block_id=int(position.local_block_id),
-                                    destination_half=int(position.plane_index),
+                                    local_block_id=position.local_block_id,
+                                    destination_half=position.destination_half,
                                     rank_slot=rank_slot,
                                 )
                             )
@@ -2859,15 +3870,15 @@ class NixlBaseConnectorWorker:
                             commit_leaf = build_integrity_leaf(
                                 identity=commit_identity,
                                 payload=payload[:commit_bytes],
-                                local_block_id=int(position.local_block_id),
-                                destination_half=int(position.plane_index),
+                                local_block_id=position.local_block_id,
+                                destination_half=position.destination_half,
                                 rank_slot=rank_slot,
                             )
                             leaves.append(commit_leaf)
                             mapping[leaf_source_key(commit_leaf)] = (
-                                int(position.local_block_id),
+                                position.local_block_id,
                                 rank_slot,
-                                int(position.plane_index),
+                                position.destination_half,
                             )
                         hashed_bytes += commit_bytes
                     if fingerprint_mode:
@@ -2912,7 +3923,7 @@ class NixlBaseConnectorWorker:
     def _localization_capture_destination(
         self,
         req_id: ReqId,
-        plan: dict[str, Any],
+        plan: _CoalescedLocalizationPlan,
         stage: IntegrityStage,
         barrier: str,
     ) -> None:
@@ -2927,41 +3938,48 @@ class NixlBaseConnectorWorker:
             return
         if self._region_rows is None:
             raise LocalizationError("destination capture has no canonical rows")
-        contracts = tuple(plan["source_contracts"])
-        positions = plan["transfer_order"]
-        n_ranks = int(plan["n_ranks"])
+        layout = plan.layout
+        contracts = plan.source_contracts
+        n_ranks = len(layout.source_ranks)
         if len(contracts) != n_ranks:
             raise LocalizationError(f"destination capture lacks contracts for {req_id}")
+        if len(self._region_rows) != len(layout.regions):
+            raise LocalizationError(
+                f"destination region roster differs from plan for {req_id}"
+            )
         fingerprint_mode = (
             self._localization_config.mode is LocalizationMode.FINGERPRINT
         )
-        for rank_index, source_rank in enumerate(plan["source_ranks"]):
+        for rank_index, source_rank in enumerate(layout.source_ranks):
             start_ns = time.perf_counter_ns()
             contract = contracts[rank_index]
-            if contract.source_rank != int(source_rank):
+            if contract.source_rank != source_rank:
                 raise LocalizationError("destination contract rank order differs")
-            rank_slot = int(plan["slots"][rank_index])
+            rank_slot = layout.rank_slots[rank_index]
             leaves: list[NixlIntegrityLeaf] = []
             fingerprint_batches: list[torch.Tensor] = []
             fingerprint_specs: list[_LocalizationLeafSpec] = []
             mapping: dict[IntegrityLeafKey, tuple[int, int, int]] = {}
             copied_bytes = 0
             hashed_bytes = 0
-            for region_index, flat in enumerate(self._region_rows):
-                row_bytes = int(plan["blens"][region_index])
+            for region_layout, flat in zip(
+                layout.regions,
+                self._region_rows,
+                strict=True,
+            ):
+                region_index = region_layout.ownership.region_index
+                positions = region_layout.positions
+                row_bytes = region_layout.ownership.row_bytes
                 chunk_bytes = row_bytes // 2
-                descriptor = self._region_descriptors[region_index]
                 dual_indices = [
                     index
                     for index, position in enumerate(positions)
-                    if int(position.group_index) in descriptor.group_indices
-                    and int(position.plane_index) < 0
+                    if position.destination_half < 0
                 ]
                 single_indices = [
                     index
                     for index, position in enumerate(positions)
-                    if int(position.group_index) in descriptor.group_indices
-                    and int(position.plane_index) >= 0
+                    if position.destination_half >= 0
                 ]
                 destination = flat.view(flat.shape[0], 2, n_ranks, chunk_bytes)
                 rows_per_chunk = max(
@@ -2971,7 +3989,7 @@ class NixlBaseConnectorWorker:
                 for chunk_start in range(0, len(dual_indices), rows_per_chunk):
                     selected = dual_indices[chunk_start : chunk_start + rows_per_chunk]
                     local_indices = torch.tensor(
-                        [int(positions[index].local_block_id) for index in selected],
+                        [positions[index].local_block_id for index in selected],
                         device=flat.device,
                         dtype=torch.long,
                     )
@@ -2986,6 +4004,9 @@ class NixlBaseConnectorWorker:
                     batch_specs: list[_LocalizationLeafSpec] = []
                     for row_index, position_index in enumerate(selected):
                         position = positions[position_index]
+                        group_token_capacity = contract.group_token_capacities[
+                            position.group_index
+                        ]
                         payload = (
                             None
                             if host_rows is None
@@ -2993,10 +4014,10 @@ class NixlBaseConnectorWorker:
                         )
                         semantic_contract_digest = compute_semantic_contract_digest(
                             region=contract.regions[region_index],
-                            group_index=int(position.group_index),
-                            group_token_capacity=int(position.group_token_capacity),
+                            group_index=position.group_index,
+                            group_token_capacity=group_token_capacity,
                             source_plane_contract=(
-                                contract.source_group_planes[int(position.group_index)]
+                                contract.source_group_planes[position.group_index]
                             ),
                         )
                         identity = build_integrity_identity(
@@ -3007,14 +4028,14 @@ class NixlBaseConnectorWorker:
                             semantic_contract_digest=semantic_contract_digest,
                             offer_generation=contract.offer_generation,
                             iteration=contract.iteration,
-                            source_rank=int(source_rank),
+                            source_rank=source_rank,
                             region_index=region_index,
-                            group_index=int(position.group_index),
+                            group_index=position.group_index,
                             plane_index=-1,
-                            source_position=int(position.source_position),
-                            remote_block_id=int(position.remote_block_id),
-                            valid_token_extent=int(position.valid_token_extent),
-                            group_token_capacity=int(position.group_token_capacity),
+                            source_position=position.source_position,
+                            remote_block_id=position.remote_block_id,
+                            valid_token_extent=contract.valid_token_extent,
+                            group_token_capacity=group_token_capacity,
                             payload_kind=IntegrityPayloadKind.WIRE,
                             byte_length=row_bytes,
                         )
@@ -3022,7 +4043,7 @@ class NixlBaseConnectorWorker:
                             batch_specs.append(
                                 _LocalizationLeafSpec(
                                     identity=identity,
-                                    local_block_id=int(position.local_block_id),
+                                    local_block_id=position.local_block_id,
                                     destination_half=-1,
                                     rank_slot=rank_slot,
                                 )
@@ -3032,13 +4053,13 @@ class NixlBaseConnectorWorker:
                             leaf = build_integrity_leaf(
                                 identity=identity,
                                 payload=payload,
-                                local_block_id=int(position.local_block_id),
+                                local_block_id=position.local_block_id,
                                 destination_half=-1,
                                 rank_slot=rank_slot,
                             )
                             leaves.append(leaf)
                             mapping[leaf_source_key(leaf)] = (
-                                int(position.local_block_id),
+                                position.local_block_id,
                                 rank_slot,
                                 -1,
                             )
@@ -3063,12 +4084,12 @@ class NixlBaseConnectorWorker:
                         chunk_start : chunk_start + single_rows_per_chunk
                     ]
                     local_indices = torch.tensor(
-                        [int(positions[index].local_block_id) for index in selected],
+                        [positions[index].local_block_id for index in selected],
                         device=flat.device,
                         dtype=torch.long,
                     )
                     destination_halves = torch.tensor(
-                        [int(positions[index].plane_index) for index in selected],
+                        [positions[index].destination_half for index in selected],
                         device=flat.device,
                         dtype=torch.long,
                     )
@@ -3084,6 +4105,9 @@ class NixlBaseConnectorWorker:
                     batch_specs = []
                     for row_index, position_index in enumerate(selected):
                         position = positions[position_index]
+                        group_token_capacity = contract.group_token_capacities[
+                            position.group_index
+                        ]
                         payload = (
                             None
                             if host_rows is None
@@ -3091,10 +4115,10 @@ class NixlBaseConnectorWorker:
                         )
                         semantic_contract_digest = compute_semantic_contract_digest(
                             region=contract.regions[region_index],
-                            group_index=int(position.group_index),
-                            group_token_capacity=int(position.group_token_capacity),
+                            group_index=position.group_index,
+                            group_token_capacity=group_token_capacity,
                             source_plane_contract=(
-                                contract.source_group_planes[int(position.group_index)]
+                                contract.source_group_planes[position.group_index]
                             ),
                         )
                         identity = build_integrity_identity(
@@ -3105,14 +4129,14 @@ class NixlBaseConnectorWorker:
                             semantic_contract_digest=semantic_contract_digest,
                             offer_generation=contract.offer_generation,
                             iteration=contract.iteration,
-                            source_rank=int(source_rank),
+                            source_rank=source_rank,
                             region_index=region_index,
-                            group_index=int(position.group_index),
+                            group_index=position.group_index,
                             plane_index=0,
-                            source_position=int(position.source_position),
-                            remote_block_id=int(position.remote_block_id),
-                            valid_token_extent=int(position.valid_token_extent),
-                            group_token_capacity=int(position.group_token_capacity),
+                            source_position=position.source_position,
+                            remote_block_id=position.remote_block_id,
+                            valid_token_extent=contract.valid_token_extent,
+                            group_token_capacity=group_token_capacity,
                             payload_kind=IntegrityPayloadKind.COMMIT,
                             byte_length=chunk_bytes,
                         )
@@ -3120,8 +4144,8 @@ class NixlBaseConnectorWorker:
                             batch_specs.append(
                                 _LocalizationLeafSpec(
                                     identity=identity,
-                                    local_block_id=int(position.local_block_id),
-                                    destination_half=int(position.plane_index),
+                                    local_block_id=position.local_block_id,
+                                    destination_half=position.destination_half,
                                     rank_slot=rank_slot,
                                 )
                             )
@@ -3130,15 +4154,15 @@ class NixlBaseConnectorWorker:
                             leaf = build_integrity_leaf(
                                 identity=identity,
                                 payload=payload,
-                                local_block_id=int(position.local_block_id),
-                                destination_half=int(position.plane_index),
+                                local_block_id=position.local_block_id,
+                                destination_half=position.destination_half,
                                 rank_slot=rank_slot,
                             )
                             leaves.append(leaf)
                             mapping[leaf_source_key(leaf)] = (
-                                int(position.local_block_id),
+                                position.local_block_id,
                                 rank_slot,
-                                int(position.plane_index),
+                                position.destination_half,
                             )
                         hashed_bytes += chunk_bytes
                     if fingerprint_mode:
@@ -3234,7 +4258,7 @@ class NixlBaseConnectorWorker:
             return
         if len(self._localization_pre_read_plans) == 0:
             return
-        scheduled_plans: list[tuple[ReqId, dict[str, Any]]] = []
+        scheduled_plans: list[tuple[ReqId, _CoalescedLocalizationPlan]] = []
         for req_id, plan in self._localization_pre_read_plans.items():
             if self._localization_config.enabled_for(req_id) is False:
                 raise LocalizationError(
@@ -3248,9 +4272,9 @@ class NixlBaseConnectorWorker:
                 req_id,
                 plan,
                 IntegrityStage.PRE_READ,
-                "after_transfer_phase_drain_before_model_forward",
+                localization_stage_barrier(IntegrityStage.PRE_READ),
             )
-            contracts = tuple(plan["source_contracts"])
+            contracts = plan.source_contracts
             if len(contracts) == 0:
                 raise LocalizationError("pre-read plan has no source contracts")
             producer = contracts[0]
@@ -3327,11 +4351,16 @@ class NixlBaseConnectorWorker:
         size = self.coalesce_staging_mb * 1024 * 1024
         try:
             dev = next(iter(self.device_kv_caches.values())).device
-            # Successful plans overwrite the complete lease before scatter.
-            # The allocation therefore has no initialization writer to order.
-            self._staging_buf = torch.empty(size, dtype=torch.uint8, device=dev)
+            if dev.type != "cuda":
+                raise StagingSafetyError(
+                    "coalesced scatter requires a CUDA staging device"
+                )
+            staging_buf = torch.empty(size, dtype=torch.uint8, device=dev)
+            scatter_stream = torch.cuda.Stream(device=dev)
+            allocator = StagingRangeAllocator(size)
+            staging_descs = [(staging_buf.data_ptr(), size, self.device_id, "")]
             self.nixl_wrapper.register_memory(
-                [(self._staging_buf.data_ptr(), size, self.device_id, "")],
+                staging_descs,
                 self.nixl_memory_type,
             )
         except Exception:
@@ -3342,25 +4371,26 @@ class NixlBaseConnectorWorker:
             self.coalesce_pull = False
             self._staging_buf = None
             return False
-        self._staging_allocator = StagingRangeAllocator(size)
+        self._registered_descs.append(staging_descs)
+        self._staging_buf = staging_buf
+        self._coalesced_scatter_stream = scatter_stream
+        self._staging_allocator = allocator
         logger.info("coalesced pull: %sMB staging registered", self.coalesce_staging_mb)
         return True
 
     def _create_coalesced_plan(
         self,
         req_id: ReqId,
-        size: int,
-        source_ranks: tuple[int, ...],
         remote_engine_id: EngineId,
-        scatter: dict[str, Any],
+        layout: CoalescedTransferPlan,
+        layout_duration_seconds: float,
     ) -> CoalescedStagingPlan | None:
         """Atomically allocate staging and install its native owner.
 
         :param req_id: Decoder request identifier.
-        :param size: Required staging bytes.
-        :param source_ranks: Complete set of independently posted ranks.
         :param remote_engine_id: Remote engine owning the source registration.
-        :param scatter: Transfer and placement geometry retained by the plan.
+        :param layout: Canonical transfer and placement geometry.
+        :param layout_duration_seconds: Wall time spent building ``layout``.
         :returns: Installed plan, or ``None`` when the pool is busy.
         """
         if self._staging_allocator is None:
@@ -3379,10 +4409,9 @@ class NixlBaseConnectorWorker:
         plan = self._staging_allocator.create_plan(
             owner_id=owner_id,
             request_id=req_id,
-            size=size,
-            source_ranks=source_ranks,
+            layout=layout,
+            layout_duration_seconds=layout_duration_seconds,
             remote_engine_id=remote_engine_id,
-            scatter=scatter,
             warn_after_s=self._coalesce_warn_after_s,
             fail_after_s=self._coalesce_fail_after_s,
         )
@@ -3400,10 +4429,66 @@ class NixlBaseConnectorWorker:
         """
         if self._staging_allocator is None:
             raise StagingSafetyError("coalesced staging allocator disappeared")
-        if self._coalesce_plans.get(plan.request_id) is not plan:
+        request_id = plan.request_id
+        if self._coalesce_plans.get(request_id) is not plan:
             raise StagingSafetyError("coalesced staging request owner mismatch")
         self._staging_allocator.release(plan)
-        del self._coalesce_plans[plan.request_id]
+        del self._coalesce_plans[request_id]
+
+    def _install_coalesced_localization_plan(
+        self,
+        req_id: ReqId,
+        layout: CoalescedTransferPlan,
+        source_contracts: tuple[NixlSourceContract, ...],
+    ) -> None:
+        """Retain typed diagnostic context for a canonical transfer.
+
+        :param req_id: Decoder child request identifier.
+        :param layout: Canonical transfer and placement layout.
+        :param source_contracts: Authenticated producer contracts in rank order.
+        """
+        if self._localization_config.enabled_for(req_id) is False:
+            if len(source_contracts) > 0:
+                raise LocalizationError(
+                    "localization contracts were supplied outside target scope"
+                )
+            return
+        if req_id in self._coalesced_localization_plans:
+            raise LocalizationError("coalesced localization plan is duplicated")
+        if tuple(contract.source_rank for contract in source_contracts) != (
+            layout.source_ranks
+        ):
+            raise LocalizationError(
+                "localization source contracts differ from canonical rank order"
+            )
+        for contract in source_contracts:
+            if (
+                len(contract.regions) != len(layout.regions)
+                or len(contract.source_group_planes) != len(layout.groups)
+                or len(contract.group_token_capacities) != len(layout.groups)
+            ):
+                raise LocalizationError(
+                    "localization contract cardinality differs from canonical layout"
+                )
+            for region_layout, descriptor in zip(
+                layout.regions,
+                contract.regions,
+                strict=True,
+            ):
+                ownership = region_layout.ownership
+                if (
+                    descriptor.group_indices != ownership.group_indices
+                    or descriptor.row_bytes != ownership.row_bytes
+                    or len(descriptor.shape) == 0
+                    or descriptor.shape[0] != ownership.source_row_count
+                ):
+                    raise LocalizationError(
+                        "localization region contract differs from canonical layout"
+                    )
+        self._coalesced_localization_plans[req_id] = _CoalescedLocalizationPlan(
+            layout=layout,
+            source_contracts=source_contracts,
+        )
 
     def _discard_completed_coalesced_plan(self, request_id: ReqId) -> None:
         """Reclaim a successful native plan whose request failed before scatter.
@@ -3506,6 +4591,8 @@ class NixlBaseConnectorWorker:
         plan = self._coalesce_plans.get(request_id)
         if plan is None:
             return True
+        if request_id in self._pending_coalesced_scatters:
+            return False
         if plan.ready_to_scatter:
             self._discard_completed_coalesced_plan(request_id)
             return True
@@ -3519,7 +4606,48 @@ class NixlBaseConnectorWorker:
         self._release_quiescent_failed_coalesced_plan(plan)
         return True
 
-    def _initialize_and_post_coalesced(
+    def _finish_quiescent_coalesced_request_failure(
+        self,
+        plan: CoalescedStagingPlan,
+        reason: str,
+    ) -> None:
+        """Fail one request after every native and device actor is quiescent.
+
+        :param plan: Exact staging owner being retired.
+        :param reason: Stable request-failure detail.
+        """
+        if plan.operation_failed is False:
+            plan.fail(reason)
+        if plan.posting_sealed is False:
+            plan.seal_posting()
+        if plan.reusable is False:
+            self._fail_coalesced_plan(plan, reason)
+        self._release_quiescent_failed_coalesced_plan(plan)
+        logger.error(
+            "coalesced request failed after safe quiescence: request=%s reason=%s",
+            plan.request_id,
+            reason,
+        )
+        meta = self._recving_metadata.get(plan.request_id)
+        remote = meta.remote if meta is not None else None
+        self._localization_record_event(
+            code="TRANSFER_ABORTED",
+            evidentiary=False,
+            child_request_id=plan.request_id,
+            producer_engine_id=(remote.engine_id if remote is not None else None),
+            producer_request_id=(remote.request_id if remote is not None else None),
+            detail=reason,
+        )
+        self._coalesced_localization_plans.pop(plan.request_id, None)
+        self._localization_pre_read_plans.pop(plan.request_id, None)
+        self._record_failed_receive(
+            plan.request_id,
+            KVTransferFailureReason.TRANSFER,
+            meta,
+        )
+        self.xfer_stats.record_failed_transfer()
+
+    def _prepare_coalesced_handle(
         self,
         plan: CoalescedStagingPlan,
         source_rank: int,
@@ -3528,7 +4656,7 @@ class NixlBaseConnectorWorker:
         remote_agent: str,
         notification_id: bytes,
     ) -> bool:
-        """Prepare, attach, and post one rank without losing native ownership.
+        """Prepare and attach one rank without entering the native post boundary.
 
         :param plan: Owner installed before native preparation.
         :param source_rank: Producer rank being posted.
@@ -3536,7 +4664,7 @@ class NixlBaseConnectorWorker:
         :param remote_descs: NIXL remote descriptor list.
         :param remote_agent: NIXL remote agent identity.
         :param notification_id: Completion notification payload.
-        :returns: Whether the source rank was posted successfully.
+        :returns: Whether the source rank was prepared successfully.
         """
         try:
             handle = self.nixl_wrapper.initialize_xfer(
@@ -3570,9 +4698,29 @@ class NixlBaseConnectorWorker:
                 error,
             )
 
+        return True
+
+    def _post_prepared_coalesced(
+        self,
+        plan: CoalescedStagingPlan,
+        source_rank: int,
+    ) -> None:
+        """Post one already-prepared rank at the exact native mutation boundary.
+
+        :param plan: Owner retaining every prepared rank handle.
+        :param source_rank: Producer rank entering native transfer.
+        :raises StagingSafetyError: If native submission becomes uncertain or fails.
+        """
+        slot = plan.slots[source_rank]
+        handle = slot.native_handle
+        if slot.state is not HandleState.PREPARED or handle is None:
+            raise StagingSafetyError(
+                f"rank {source_rank} is not prepared for native posting"
+            )
+
         try:
-            plan.begin_post(source_rank)
             self._assert_transfer_post_allowed(coalesced=True)
+            plan.begin_post(source_rank)
             status = self.nixl_wrapper.transfer(handle)
             plan.record_post_result(source_rank, status)
         except Exception as error:
@@ -3584,12 +4732,10 @@ class NixlBaseConnectorWorker:
                     f"rank {source_rank} native post raised\n{stacktrace}",
                 )
             elif slot.state is HandleState.PREPARED:
-                self._finish_quiescent_coalesced_failure(
-                    plan,
-                    f"rank {source_rank} failed before native post\n{stacktrace}",
-                    error,
+                plan.tombstone(
+                    f"rank {source_rank} failed at the guarded native post "
+                    f"boundary\n{stacktrace}"
                 )
-                return False
             else:
                 plan.tombstone(
                     f"rank {source_rank} post transition failed in "
@@ -3606,7 +4752,6 @@ class NixlBaseConnectorWorker:
                 plan,
                 plan.failure_reason or "native post failed",
             )
-        return True
 
     def _fail_coalesced_plan(
         self,
@@ -3639,17 +4784,24 @@ class NixlBaseConnectorWorker:
         raise failure from error
 
     def _poll_coalesced_plans(self) -> set[ReqId]:
-        """Poll coalesced owners without releasing any possible writer.
+        """Advance native transfers and event-owned scatters in generation order.
 
-        :returns: Requests whose every native handle authoritatively reached DONE.
+        :returns: Requests whose destination bytes are safe to publish.
         """
-        done_req_ids: set[ReqId] = set()
         now = time.monotonic()
-        for plan in tuple(self._coalesce_plans.values()):
+        plans = tuple(
+            sorted(
+                self._coalesce_plans.values(),
+                key=lambda candidate: candidate.lease.generation,
+            )
+        )
+        for plan in plans:
             if plan.warning_due(now):
                 logger.error("coalesced staging still active: %s", plan.describe(now))
                 plan.mark_warning_emitted()
-            if plan.operation_failed:
+            if plan.request_id in self._pending_coalesced_scatters:
+                continue
+            if plan.operation_failed and plan.permanently_tombstoned:
                 self._fail_coalesced_plan(
                     plan,
                     plan.failure_reason or "coalesced operation failed",
@@ -3690,7 +4842,21 @@ class NixlBaseConnectorWorker:
                     )
                 try:
                     telemetry = self.nixl_wrapper.get_xfer_telemetry(slot.native_handle)
-                    self.xfer_stats.record_transfer(telemetry)
+                    plan.record_native_telemetry(source_rank, telemetry)
+                except Exception:
+                    plan.fail(
+                        f"rank {source_rank} terminal telemetry query raised\n"
+                        + traceback.format_exc()
+                    )
+                else:
+                    try:
+                        self.xfer_stats.record_transfer(telemetry)
+                    except Exception:
+                        logger.error(
+                            "native transfer telemetry recording failed\n%s",
+                            traceback.format_exc(),
+                        )
+                try:
                     self.nixl_wrapper.release_xfer_handle(slot.native_handle)
                 except Exception as error:
                     stacktrace = traceback.format_exc()
@@ -3699,8 +4865,7 @@ class NixlBaseConnectorWorker:
                         f"rank {source_rank} DONE handle cleanup raised\n{stacktrace}",
                         error,
                     )
-                else:
-                    plan.mark_native_released(source_rank)
+                plan.mark_native_released(source_rank)
 
             if plan.fail_deadline_expired(now):
                 plan.tombstone("native transfer exceeded the fail-stop deadline")
@@ -3708,9 +4873,38 @@ class NixlBaseConnectorWorker:
                     plan,
                     "native transfer exceeded the fail-stop deadline",
                 )
-            if plan.ready_to_scatter:
-                done_req_ids.add(plan.request_id)
-        return done_req_ids
+            if plan.operation_failed:
+                if plan.native_quiescent:
+                    self._finish_quiescent_coalesced_request_failure(
+                        plan,
+                        plan.failure_reason or "coalesced request was cancelled",
+                    )
+                continue
+            if plan.ready_to_scatter is False:
+                continue
+            try:
+                wire_bytes = sum(
+                    int(telemetry.totalBytes) for telemetry in plan.native_telemetry
+                )
+            except Exception:
+                reason = (
+                    "native telemetry was malformed after terminal completion\n"
+                    + traceback.format_exc()
+                )
+                plan.fail(reason)
+                self._finish_quiescent_coalesced_request_failure(plan, reason)
+                continue
+            if wire_bytes != plan.layout.staging_size_bytes:
+                reason = (
+                    "native byte proof differs from the canonical layout: "
+                    f"observed={wire_bytes} expected={plan.layout.staging_size_bytes}"
+                )
+                plan.fail(reason)
+                self._finish_quiescent_coalesced_request_failure(plan, reason)
+                continue
+            self._coalesced_scatter(plan.request_id)
+
+        return self._poll_pending_coalesced_scatters()
 
     def _sp_group_flags(self) -> list[bool]:
         """Per-KV-cache-group single-plane flags (F2b: kv_planes==1
@@ -3754,7 +4948,10 @@ class NixlBaseConnectorWorker:
             return True
         rows: list[torch.Tensor] = []
         for i, cache in enumerate(self._region_tensors):
-            order = sorted(range(cache.dim()), key=lambda d: -cache.stride(d))
+            order = sorted(
+                range(cache.dim()),
+                key=lambda dimension: -cache.stride()[dimension],
+            )
             phys = cache.permute(order)
             if not phys.is_contiguous() or phys.shape[0] != cache.shape[0]:
                 logger.warning(
@@ -3781,25 +4978,42 @@ class NixlBaseConnectorWorker:
         return True
 
     def _coalesced_scatter(self, req_id: ReqId) -> None:
-        """Scatter one completed staging generation into the destination cache.
+        """Enqueue one validated scatter without publishing its request.
 
-        The device-wide completion fence proves that asynchronous scatter reads
-        no longer touch staging before its lease is returned to the allocator.
-
-        :param req_id: Decoder request whose completed generation should scatter.
+        :param req_id: Decoder request whose native reads reached ``DONE``.
         """
         plan = self._coalesce_plans.get(req_id)
-        if plan is None:
+        if plan is None or req_id in self._pending_coalesced_scatters:
             return
-        geometry = plan.scatter
-        plan.begin_device_read()
-        scatter_error: BaseException | None = None
-        scatter_traceback: str | None = None
-        observation_error: BaseException | None = None
-        observation_traceback: str | None = None
+        if plan.ready_to_scatter is False:
+            raise StagingSafetyError(
+                f"scatter requested before native completion: {plan.describe()}"
+            )
+        if (
+            self._staging_buf is None
+            or self._region_rows is None
+            or self._coalesced_scatter_stream is None
+        ):
+            raise StagingSafetyError("coalesced scatter resources are unavailable")
+        destinations = tuple(row.reshape(-1) for row in self._region_rows)
         try:
-            assert self._staging_buf is not None
-            assert self._region_rows is not None
+            validate_coalesced_scatter(
+                self._staging_buf,
+                destinations,
+                plan.layout,
+                self._coalesced_scatter_stream,
+                staging_base_offset_bytes=plan.lease.offset,
+            )
+        except Exception:
+            reason = "scatter validation failed before device work\n" + (
+                traceback.format_exc()
+            )
+            plan.fail(reason)
+            self._finish_quiescent_coalesced_request_failure(plan, reason)
+            return
+
+        plan.begin_device_read()
+        try:
             if (
                 self._localization_config.enabled_for(req_id)
                 and self._localization_config.mode is not LocalizationMode.FINGERPRINT
@@ -3808,162 +5022,240 @@ class NixlBaseConnectorWorker:
                     req_id,
                     plan,
                     IntegrityStage.STAGING_RAW,
-                    "nixl_done_without_added_device_wide_sync",
+                    localization_stage_barrier(IntegrityStage.STAGING_RAW),
                 )
-                if self._staging_buf.device.type != "cpu":
-                    torch.accelerator.synchronize()
+                torch.accelerator.synchronize()
                 self._localization_capture_staging(
                     req_id,
                     plan,
                     IntegrityStage.STAGING_FENCED_CONTROL,
-                    "device_synchronize_observer_control_not_gdr_flush",
+                    localization_stage_barrier(IntegrityStage.STAGING_FENCED_CONTROL),
                 )
-            idx = torch.tensor(
-                geometry["lpos"], device=self._staging_buf.device, dtype=torch.long
+            current_stream = torch.cuda.current_stream(self._staging_buf.device)
+            self._coalesced_scatter_stream.wait_stream(current_stream)
+            enqueued_at = time.monotonic()
+            launch = launch_coalesced_scatter(
+                self._staging_buf,
+                destinations,
+                plan.layout,
+                self._coalesced_scatter_stream,
+                staging_base_offset_bytes=plan.lease.offset,
             )
-            n_pos, n_ranks = geometry["n_pos"], geometry["n_ranks"]
-            halves = geometry.get("sp_half")
-            hv = None
-            if halves is not None and any(h >= 0 for h in halves):
-                hv = torch.tensor(
-                    halves, device=self._staging_buf.device, dtype=torch.long
-                )
-                dual_m = hv < 0
-                sp_m = ~dual_m
-                idx_d = idx[dual_m]
-                idx_s = idx[sp_m]
-                h_s = hv[sp_m]
-            for i, flat in enumerate(self._region_rows):
-                blen = geometry["blens"][i]
-                chunk = blen // 2
-                base = plan.lease.offset + geometry["region_off"][i]
-                reg = self._staging_buf[base : base + n_ranks * n_pos * blen]
-                reg = reg.view(n_ranks, n_pos, 2, chunk)
-                dest = flat.view(flat.shape[0], 2, n_ranks, chunk)
-                if hv is None:
-                    for r in range(n_ranks):
-                        dest[:, :, geometry["slots"][r], :][idx] = reg[r]
-                    continue
-                # F2b: single-plane positions carry (local row, half);
-                # the row layout is (rank-shard, halves of 64 tok, K
-                # chunk) -- write only the staged K half. Dual positions
-                # keep the standard (K/V, rank-shard, chunk) write.
-                dest_sp = flat.view(flat.shape[0], n_ranks, 2, chunk)
-                for r in range(n_ranks):
-                    sl = geometry["slots"][r]
-                    if idx_d.numel():
-                        dest[:, :, sl, :][idx_d] = reg[r][dual_m]
-                    if idx_s.numel():
-                        dest_sp[idx_s, sl, h_s] = reg[r][sp_m][:, 0]
-            if self._audit_enabled and geometry.get("audit_rows"):
-                self._audit_pending.append(
-                    (req_id, geometry["audit_rows"], geometry["lpos"])
-                )
-        except Exception as error:
-            scatter_error = error
-            scatter_traceback = traceback.format_exc()
-
-        # NIXL writers are quiescent at this point, but the CUDA scatter reads
-        # staging asynchronously. A failed synchronization is not a release
-        # fence and must leave the allocation permanently owned.
-        try:
-            torch.cuda.synchronize()
-        except Exception as error:
-            stacktrace = traceback.format_exc()
-            reason = (
-                "device synchronization failed after staging readers began\n"
-                + stacktrace
+        except ScatterEnqueueError as error:
+            reason = str(error)
+            plan.fail(reason)
+            if error.recovery_launch is None:
+                plan.tombstone(reason)
+                self._fail_coalesced_plan(plan, reason, error)
+            self._pending_coalesced_scatters[req_id] = _PendingCoalescedScatter(
+                plan=plan,
+                launch=error.recovery_launch,
+                enqueued_at=enqueued_at,
+                failure_reason=reason,
             )
-            plan.tombstone(reason)
-            self._fail_coalesced_plan(
-                plan,
-                reason,
-                error,
+            return
+        except Exception:
+            reason = "scatter setup failed after device ownership began\n" + (
+                traceback.format_exc()
             )
-        if (
-            scatter_error is None
-            and self._localization_config.enabled_for(req_id)
-            and self._localization_config.mode is LocalizationMode.FINGERPRINT
-        ):
             try:
-                self._localization_capture_staging(
-                    req_id,
-                    plan,
-                    IntegrityStage.STAGING_POST_SCATTER,
-                    "post_scatter_device_synchronize_before_staging_release",
-                )
-                self._localization_capture_destination(
-                    req_id,
-                    geometry,
-                    IntegrityStage.DESTINATION,
-                    "post_scatter_device_synchronize_before_publication",
-                )
-                self._localization_pre_read_plans[req_id] = geometry
-            except Exception as error:
-                observation_error = error
-                observation_traceback = traceback.format_exc()
-
-            try:
-                torch.cuda.synchronize()
-            except Exception as error:
-                stacktrace = traceback.format_exc()
-                reason = (
-                    "device synchronization failed after localization readers "
-                    "began\n" + stacktrace
+                torch.accelerator.synchronize()
+            except Exception as synchronization_error:
+                reason += (
+                    "\ndevice quiescence recovery failed\n" + traceback.format_exc()
                 )
                 plan.tombstone(reason)
                 self._fail_coalesced_plan(
                     plan,
                     reason,
-                    error,
+                    synchronization_error,
                 )
-
-        plan.mark_device_quiescent()
-
-        if scatter_error is not None:
-            plan.fail("staging scatter failed before publication")
-            self._release_coalesced_plan(plan)
-            logger.error(
-                "coalesced staging scatter failed after safe device quiescence: %s\n%s",
-                plan.describe(),
-                scatter_traceback,
-            )
-            raise StagingSafetyError(
-                "coalesced staging scatter failed before scheduler publication"
-            ) from scatter_error
-
-        if observation_error is not None:
-            assert observation_traceback is not None
-            plan.fail("post-scatter observation failed before publication")
-            self._release_coalesced_plan(plan)
-            raise StagingSafetyError(
-                "post-scatter observation failed before publication\n"
-                + observation_traceback
-            ) from observation_error
-
-        try:
-            if (
-                self._localization_config.enabled_for(req_id)
-                and self._localization_config.mode is not LocalizationMode.FINGERPRINT
-            ):
-                self._localization_capture_destination(
-                    req_id,
-                    geometry,
-                    IntegrityStage.DESTINATION,
-                    "post_scatter_device_synchronize_before_publication",
-                )
-                self._localization_pre_read_plans[req_id] = geometry
-        except Exception as error:
-            stacktrace = traceback.format_exc()
-            reason = "destination observation failed before publication\n" + stacktrace
+            plan.mark_device_quiescent()
             plan.fail(reason)
-            self._release_coalesced_plan(plan)
-            raise StagingSafetyError(
-                "coalesced destination observation failed before publication\n"
-                + stacktrace
-            ) from error
+            self._finish_quiescent_coalesced_request_failure(plan, reason)
+            return
 
-        self._release_coalesced_plan(plan)
+        self._pending_coalesced_scatters[req_id] = _PendingCoalescedScatter(
+            plan=plan,
+            launch=launch,
+            enqueued_at=enqueued_at,
+        )
+
+    def _poll_pending_coalesced_scatters(self) -> set[ReqId]:
+        """Publish only scatters whose completion events prove quiescence.
+
+        :returns: Successfully scattered requests safe for scheduler publication.
+        """
+        done_req_ids: set[ReqId] = set()
+        pending_scatters = tuple(
+            sorted(
+                self._pending_coalesced_scatters.values(),
+                key=lambda pending: pending.plan.lease.generation,
+            )
+        )
+        for pending in pending_scatters:
+            plan = pending.plan
+            try:
+                if pending.launch.is_complete() is False:
+                    continue
+            except Exception as error:
+                reason = "scatter completion event query failed\n" + (
+                    traceback.format_exc()
+                )
+                plan.tombstone(reason)
+                self._fail_coalesced_plan(plan, reason, error)
+
+            completed_at = time.monotonic()
+            if pending.failure_reason is not None:
+                plan.mark_device_quiescent()
+                self._finish_quiescent_coalesced_request_failure(
+                    plan,
+                    pending.failure_reason,
+                )
+                del self._pending_coalesced_scatters[plan.request_id]
+                continue
+
+            try:
+                scatter_gpu_duration_seconds = pending.launch.gpu_duration_ms() / 1_000
+            except Exception:
+                scatter_gpu_duration_seconds = None
+                logger.error(
+                    "scatter GPU timing failed after quiescence; omitting the "
+                    "GPU-duration observation\n%s",
+                    traceback.format_exc(),
+                )
+
+            localization_plan = self._coalesced_localization_plans.get(plan.request_id)
+            try:
+                if self._localization_config.enabled_for(plan.request_id):
+                    if localization_plan is None:
+                        raise LocalizationError(
+                            "coalesced localization plan disappeared before capture"
+                        )
+                    if self._localization_config.mode is LocalizationMode.FINGERPRINT:
+                        self._localization_capture_staging(
+                            plan.request_id,
+                            plan,
+                            IntegrityStage.STAGING_POST_SCATTER,
+                            localization_stage_barrier(
+                                IntegrityStage.STAGING_POST_SCATTER
+                            ),
+                        )
+                    self._localization_capture_destination(
+                        plan.request_id,
+                        localization_plan,
+                        IntegrityStage.DESTINATION,
+                        localization_stage_barrier(IntegrityStage.DESTINATION),
+                    )
+                    torch.accelerator.synchronize()
+                    self._localization_pre_read_plans[plan.request_id] = (
+                        localization_plan
+                    )
+            except Exception:
+                reason = "post-scatter localization failed\n" + (traceback.format_exc())
+                try:
+                    torch.accelerator.synchronize()
+                except Exception as synchronization_error:
+                    reason += (
+                        "\nlocalization quiescence recovery failed\n"
+                        + traceback.format_exc()
+                    )
+                    plan.tombstone(reason)
+                    self._fail_coalesced_plan(
+                        plan,
+                        reason,
+                        synchronization_error,
+                    )
+                plan.mark_device_quiescent()
+                plan.fail(reason)
+                self._finish_quiescent_coalesced_request_failure(plan, reason)
+                del self._pending_coalesced_scatters[plan.request_id]
+                continue
+
+            plan.mark_device_quiescent()
+            release_ready_at = time.monotonic()
+            try:
+                telemetry = NixlCoalescedPlanTelemetry.from_native_transfers(
+                    logical_bytes=plan.logical_size_bytes,
+                    layout_duration_seconds=plan.layout_duration_seconds,
+                    native_transfers=plan.native_telemetry,
+                    scatter_duration_seconds=completed_at - pending.enqueued_at,
+                    scatter_gpu_duration_seconds=scatter_gpu_duration_seconds,
+                    staging_residency_seconds=release_ready_at - plan.created_at,
+                )
+            except Exception:
+                reason = "coalesced plan telemetry validation failed\n" + (
+                    traceback.format_exc()
+                )
+                plan.fail(reason)
+                self._finish_quiescent_coalesced_request_failure(plan, reason)
+                del self._pending_coalesced_scatters[plan.request_id]
+                continue
+
+            try:
+                self._release_coalesced_plan(plan)
+            except Exception as error:
+                reason = "completed scatter staging release failed\n" + (
+                    traceback.format_exc()
+                )
+                plan.tombstone(reason)
+                self._fail_coalesced_plan(plan, reason, error)
+            del self._pending_coalesced_scatters[plan.request_id]
+            self._coalesced_localization_plans.pop(plan.request_id, None)
+            try:
+                self.xfer_stats.record_coalesced_plan(telemetry)
+            except Exception:
+                logger.error(
+                    "coalesced plan telemetry recording failed after safe release\n%s",
+                    traceback.format_exc(),
+                )
+            if self._audit_enabled:
+                audit_rows, all_rows = self._coalesced_audit_rows(plan.layout)
+                if len(audit_rows) > 0:
+                    self._audit_pending.append((plan.request_id, audit_rows, all_rows))
+            logger.info(
+                "[coalesced-complete] request=%s digest=%s logical_bytes=%d "
+                "wire_bytes=%d descriptors=%d scatter_wall_ms=%.3f "
+                "scatter_gpu_ms=%s residency_ms=%.3f",
+                plan.request_id,
+                plan.layout.digest,
+                telemetry.logical_bytes,
+                telemetry.wire_bytes,
+                telemetry.descriptor_count,
+                telemetry.scatter_duration_seconds * 1_000,
+                (
+                    "unavailable"
+                    if telemetry.scatter_gpu_duration_seconds is None
+                    else f"{telemetry.scatter_gpu_duration_seconds * 1_000:.3f}"
+                ),
+                telemetry.staging_residency_seconds * 1_000,
+            )
+            done_req_ids.add(plan.request_id)
+        return done_req_ids
+
+    def _coalesced_audit_rows(
+        self,
+        layout: CoalescedTransferPlan,
+    ) -> tuple[list[int], list[int]]:
+        """Derive resident-auditor rows from canonical group rosters.
+
+        :param layout: Completed canonical transfer layout.
+        :returns: Immutable audit rows and every destination row written.
+        """
+        audit_rows: list[int] = []
+        all_rows: list[int] = []
+        for group in layout.groups:
+            all_rows.extend(group.local_block_ids)
+            if (
+                group.group_index not in self._audit_groups
+                or group.destination_plane_count == 1
+            ):
+                continue
+            if self._audit_tail_exclude == 0:
+                audit_rows.extend(group.local_block_ids)
+            elif len(group.local_block_ids) > self._audit_tail_exclude:
+                audit_rows.extend(group.local_block_ids[: -self._audit_tail_exclude])
+        return audit_rows, all_rows
 
     def _begin_transfer_phase(self) -> None:
         """Close prior device work and authorize one transfer-only phase.
@@ -4009,10 +5301,10 @@ class NixlBaseConnectorWorker:
         self._transfer_phase_started_ns = time.monotonic_ns()
         self._transfer_phase_active = True
 
-    def _assert_transfer_post_allowed(self, *, coalesced: bool) -> None:
-        """Authorize one native post at the transfer/compute boundary.
+    def _assert_transfer_phase_active(self, *, coalesced: bool) -> None:
+        """Validate the transfer/compute boundary without recording a post.
 
-        :param coalesced: Whether the post is owned by a coalesced staging plan.
+        :param coalesced: Whether work is owned by a coalesced staging plan.
         :raises StagingSafetyError: If a post could overlap model execution or
             escape generation-scoped staging ownership.
         """
@@ -4023,6 +5315,17 @@ class NixlBaseConnectorWorker:
             raise StagingSafetyError(
                 "native transfer post is forbidden outside the owned transfer phase"
             )
+
+    def _assert_transfer_post_allowed(self, *, coalesced: bool) -> None:
+        """Authorize and record one native post at the phase boundary.
+
+        :param coalesced: Whether the post is owned by a coalesced staging plan.
+        :raises StagingSafetyError: If a post could overlap model execution or
+            escape generation-scoped staging ownership.
+        """
+        self._assert_transfer_phase_active(coalesced=coalesced)
+        if not self._phase_separate_transfer_decode:
+            return
         self._transfer_phase_handle_count += 1
 
     def _drain_transfer_phase(self) -> None:
@@ -4188,6 +5491,7 @@ class NixlBaseConnectorWorker:
 
         :returns: Requests done sending and receiving on this worker.
         """
+        self._raise_if_handshake_fail_stopped()
         if not self._phase_separate_transfer_decode:
             result = self._get_finished(service_pending=True)
             if self._phase_separation_instrumented:
@@ -4726,6 +6030,8 @@ class NixlBaseConnectorWorker:
         :param reason: Failure classification.
         :param meta: Optional metadata retained by the current caller.
         """
+        self._coalesced_localization_plans.pop(req_id, None)
+        self._localization_pre_read_plans.pop(req_id, None)
         failure = self._make_failed_receive(req_id, reason, meta)
         existing = self._failed_recv_pending.get(req_id)
         self._failed_recv_pending[req_id] = (
@@ -4754,6 +6060,7 @@ class NixlBaseConnectorWorker:
             producer_request_id=(remote.request_id if remote is not None else None),
             detail="transfer failed before complete diagnostic capture",
         )
+        self._coalesced_localization_plans.pop(req_id, None)
         self._localization_pre_read_plans.pop(req_id, None)
         self._failed_recv_outcomes.put((req_id, reason, handle))
 
@@ -4846,7 +6153,7 @@ class NixlBaseConnectorWorker:
         if block_ids.size == 0:
             return np.array([], dtype=np.int64)
 
-        start_ids = block_ids * block_size_ratio
+        start_ids: np.ndarray = block_ids * block_size_ratio
         offsets = np.arange(block_size_ratio)
         mapped_2d = start_ids[:, None] + offsets[None, :]
 
@@ -4882,7 +6189,7 @@ class NixlBaseConnectorWorker:
         local_block_ids: BlockIds,
         remote_block_ids: BlockIds,
         remote_physical_per_logical: int,
-    ) -> tuple[BlockIds, list]:
+    ) -> tuple[BlockIds, list[list[int]]]:
         """Apply prefix caching by trimming local/remote block ID lists.
 
         For non-Mamba models: end-trim remote to match local count, so that
@@ -4895,15 +6202,17 @@ class NixlBaseConnectorWorker:
         # Partial prefix cache hit: just read uncomputed blocks.
         # Skip mamba groups — their blocks represent full state (conv+ssm),
         # not per-token data, so trimming would corrupt the transfer.
-        remote_block_ids = list(remote_block_ids)
+        local_is_tuple = isinstance(local_block_ids, tuple)
+        local_groups = [list(group) for group in local_block_ids]
+        remote_groups = [list(group) for group in remote_block_ids]
         if not self._has_mamba:
             sp_flags = self._sp_group_flags()
-            for i, remote_group in enumerate(remote_block_ids):
+            for i, remote_group in enumerate(remote_groups):
                 if i in self._skip_pull_groups:
-                    remote_block_ids[i] = []
-                    local_block_ids[i] = []
+                    remote_groups[i] = []
+                    local_groups[i] = []
                     continue
-                num_local_blocks = len(local_block_ids[i])
+                num_local_blocks = len(local_groups[i])
                 # F2b single-plane groups: local blocks hold 2x remote
                 # tokens, so a fully-uncached request legitimately has
                 # len(local) ~= len(remote)/2. The end-trim must keep
@@ -4923,10 +6232,10 @@ class NixlBaseConnectorWorker:
                         num_local_blocks,
                         len(remote_group),
                         remote_start,
-                        local_block_ids[i][:2] if num_local_blocks else [],
+                        local_groups[i][:2] if num_local_blocks else [],
                         remote_group[:2],
                     )
-                remote_block_ids[i] = remote_group[remote_start:]
+                remote_groups[i] = remote_group[remote_start:]
         else:
             # (NOTE: ZhanqiuHu) Mamba hybrid: no prefix caching support so far.HeteroTP
             # can cause different kernel block counts due to logical block rounding.
@@ -4942,9 +6251,8 @@ class NixlBaseConnectorWorker:
             #   remote kernel blocks: [0..11] (2*6=12)
             #   local kernel blocks:  [0..9]  (1*10=10)
             #   actual data blocks = ceil(640/64) = 10, trim both to 10
-            local_block_ids = list(local_block_ids)
-            for i, remote_group in enumerate(remote_block_ids):
-                num_local_blocks = len(local_block_ids[i])
+            for i, remote_group in enumerate(remote_groups):
+                num_local_blocks = len(local_groups[i])
                 num_remote_blocks = len(remote_group)
                 if (
                     _is_ssm_spec(self._group_spec_types[i])
@@ -4955,14 +6263,14 @@ class NixlBaseConnectorWorker:
                     # this doesn't really impact transfer, as we only still care about
                     # the last "block", the full in-place state.
                     assert num_local_blocks == 1, "SSM can only have one local block"
-                    remote_block_ids[i] = remote_group[-num_local_blocks:]
+                    remote_groups[i] = remote_group[-num_local_blocks:]
                 elif (
                     self._physical_blocks_per_logical_kv_block
                     == remote_physical_per_logical
                     and num_local_blocks < num_remote_blocks
                 ):
                     # Partial prefix cache hit for FA group.
-                    remote_block_ids[i] = remote_group[-num_local_blocks:]
+                    remote_groups[i] = remote_group[-num_local_blocks:]
                 else:
                     # TODO Handle prefix caching with different block_sizes
                     max_padding = max(
@@ -4974,9 +6282,12 @@ class NixlBaseConnectorWorker:
                         f"{num_remote_blocks}| >= {max_padding}"
                     )
                     num_blocks = min(num_local_blocks, num_remote_blocks)
-                    local_block_ids[i] = local_block_ids[i][:num_blocks]
-                    remote_block_ids[i] = remote_group[:num_blocks]
-        return local_block_ids, remote_block_ids
+                    local_groups[i] = local_groups[i][:num_blocks]
+                    remote_groups[i] = remote_group[:num_blocks]
+        aligned_local: BlockIds = (
+            tuple(local_groups) if local_is_tuple else local_groups
+        )
+        return aligned_local, remote_groups
 
     def _logical_to_remote_kernel_block_ids(
         self, block_ids: BlockIds, remote_physical_per_logical: int
@@ -5142,15 +6453,15 @@ class NixlBaseConnectorWorker:
         shutdown.
         """
         assert engine_id in self._remote_agents
-        unsafe_plans = [
+        active_plans = [
             plan
             for plan in self._coalesce_plans.values()
-            if plan.remote_engine_id == engine_id and plan.reusable is False
+            if plan.remote_engine_id == engine_id
         ]
-        if len(unsafe_plans) > 0:
+        if len(active_plans) > 0:
             raise StagingSafetyError(
                 "remote-engine cleanup would release resources with live staging "
-                + "; ".join(plan.describe() for plan in unsafe_plans)
+                + "; ".join(plan.describe() for plan in active_plans)
             )
 
         for handle in self.dst_xfer_side_handles.pop(engine_id).values():
@@ -5164,6 +6475,8 @@ class NixlBaseConnectorWorker:
         self._remote_layout.pop(engine_id, None)
         self._remote_regions.pop(engine_id, None)
         self._remote_registration_generations.pop(engine_id, None)
+        self._remote_source_semantics.pop(engine_id, None)
+        self._remote_rank_contracts.pop(engine_id, None)
         if self.transfer_topo is not None:
             self.transfer_topo.unregister_remote_engine(engine_id)
 
@@ -5189,6 +6502,7 @@ class NixlBaseConnectorWorker:
         if not hasattr(self, "_handshake_initiation_executor"):
             # error happens during init, no need to shutdown
             return
+        self._raise_if_handshake_fail_stopped()
         unsafe_plans = [
             plan for plan in self._coalesce_plans.values() if plan.reusable is False
         ]
@@ -5197,6 +6511,19 @@ class NixlBaseConnectorWorker:
                 "in-process shutdown cannot quiesce coalesced staging: "
                 + "; ".join(plan.describe() for plan in unsafe_plans)
             )
+        for plan in tuple(
+            sorted(
+                self._coalesce_plans.values(),
+                key=lambda candidate: candidate.lease.generation,
+            )
+        ):
+            if plan.operation_failed is False:
+                plan.fail("connector shutdown retired an unpublished transfer")
+            if plan.posting_sealed is False:
+                plan.seal_posting()
+            self._release_quiescent_failed_coalesced_plan(plan)
+            self._coalesced_localization_plans.pop(plan.request_id, None)
+            self._localization_pre_read_plans.pop(plan.request_id, None)
         if self._localization_writer is not None:
             self._localization_writer.close()
             self._localization_writer = None

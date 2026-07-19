@@ -11,7 +11,9 @@ import traceback
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from multiprocessing.process import BaseProcess
 from pathlib import Path
+from typing import TypedDict
 
 from tools.gemma4_pd.nixl_micro_rig.config import RigConfig, load_config
 from tools.gemma4_pd.nixl_micro_rig.geometry import (
@@ -22,6 +24,13 @@ from tools.gemma4_pd.nixl_micro_rig.geometry import (
 _HOST_ALLOWED_GPUS = frozenset(range(6))
 _HOST_DENIED_GPUS = frozenset({6, 7})
 _LOCK_PATH = Path("/data/colleague/locks/gemma4-nixl-micro-rig.lock")
+
+
+class _GpuInventoryRow(TypedDict):
+    """Describe one preflighted GPU inventory row."""
+
+    uuid: str
+    free_mib: int
 
 
 def _nvidia_smi(*fields: str, compute_apps: bool = False) -> list[list[str]]:
@@ -91,15 +100,15 @@ def preflight(config: RigConfig) -> dict[str, object]:
         raise RuntimeError("selected GPUs violate the immutable host boundary")
 
     gpu_rows = _nvidia_smi("index", "uuid", "memory.free")
-    inventory: dict[int, dict[str, object]] = {}
+    inventory: dict[int, _GpuInventoryRow] = {}
     uuid_to_index: dict[str, int] = {}
     for index_text, gpu_uuid, free_mib_text in gpu_rows:
-        index = int(index_text)
-        inventory[index] = {
+        inventory_index = int(index_text)
+        inventory[inventory_index] = {
             "uuid": gpu_uuid,
             "free_mib": int(free_mib_text),
         }
-        uuid_to_index[gpu_uuid] = index
+        uuid_to_index[gpu_uuid] = inventory_index
     if not selected <= inventory.keys():
         raise RuntimeError("configured GPUs are absent from nvidia-smi inventory")
 
@@ -107,9 +116,15 @@ def preflight(config: RigConfig) -> dict[str, object]:
     for gpu_uuid, pid_text, process_name in _nvidia_smi(
         "gpu_uuid", "pid", "process_name", compute_apps=True
     ):
-        index = uuid_to_index.get(gpu_uuid)
-        if index in selected:
-            foreign.append({"gpu": index, "pid": int(pid_text), "name": process_name})
+        selected_index = uuid_to_index.get(gpu_uuid)
+        if selected_index is not None and selected_index in selected:
+            foreign.append(
+                {
+                    "gpu": selected_index,
+                    "pid": int(pid_text),
+                    "name": process_name,
+                }
+            )
     if len(foreign) > 0:
         raise RuntimeError(f"selected GPUs have foreign compute processes: {foreign}")
 
@@ -315,10 +330,10 @@ def _run_arm(
     :raises RuntimeError: If any role exits unsuccessfully.
     """
     context = multiprocessing.get_context("spawn")
-    processes: list[multiprocessing.Process] = []
+    processes: list[BaseProcess] = []
     try:
         for rank in range(len(config.producer_devices)):
-            process = context.Process(
+            producer_process = context.Process(
                 target=_role_entry,
                 name=f"micro-rig-p{rank}",
                 args=(
@@ -332,9 +347,9 @@ def _run_arm(
                     device_uuids,
                 ),
             )
-            process.start()
-            processes.append(process)
-        consumer = context.Process(
+            producer_process.start()
+            processes.append(producer_process)
+        consumer_process = context.Process(
             target=_role_entry,
             name="micro-rig-d0",
             args=(
@@ -348,31 +363,31 @@ def _run_arm(
                 device_uuids,
             ),
         )
-        consumer.start()
-        processes.append(consumer)
-        active = set(processes)
+        consumer_process.start()
+        processes.append(consumer_process)
+        active: set[BaseProcess] = set(processes)
         failures: dict[str, int | None] = {}
         while len(active) > 0 and len(failures) == 0:
-            for process in tuple(active):
-                process.join(timeout=0.1)
-                if process.exitcode is None:
+            for active_process in tuple(active):
+                active_process.join(timeout=0.1)
+                if active_process.exitcode is None:
                     continue
-                active.remove(process)
-                if process.exitcode != 0:
-                    failures[process.name] = process.exitcode
+                active.remove(active_process)
+                if active_process.exitcode != 0:
+                    failures[active_process.name] = active_process.exitcode
         if len(failures) > 0:
             raise RuntimeError(f"micro-rig arm processes failed: {failures}")
     finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-        for process in processes:
-            process.join(timeout=5.0)
-        for process in processes:
-            if process.is_alive():
-                process.kill()
-        for process in processes:
-            process.join()
+        for managed_process in processes:
+            if managed_process.is_alive():
+                managed_process.terminate()
+        for managed_process in processes:
+            managed_process.join(timeout=5.0)
+        for managed_process in processes:
+            if managed_process.is_alive():
+                managed_process.kill()
+        for managed_process in processes:
+            managed_process.join()
 
 
 def run_campaign(config_path: Path, artifact_root: Path) -> Path:
@@ -383,13 +398,22 @@ def run_campaign(config_path: Path, artifact_root: Path) -> Path:
     :returns: Created run artifact directory.
     """
     source_config = load_config(config_path)
+    source_plan_records = [
+        describe_plan(
+            source_config,
+            scenario,
+            build_configured_plan(config_path, source_config, scenario),
+        )
+        for scenario in source_config.scenarios
+    ]
     run_id = str(uuid.uuid4())
     run_directory = artifact_root / run_id
     run_directory.mkdir(parents=True, exist_ok=False)
     shutil.copy2(config_path, run_directory / config_path.name)
     input_names = {
-        source_config.source_handshake_manifest,
-        source_config.destination_handshake_manifest,
+        source_config.legacy_source_handshake_manifest,
+        source_config.legacy_destination_handshake_manifest,
+        source_config.semantic_handshake_manifest,
     } | {
         scenario.replay_manifest
         for scenario in source_config.scenarios
@@ -407,6 +431,8 @@ def run_campaign(config_path: Path, artifact_root: Path) -> Path:
         )
         for scenario in config.scenarios
     ]
+    if plan_records != source_plan_records:
+        raise RuntimeError("run-local canonical plans differ from their source inputs")
     (run_directory / "plans.json").write_text(
         json.dumps(plan_records, indent=2, sort_keys=True)
     )
