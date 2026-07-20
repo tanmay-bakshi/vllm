@@ -1,4 +1,4 @@
-"""Typed connector-v9 semantic fixtures for the NIXL micro-rig."""
+"""Typed connector-v11 semantic fixtures for the NIXL micro-rig."""
 
 import hashlib
 import json
@@ -7,9 +7,9 @@ from pathlib import Path
 
 from vllm.distributed.kv_transfer.nixl_contracts import NixlRegionDescriptor
 
-SEMANTIC_HANDSHAKE_SCHEMA_VERSION = 2
-SEMANTIC_HANDSHAKE_CONNECTOR_VERSION = 9
-STATIC_SEMANTIC_EVIDENCE_SCOPE = "static_model_free_connector_v9_contract_fixture"
+SEMANTIC_HANDSHAKE_SCHEMA_VERSION = 3
+SEMANTIC_HANDSHAKE_CONNECTOR_VERSION = 11
+STATIC_SEMANTIC_EVIDENCE_SCOPE = "static_model_free_connector_v11_contract_fixture"
 
 
 class SemanticHandshakeError(ValueError):
@@ -130,13 +130,131 @@ def _nested_integer_tuple(
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticPackedWriteContract:
+    """Describe the address-independent connector-v11 packed-WRITE contract.
+
+    :ivar direction: Native data-flow direction.
+    :ivar chunk_bytes_per_rank: Reserved bytes in one producer-rank slab.
+    :ivar min_descriptors_per_rank: Direct-plan threshold selecting packing.
+    :ivar producer_slot_count: Reusable gather slots on each producer rank.
+    :ivar consumer_slot_count: Reusable rank-major slots on each decoder.
+    :ivar source_tp_size: Producer ranks represented in each decoder slot.
+    :ivar alignment_bytes: Required address and stride alignment.
+    """
+
+    direction: str
+    chunk_bytes_per_rank: int
+    min_descriptors_per_rank: int
+    producer_slot_count: int
+    consumer_slot_count: int
+    source_tp_size: int
+    alignment_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.direction != "producer_to_consumer_write":
+            raise SemanticHandshakeError(
+                "connector-v11 packed transport must be producer-to-consumer WRITE"
+            )
+        if self.chunk_bytes_per_rank not in {
+            64 * 1024 * 1024,
+            128 * 1024 * 1024,
+            256 * 1024 * 1024,
+            512 * 1024 * 1024,
+        }:
+            raise SemanticHandshakeError(
+                "packed-WRITE chunk size must be a supported bounded candidate"
+            )
+        if self.min_descriptors_per_rank <= 0:
+            raise SemanticHandshakeError(
+                "packed-WRITE descriptor threshold must be positive"
+            )
+        if self.producer_slot_count <= 0 or self.consumer_slot_count <= 0:
+            raise SemanticHandshakeError("packed-WRITE slot counts must be positive")
+        if self.source_tp_size <= 0:
+            raise SemanticHandshakeError("packed-WRITE source TP size must be positive")
+        if (
+            self.alignment_bytes <= 0
+            or (self.alignment_bytes & (self.alignment_bytes - 1)) != 0
+        ):
+            raise SemanticHandshakeError(
+                "packed-WRITE alignment must be a positive power of two"
+            )
+        if self.chunk_bytes_per_rank % self.alignment_bytes != 0:
+            raise SemanticHandshakeError(
+                "packed-WRITE rank stride does not satisfy its alignment"
+            )
+
+    @classmethod
+    def from_json(
+        cls,
+        value: object,
+        context: str,
+    ) -> "SemanticPackedWriteContract":
+        """Parse one strict packed-WRITE contract.
+
+        :param value: Parsed contract object.
+        :param context: Human-readable value identity.
+        :returns: Typed packed-WRITE contract.
+        """
+        obj = _object(value, context)
+        expected = {
+            "direction",
+            "chunk_bytes_per_rank",
+            "min_descriptors_per_rank",
+            "producer_slot_count",
+            "consumer_slot_count",
+            "source_tp_size",
+            "alignment_bytes",
+        }
+        _exact_keys(obj, expected, context)
+        return cls(
+            direction=_string(obj["direction"], f"{context}.direction"),
+            chunk_bytes_per_rank=_integer(
+                obj["chunk_bytes_per_rank"],
+                f"{context}.chunk_bytes_per_rank",
+            ),
+            min_descriptors_per_rank=_integer(
+                obj["min_descriptors_per_rank"],
+                f"{context}.min_descriptors_per_rank",
+            ),
+            producer_slot_count=_integer(
+                obj["producer_slot_count"],
+                f"{context}.producer_slot_count",
+            ),
+            consumer_slot_count=_integer(
+                obj["consumer_slot_count"],
+                f"{context}.consumer_slot_count",
+            ),
+            source_tp_size=_integer(
+                obj["source_tp_size"],
+                f"{context}.source_tp_size",
+            ),
+            alignment_bytes=_integer(
+                obj["alignment_bytes"],
+                f"{context}.alignment_bytes",
+            ),
+        )
+
+
+SELECTED_PACKED_WRITE_CONTRACT = SemanticPackedWriteContract(
+    direction="producer_to_consumer_write",
+    chunk_bytes_per_rank=256 * 1024 * 1024,
+    min_descriptors_per_rank=1024,
+    producer_slot_count=2,
+    consumer_slot_count=2,
+    source_tp_size=4,
+    alignment_bytes=256,
+)
+
+
+@dataclass(frozen=True, slots=True)
 class SemanticHandshakeProfile:
-    """Describe one static, model-free connector-v9 semantic projection.
+    """Describe one static, model-free connector-v11 semantic projection.
 
     :ivar name: Stable profile identity selected by rig configuration.
     :ivar connector_version: Production wire-contract version under test.
     :ivar evidence_scope: Explicit non-runtime evidence classification.
-    :ivar runtime_capture_authenticated: Whether a live v9 payload is preserved.
+    :ivar runtime_capture_authenticated: Whether a live v11 payload is preserved.
     :ivar rank_identity_field: Wire field binding metadata to its producer rank.
     :ivar group_semantic_names: Ordered synthetic group identities.
     :ivar source_group_planes: Ordered source plane semantics.
@@ -146,6 +264,7 @@ class SemanticHandshakeProfile:
     :ivar descriptor_dtype: Synthetic packed descriptor dtype identity.
     :ivar descriptor_element_size_bytes: Bytes per synthetic descriptor element.
     :ivar descriptor_layout: Synthetic descriptor layout identity.
+    :ivar packed_write_contract: Address-independent bounded WRITE geometry.
     """
 
     name: str
@@ -161,6 +280,7 @@ class SemanticHandshakeProfile:
     descriptor_dtype: str
     descriptor_element_size_bytes: int
     descriptor_layout: str
+    packed_write_contract: SemanticPackedWriteContract
 
     def __post_init__(self) -> None:
         if len(self.name) == 0:
@@ -175,7 +295,7 @@ class SemanticHandshakeProfile:
             )
         if self.rank_identity_field != "tp_rank":
             raise SemanticHandshakeError(
-                "connector-v9 metadata rank identity must be bound by tp_rank"
+                "connector-v11 metadata rank identity must be bound by tp_rank"
             )
         group_count = len(self.group_semantic_names)
         if group_count == 0:
@@ -237,6 +357,14 @@ class SemanticHandshakeProfile:
             raise SemanticHandshakeError(
                 "model-free semantic fixtures must use packed descriptors"
             )
+        if type(self.packed_write_contract) is not SemanticPackedWriteContract:
+            raise SemanticHandshakeError(
+                "semantic fixture packed-WRITE contract must be typed"
+            )
+        if self.packed_write_contract != SELECTED_PACKED_WRITE_CONTRACT:
+            raise SemanticHandshakeError(
+                "semantic fixture differs from the selected packed-WRITE contract"
+            )
 
     @classmethod
     def from_json(cls, value: object, index: int) -> "SemanticHandshakeProfile":
@@ -262,6 +390,7 @@ class SemanticHandshakeProfile:
             "descriptor_dtype",
             "descriptor_element_size_bytes",
             "descriptor_layout",
+            "packed_write_contract",
         }
         _exact_keys(obj, expected, context)
         runtime_capture_authenticated = obj["runtime_capture_authenticated"]
@@ -305,6 +434,10 @@ class SemanticHandshakeProfile:
             descriptor_layout=_string(
                 obj["descriptor_layout"], f"{context}.descriptor_layout"
             ),
+            packed_write_contract=SemanticPackedWriteContract.from_json(
+                obj["packed_write_contract"],
+                f"{context}.packed_write_contract",
+            ),
         )
 
     def validate_rig_contract(
@@ -345,7 +478,7 @@ class SemanticHandshakeProfile:
         )
         if observed != expected:
             raise SemanticHandshakeError(
-                "connector-v9 semantic fixture differs from the typed rig contract: "
+                "connector-v11 semantic fixture differs from the typed rig contract: "
                 f"observed={observed}, expected={expected}"
             )
 
@@ -356,7 +489,7 @@ class SemanticHandshakeProfile:
         row_bytes: tuple[int, ...],
         base_address: int,
     ) -> tuple[NixlRegionDescriptor, ...]:
-        """Materialize complete packed v9 descriptors for validator replay.
+        """Materialize complete packed v11 descriptors for validator replay.
 
         :param num_blocks: Physical rows in each registration.
         :param row_bytes: Ordered bytes per physical row.

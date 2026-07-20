@@ -1,4 +1,4 @@
-"""Connector-v9 semantic evidence tests for the NIXL micro-rig."""
+"""Connector-v11 semantic evidence tests for the NIXL micro-rig."""
 
 import hashlib
 import json
@@ -13,6 +13,7 @@ import pytest
 
 from tools.gemma4_pd.nixl_micro_rig.config import ConfigError, load_config
 from tools.gemma4_pd.nixl_micro_rig.handshake import (
+    SELECTED_PACKED_WRITE_CONTRACT,
     SEMANTIC_HANDSHAKE_CONNECTOR_VERSION,
     STATIC_SEMANTIC_EVIDENCE_SCOPE,
     load_semantic_handshake_profile,
@@ -24,6 +25,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NIXL_CONNECTOR_VERSION,
     NixlAgentMetadata,
+    PackedWriteProducerPoolGeometry,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.packed_write_config import (
+    PackedWriteConfig,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     compute_tp_mapping,
@@ -98,6 +103,8 @@ def _write_mutated_fixture(
         profile["rank_identity_field"] = "device_id"
     elif mutation == "descriptor_element_size_bytes":
         profile["descriptor_element_size_bytes"] = 3
+    elif mutation == "packed_write_contract":
+        profile["packed_write_contract"]["chunk_bytes_per_rank"] = 128 * 1024 * 1024
     else:
         raise AssertionError(f"unhandled mutation {mutation}")
 
@@ -153,7 +160,20 @@ def _fixture_worker() -> NixlBaseConnectorWorker:
     worker._is_hma_required = False
     worker._physical_blocks_per_logical_kv_block = 1
     worker._sp_flags_cache = [False] * len(config.groups)
-    worker.kv_transfer_config = SimpleNamespace(enable_permute_local_kv=False)
+    worker.kv_transfer_config = SimpleNamespace(
+        enable_permute_local_kv=False,
+        kv_role="kv_consumer",
+    )
+    worker._packed_write_config = PackedWriteConfig(
+        enabled=True,
+        chunk_bytes_per_rank=256 * 1024 * 1024,
+        min_descriptors_per_rank=1024,
+        producer_slot_count=2,
+        consumer_slot_count=2,
+        alignment_bytes=256,
+        warn_after_s=30.0,
+        fail_after_s=300.0,
+    )
     worker.vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(enable_prefix_caching=False)
     )
@@ -199,7 +219,7 @@ def _fixture_worker() -> NixlBaseConnectorWorker:
 
 
 def test_static_fixture_is_bound_to_the_current_connector_version() -> None:
-    assert SEMANTIC_HANDSHAKE_CONNECTOR_VERSION == NIXL_CONNECTOR_VERSION == 9
+    assert SEMANTIC_HANDSHAKE_CONNECTOR_VERSION == NIXL_CONNECTOR_VERSION == 11
 
 
 def test_static_profile_is_explicitly_not_a_runtime_capture() -> None:
@@ -213,6 +233,7 @@ def test_static_profile_is_explicitly_not_a_runtime_capture() -> None:
     assert profile.evidence_scope == STATIC_SEMANTIC_EVIDENCE_SCOPE
     assert profile.runtime_capture_authenticated is False
     assert profile.rank_identity_field == "tp_rank"
+    assert profile.packed_write_contract == SELECTED_PACKED_WRITE_CONTRACT
 
 
 @pytest.mark.parametrize(
@@ -226,6 +247,7 @@ def test_static_profile_is_explicitly_not_a_runtime_capture() -> None:
         "runtime_capture_authenticated",
         "rank_identity_field",
         "descriptor_element_size_bytes",
+        "packed_write_contract",
     ],
 )
 def test_config_rejects_authenticated_semantic_fixture_drift(
@@ -253,7 +275,7 @@ def test_config_rejects_unauthenticated_semantic_fixture_changes(
         load_config(config_path)
 
 
-def test_static_profile_replays_through_current_v9_production_validator() -> None:
+def test_static_profile_replays_through_current_v11_production_validator() -> None:
     config = load_config(CONFIG_PATH)
     profile = load_semantic_handshake_profile(
         FIXTURE_DIRECTORY / config.semantic_handshake_manifest,
@@ -292,6 +314,18 @@ def test_static_profile_replays_through_current_v9_production_validator() -> Non
             regions=regions,
             source_group_planes=profile.source_group_planes,
             physical_group_token_capacities=(profile.physical_group_token_capacities),
+            packed_write_producer_pool=PackedWriteProducerPoolGeometry(
+                registration_generation=f"static-fixture-rank-{rank}",
+                base_address=0x90000000000 + rank * 0x10000000000,
+                registered_bytes=(
+                    profile.packed_write_contract.producer_slot_count
+                    * profile.packed_write_contract.chunk_bytes_per_rank
+                ),
+                slot_size_bytes=(profile.packed_write_contract.chunk_bytes_per_rank),
+                slot_count=profile.packed_write_contract.producer_slot_count,
+                device_id=rank,
+                alignment_bytes=profile.packed_write_contract.alignment_bytes,
+            ),
         )
 
     worker._validate_remote_handshake_roster(

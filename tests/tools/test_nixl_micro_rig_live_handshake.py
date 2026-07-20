@@ -1,4 +1,4 @@
-"""Live connector-v9 wire capture and offline replay tests."""
+"""Live connector-v11 wire capture and offline replay tests."""
 
 import hashlib
 from pathlib import Path
@@ -22,6 +22,8 @@ from tools.gemma4_pd.nixl_micro_rig.live_handshake import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
     NixlHandshakePayload,
+    PackedWriteConsumerPoolGeometry,
+    PackedWriteProducerPoolGeometry,
 )
 
 FIXTURE_DIRECTORY = Path(__file__).parents[2] / "tools" / "gemma4_pd" / "nixl_micro_rig"
@@ -47,8 +49,9 @@ def _wire_payload(
     semantic_drift: bool = False,
     block_count: int | None = None,
     decoder_row_scale: int | None = None,
+    packed_pool_slot_bytes: int | None = None,
 ) -> bytes:
-    """Build one complete synthetic live connector-v9 response.
+    """Build one complete synthetic live connector-v11 response.
 
     :param rank: Endpoint TP rank.
     :param decoder: Whether to materialize TP1 decoder geometry.
@@ -56,6 +59,7 @@ def _wire_payload(
     :param semantic_drift: Whether to corrupt one producer semantic identity.
     :param block_count: Optional advertised physical block count.
     :param decoder_row_scale: Optional decoder-to-producer row-width ratio.
+    :param packed_pool_slot_bytes: Optional packed-WRITE rank stride.
     :returns: Exact outer MessagePack payload.
     """
     config = load_config(CONFIG_PATH)
@@ -82,6 +86,33 @@ def _wire_payload(
     if semantic_drift:
         first = regions[0]
         regions[0] = msgspec.structs.replace(first, semantic_name="wrong-region")
+    registration_generation = f"volatile-generation-{decoder}-{rank}"
+    if packed_pool_slot_bytes is None:
+        packed_pool_slot_bytes = 256 * 1024 * 1024
+    packed_write_producer_pool = None
+    packed_write_consumer_pool = None
+    if decoder:
+        packed_write_consumer_pool = PackedWriteConsumerPoolGeometry(
+            registration_generation=registration_generation,
+            base_address=0xA0000000000,
+            registered_bytes=2 * 4 * packed_pool_slot_bytes,
+            slot_size_bytes=4 * packed_pool_slot_bytes,
+            slot_count=2,
+            source_tp_size=4,
+            rank_stride_bytes=packed_pool_slot_bytes,
+            device_id=0,
+            alignment_bytes=256,
+        )
+    else:
+        packed_write_producer_pool = PackedWriteProducerPoolGeometry(
+            registration_generation=registration_generation,
+            base_address=0x90000000000 + rank * 0x10000000000,
+            registered_bytes=2 * packed_pool_slot_bytes,
+            slot_size_bytes=packed_pool_slot_bytes,
+            slot_count=2,
+            device_id=rank,
+            alignment_bytes=256,
+        )
     metadata = NixlAgentMetadata(
         engine_id="live-decoder" if decoder else "live-prefill",
         tp_rank=rank if metadata_rank is None else metadata_rank,
@@ -95,7 +126,7 @@ def _wire_payload(
         ssm_sizes=(0, 0),
         attn_backend_name="FLASHINFER_GEMMA4_TRTLLM_GEN",
         physical_blocks_per_logical_kv_block=1,
-        registration_generation=f"volatile-generation-{decoder}-{rank}",
+        registration_generation=registration_generation,
         regions=tuple(regions),
         source_group_planes=tuple(
             group.destination_plane_count for group in config.groups
@@ -103,6 +134,8 @@ def _wire_payload(
         physical_group_token_capacities=tuple(
             group.token_capacity for group in config.groups
         ),
+        packed_write_producer_pool=packed_write_producer_pool,
+        packed_write_consumer_pool=packed_write_consumer_pool,
     )
     handshake = NixlHandshakePayload(
         compatibility_hash=COMPATIBILITY_HASH,
@@ -117,6 +150,8 @@ def _payloads(
     semantic_drift_rank: int | None = None,
     decoder_block_count: int | None = None,
     decoder_row_scale: int | None = None,
+    packed_pool_slot_bytes: int | None = None,
+    packed_pool_drift_rank: int | None = None,
 ) -> dict[tuple[str, int], bytes]:
     result = {
         ("producer", rank): _wire_payload(
@@ -124,6 +159,12 @@ def _payloads(
             decoder=False,
             metadata_rank=(rank - 1) if rank == misbound_rank else rank,
             semantic_drift=rank == semantic_drift_rank,
+            packed_pool_slot_bytes=(
+                None
+                if packed_pool_slot_bytes is None
+                else packed_pool_slot_bytes
+                + (2 * 1024 * 1024 if rank == packed_pool_drift_rank else 0)
+            ),
         )
         for rank in range(4)
     }
@@ -144,6 +185,8 @@ def _capture(
     semantic_drift_rank: int | None = None,
     decoder_block_count: int | None = None,
     decoder_row_scale: int | None = None,
+    packed_pool_slot_bytes: int | None = None,
+    packed_pool_drift_rank: int | None = None,
 ) -> tuple[Path, str]:
     """Capture mocked endpoint bytes through the public command implementation.
 
@@ -153,6 +196,8 @@ def _capture(
     :param semantic_drift_rank: Optional corrupt producer rank.
     :param decoder_block_count: Optional decoder block-count override.
     :param decoder_row_scale: Optional decoder row-width-ratio override.
+    :param packed_pool_slot_bytes: Optional producer packed-WRITE slot size.
+    :param packed_pool_drift_rank: Optional producer rank with different geometry.
     :returns: Capture path and external SHA-256.
     """
     from tools.gemma4_pd.nixl_micro_rig import live_handshake
@@ -162,6 +207,8 @@ def _capture(
         semantic_drift_rank=semantic_drift_rank,
         decoder_block_count=decoder_block_count,
         decoder_row_scale=decoder_row_scale,
+        packed_pool_slot_bytes=packed_pool_slot_bytes,
+        packed_pool_drift_rank=packed_pool_drift_rank,
     )
     monkeypatch.setattr(live_handshake, "_git_identity", lambda _: CODE_IDENTITY)
     monkeypatch.setattr(
@@ -172,7 +219,7 @@ def _capture(
     config = load_config(CONFIG_PATH)
     model_config = tmp_path / "model-config.json"
     model_config.write_bytes(MODEL_CONFIG_PAYLOAD)
-    output = tmp_path / "live-v9.json"
+    output = tmp_path / "live-v11.json"
     result = capture_live_handshake(
         config_path=CONFIG_PATH,
         config=config,
@@ -236,6 +283,66 @@ def test_live_capture_preserves_raw_payloads_and_replays_validator(
     assert result.validator_replay == "passed_without_native_mutation"
 
 
+def test_live_capture_preserves_selected_producer_and_consumer_pool_geometry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slot_bytes = 256 * 1024 * 1024
+    capture_path, _ = _capture(
+        tmp_path,
+        monkeypatch,
+        packed_pool_slot_bytes=slot_bytes,
+    )
+    capture = msgspec.json.decode(
+        capture_path.read_bytes(),
+        type=LiveHandshakeCapture,
+    )
+
+    pools = []
+    for payload in capture.producer.payloads:
+        handshake = msgspec.msgpack.decode(payload.payload, type=NixlHandshakePayload)
+        metadata = msgspec.msgpack.decode(
+            handshake.agent_metadata_bytes,
+            type=NixlAgentMetadata,
+        )
+        assert metadata.packed_write_producer_pool is not None
+        assert metadata.packed_write_consumer_pool is None
+        pools.append(metadata.packed_write_producer_pool)
+    assert {pool.slot_size_bytes for pool in pools} == {slot_bytes}
+    assert {pool.slot_count for pool in pools} == {2}
+    assert len({pool.base_address for pool in pools}) == 4
+    decoder_handshake = msgspec.msgpack.decode(
+        capture.decoder.payloads[0].payload,
+        type=NixlHandshakePayload,
+    )
+    decoder_metadata = msgspec.msgpack.decode(
+        decoder_handshake.agent_metadata_bytes,
+        type=NixlAgentMetadata,
+    )
+    assert decoder_metadata.packed_write_producer_pool is None
+    decoder_pool = decoder_metadata.packed_write_consumer_pool
+    assert decoder_pool is not None
+    assert decoder_pool.rank_stride_bytes == slot_bytes
+    assert decoder_pool.source_tp_size == 4
+    assert decoder_pool.slot_size_bytes == 4 * slot_bytes
+    assert decoder_pool.registered_bytes == 2 * 4 * slot_bytes
+
+
+def test_capture_rejects_cross_rank_packed_pool_geometry_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(LiveHandshakeError, match="selected v11 contract"):
+        _capture(
+            tmp_path,
+            monkeypatch,
+            packed_pool_slot_bytes=256 * 1024 * 1024,
+            packed_pool_drift_rank=2,
+        )
+
+    assert not (tmp_path / "live-v11.json").exists()
+
+
 def test_capture_rejects_cross_rank_semantic_drift_before_writing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -243,7 +350,7 @@ def test_capture_rejects_cross_rank_semantic_drift_before_writing(
     with pytest.raises(LiveHandshakeError, match="different normalized contracts"):
         _capture(tmp_path, monkeypatch, semantic_drift_rank=2)
 
-    assert not (tmp_path / "live-v9.json").exists()
+    assert not (tmp_path / "live-v11.json").exists()
 
 
 def test_capture_rejects_metadata_bound_to_a_different_rank(
@@ -256,7 +363,7 @@ def test_capture_rejects_metadata_bound_to_a_different_rank(
     ):
         _capture(tmp_path, monkeypatch, misbound_rank=2)
 
-    assert not (tmp_path / "live-v9.json").exists()
+    assert not (tmp_path / "live-v11.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -281,7 +388,7 @@ def test_capture_requires_exact_64k_four_way_decoder_geometry(
             decoder_row_scale=decoder_row_scale,
         )
 
-    assert not (tmp_path / "live-v9.json").exists()
+    assert not (tmp_path / "live-v11.json").exists()
 
 
 def test_capture_rejects_independent_engine_identity_mismatch(
@@ -315,11 +422,11 @@ def test_capture_rejects_independent_engine_identity_mismatch(
             decoder_engine_id="live-decoder",
             model_config_path=tmp_path / "model-config.json",
             expected_model_config_sha256=MODEL_CONFIG_SHA256,
-            output_path=tmp_path / "live-v9.json",
+            output_path=tmp_path / "live-v11.json",
             timeout_seconds=1.0,
         )
 
-    assert not (tmp_path / "live-v9.json").exists()
+    assert not (tmp_path / "live-v11.json").exists()
 
 
 def test_capture_requires_externally_authenticated_model_config(
@@ -345,11 +452,11 @@ def test_capture_requires_externally_authenticated_model_config(
             decoder_engine_id=None,
             model_config_path=model_config,
             expected_model_config_sha256="0" * 64,
-            output_path=tmp_path / "live-v9.json",
+            output_path=tmp_path / "live-v11.json",
             timeout_seconds=1.0,
         )
 
-    assert not (tmp_path / "live-v9.json").exists()
+    assert not (tmp_path / "live-v11.json").exists()
 
 
 def test_verifier_requires_external_capture_digest(

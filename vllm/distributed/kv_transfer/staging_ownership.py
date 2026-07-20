@@ -530,6 +530,22 @@ class CoalescedStagingPlan:
         )
 
     @property
+    def source_consumption_proven(self) -> bool:
+        """Return whether every posted READ consumed its remote source.
+
+        This proof deliberately excludes telemetry and destination-scatter
+        validity. An attached native completion may release the producer as
+        soon as every READ reaches ``DONE``, even when later decoder-local work
+        fails.
+
+        :returns: Whether every source READ is terminal and locally released.
+        """
+        return self.posting_sealed and all(
+            slot.state is HandleState.DONE and slot.native_released
+            for slot in self.slots.values()
+        )
+
+    @property
     def native_quiescent(self) -> bool:
         """Return whether no native actor can write this generation.
 

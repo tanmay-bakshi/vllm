@@ -605,6 +605,10 @@ def test_stop_via_update_from_output():
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
+    for request in requests:
+        request.num_in_flight_tokens = scheduler_output.num_scheduled_tokens[
+            request.request_id
+        ]
 
     model_output = ModelRunnerOutput(
         req_ids=[req.request_id for req in requests],
@@ -651,6 +655,10 @@ def test_stop_via_update_from_output():
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
+    for request in requests:
+        request.num_in_flight_tokens = scheduler_output.num_scheduled_tokens[
+            request.request_id
+        ]
 
     model_output = ModelRunnerOutput(
         req_ids=[req.request_id for req in requests],
@@ -695,6 +703,10 @@ def test_stop_via_update_from_output():
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
+    for request in requests:
+        request.num_in_flight_tokens = scheduler_output.num_scheduled_tokens[
+            request.request_id
+        ]
 
     model_output = ModelRunnerOutput(
         req_ids=[req.request_id for req in requests],
@@ -733,6 +745,9 @@ def test_stop_via_update_from_output():
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
+    requests[0].num_in_flight_tokens = scheduler_output.num_scheduled_tokens[
+        requests[0].request_id
+    ]
 
     model_output = ModelRunnerOutput(
         req_ids=[requests[0].request_id],
@@ -3336,6 +3351,8 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.enable_return_routed_experts = False
     scheduler.recompute_kv_load_failures = False
     scheduler.defer_block_free = False
+    scheduler._tok_trace = None
+    scheduler._preempt_abort_req_ids = set()
     scheduler.make_stats = Mock(return_value=None)
     scheduler.max_model_len = 128
 
@@ -3357,6 +3374,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
+    request.num_in_flight_tokens = output.num_scheduled_tokens[request.request_id]
 
     model_runner_output = ModelRunnerOutput(
         req_ids=[request.request_id],
@@ -4814,7 +4832,7 @@ def test_kv_offer_ownership_requires_exact_complete_identity() -> None:
         "do_remote_prefill": True,
         "remote_engine_id": "producer-engine",
         "remote_request_id": "producer-request",
-        "p2d_offer_generation": 7,
+        "source_offer_generation": 7,
     }
     scheduler.add_request(request)
 
@@ -4826,14 +4844,14 @@ def test_kv_offer_ownership_requires_exact_complete_identity() -> None:
         {
             "remote_engine_id": "producer-engine",
             "remote_request_id": "producer-request",
-            "p2d_offer_generation": True,
+            "source_offer_generation": True,
         }
     )
     assert not scheduler.owns_kv_transfer_offer(
         {
             "remote_engine_id": "producer-engine",
             "remote_request_id": "other-request",
-            "p2d_offer_generation": 7,
+            "source_offer_generation": 7,
         }
     )
 

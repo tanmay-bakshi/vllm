@@ -4,7 +4,7 @@
 
 The production-topology rig is implemented, and its host-only planning,
 self-test, integrity, lifecycle, semantic-handshake, and staging-generation
-checks pass. No authoritative GPU transport result for the current connector-v9
+checks pass. No authoritative GPU transport result for the current connector-v11
 implementation is preserved in the workspace. Native GPU qualification and its
 immutable result tree are required before release; the rig, launcher, and static
 fixtures alone do not constitute that result.
@@ -27,23 +27,23 @@ storm37b handshakes:
   event-owned Triton implementation used by the inference server.
 
 Those captures contain the legacy physical handshake fields only. They do not
-contain connector-v9 `registration_generation`, region descriptors, source
+contain connector-v11 `registration_generation`, region descriptors, source
 group planes, physical group token capacities, or model-derived semantic
 names. Their SHA-256 identity therefore authenticates the listed physical
-geometry, never the connector-v9 semantic contract.
+geometry, never the connector-v11 semantic contract.
 
-`connector-v9-semantic-fixtures.json` is a separate, SHA-authenticated static
+`connector-v11-semantic-fixtures.json` is a separate, SHA-authenticated static
 fixture. Each configuration selects one typed profile whose ordered group
 names, plane counts, token capacities, region names, and ownership must match
 the rig exactly. Host tests materialize complete packed source and destination
 region descriptors from that profile and pass the full four-rank TP4-to-TP1
-roster through the production connector-v9 handshake validator. This proves
+roster through the production connector-v11 handshake validator. This proves
 that the declared rig contract satisfies the current validator, including
 TP row scaling and cross-rank equality. The profile explicitly records
 `runtime_capture_authenticated: false`: its synthetic names, tensor views,
 addresses, and registration generations are not evidence of a live Gemma 4
 registration. Runtime semantic authentication requires a preserved live
-connector-v9 payload from the deployed stack.
+connector-v11 payload from the deployed stack.
 
 The 2,672-position roster is synthetic and is labeled as such in every plan.
 Authoritative ownership expands it to 13,360 transferred region positions per
@@ -113,6 +113,107 @@ $VENV/bin/python -m tools.gemma4_pd.nixl_micro_rig run \
   --artifact-root /data/colleague/micro-rig-runs
 ```
 
+### Target 2 fixed-byte transport gate
+
+The Target 2 gate compares the existing owner-aware READ against producer
+packing followed by contiguous READ and contiguous WRITE. Every cell moves the
+same exact 1,052,508,160-byte request. It covers the contiguous control plus
+the calibrated C1 and C64 fragmentation regimes, 64/128/256/512 MiB bounded
+chunks, and configurable in-flight request depth in one 4P+1D process group.
+It calls the serving worker's production `PackedTransferPlan`, Triton pack, and
+Triton TP4 scatter primitives directly. Two guarded slots per producer rank and
+two guarded rank-major TP4 receive slots on the decoder execute identical
+two-task waves for packed READ and packed WRITE without unbounded memory. The
+decoder advertises each complete receive-slot base, and both directions derive
+rank slabs with the active candidate's chunk stride. A smaller candidate never
+inherits the largest swept candidate's rank spacing.
+
+Planning is host-only:
+
+```bash
+CONFIG=tools/gemma4_pd/nixl_micro_rig/gemma4_tp4_to_tp1_2k.json
+
+$VENV/bin/python -m tools.gemma4_pd.nixl_micro_rig target2-plan \
+  --config "$CONFIG" \
+  --chunk-mib 64 128 256 512 \
+  --in-flight-depth 1 2 4 8 \
+  --warmup-batches 1 \
+  --measured-batches 3
+```
+
+After the lifecycle owner has cleanly retired every process on GPUs 0 through
+5, run the native CUDA-IPC/UCX gate from the checked-out repository:
+
+```bash
+$VENV/bin/python -m tools.gemma4_pd.nixl_micro_rig target2-gate \
+  --config "$CONFIG" \
+  --artifact-root /data/colleague/gemma4-target2-fixed-byte-gate \
+  --transport-arm cuda_ipc \
+  --chunk-mib 64 128 256 512 \
+  --in-flight-depth 1 2 4 8 \
+  --warmup-batches 1 \
+  --measured-batches 3
+```
+
+The environment must provide the repository's Python dependencies, CUDA-enabled
+Torch, the NIXL Python package and UCX plugin used by the serving stack,
+`nvidia-smi`, and writable access to `/data/colleague/locks` plus the selected
+artifact root. The launcher refuses occupied or insufficiently free GPUs 0
+through 5 and never admits GPUs 6 or 7.
+
+The immutable run directory contains `target2-gate-plan.json`,
+`target2-code-identity.json`, `campaign-start.json`, `preflight.json`, and terminal
+`postflight.json` and `campaign-complete.json`. Postflight waits for all selected
+GPU registrations to disappear and requires the exact protected-process roster
+captured before the run to remain unchanged. Each transport-arm directory
+contains five process attestations and logs, raw `target2-gate-batches.json`,
+and validated `target2-gate-summary.json`. CUDA-IPC arms also contain
+`target2-cuda-ipc-write-protocol.json`; publication fails unless every producer
+log proves a CUDA-to-CUDA `remote memory write` selected UCX zero-copy
+`cuda_ipc/cuda`. Host/control `tcp/lo` protocol rows do not satisfy that check.
+The summary schema is
+`target2_fixed_byte_native_transport_gate` version 1. It reports per-cell
+median elapsed time, GiB/s, native critical-path time, producer-pack time,
+decoder-scatter time, and direct-relative latency/goodput deltas. A summary is
+written only after every warmup verifies every received chunk and completed
+request, while every measured batch proves exact source preservation, wire-byte
+coverage, final-request destination content, guards, notifications, descriptor
+geometry, backend selection, and slot lifetime. This keeps byte-oracle work out
+of the measured packed critical path without calling the resulting evidence
+bit-exact for unretained intermediate measured requests.
+
+The machine decision is `target2_decision` in the arm summary. It evaluates
+only the calibrated C64 fragmentation regime (2,120 descriptors per rank),
+which is above the production packed-WRITE activation threshold of 1,024.
+Every q1/q2/q4/q8 median speed ratio must be at least 0.98, q4 and q8 must each
+be at least 1.0, and their geometric mean must be at least 1.05. Candidates
+within one percent of the best geometric mean are tied in favor of the smaller
+registered pool and then READ. `pass` authorizes the selected arm and chunk;
+`fail_no_non_regressing_candidate` is a hard architecture stop, not permission
+to weaken the gate. The serving conformance below is intentionally narrower:
+its already-selected candidate is connector-v11 producer-initiated WRITE256,
+while direct and packed READ remain selection-evidence controls only.
+
+Once the gate has selected WRITE, serving qualification must not spend another
+campaign reselecting it. The focused host-only plan fixes the winner at a
+256 MiB per-rank stride and defines two live cases: six exact-2K C64 requests
+alternating across two decoders, and three requests whose per-rank payload is
+two full chunks plus a 64 KiB tail. Both cases force reuse of the two producer
+and decoder slots. Their live result must preserve exact source and destination
+bytes, one descriptor per rank chunk, authenticated native-sender completion,
+the CUDA-IPC protocol evidence above, all-free final pools, and the protected
+GPU baseline.
+
+```bash
+$VENV/bin/python -m tools.gemma4_pd.nixl_micro_rig \
+  target2-conformance-plan --config "$CONFIG"
+```
+
+The code identity covers the gate, canonical layout, and exact production pack
+and scatter sources. The launcher re-hashes them after all cells and refuses to
+publish `campaign-complete.json` if any inode, timestamp, size, or digest
+changes during the run.
+
 Select the exact 2K production-semantic profile with:
 
 ```bash
@@ -143,7 +244,7 @@ the preflighted UUID for physical GPU 4, as logical device 0. UUID binding
 prevents CUDA enumeration order from weakening the GPU 6/7 denylist. CUDA
 visibility and UCX configuration are set before importing Torch or NIXL.
 
-## Live connector-v9 capture
+## Live connector-v11 capture
 
 The production candidate must preserve one live wire capture for each TP1
 decoder after all candidate side-channel listeners are READY and before the
@@ -182,8 +283,8 @@ $VENV/bin/python -m tools.gemma4_pd.nixl_micro_rig capture-handshake \
   --decoder-port 15621 \
   --model-config "$MODEL_CONFIG" \
   --expected-model-config-sha256 "$MODEL_CONFIG_SHA256" \
-  --output "$EVIDENCE/live-connector-v9-d1.json" \
-  --result-output "$EVIDENCE/live-connector-v9-d1.capture-result.json"
+  --output "$EVIDENCE/live-connector-v11-d1.json" \
+  --result-output "$EVIDENCE/live-connector-v11-d1.capture-result.json"
 ```
 
 Repeat the command with decoder port 15622 and distinct capture/result outputs.
@@ -194,10 +295,10 @@ artifact independently, then replay it before traffic:
 $VENV/bin/python -m tools.gemma4_pd.nixl_micro_rig verify-handshake \
   --config "$CONFIG" \
   --code-root "$CANDIDATE" \
-  --capture "$EVIDENCE/live-connector-v9-d1.json" \
+  --capture "$EVIDENCE/live-connector-v11-d1.json" \
   --expected-sha256 "$CAPTURE_SHA256" \
   --expected-model-config-sha256 "$MODEL_CONFIG_SHA256" \
-  --result-output "$EVIDENCE/live-connector-v9-d1.verify-result.json"
+  --result-output "$EVIDENCE/live-connector-v11-d1.verify-result.json"
 ```
 
 Verification authenticates the external capture digest, clean Git commit and

@@ -10,6 +10,7 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -1018,6 +1019,12 @@ class TestNixlHandshake:
         conn_p0.connector_worker._reqs_to_process.add(req_id)
         conn_p1.connector_worker._reqs_to_send[req_id] = now + 10.0
         conn_p1.connector_worker._reqs_to_process.add(req_id)
+        conn_p0.connector_worker._source_rosters[req_id] = SimpleNamespace(
+            offer_generation=1
+        )
+        conn_p1.connector_worker._source_rosters[req_id] = SimpleNamespace(
+            offer_generation=1
+        )
         lease = ProducerLease(
             deadline=now + 10.0,
             expected_consumers=1,
@@ -1028,6 +1035,7 @@ class TestNixlHandshake:
 
         proof = PullReadComplete(
             producer_request_id=req_id,
+            offer_generation=1,
             consumer_request_id="decode-request",
             consumer_index=0,
             consumer_rank=0,

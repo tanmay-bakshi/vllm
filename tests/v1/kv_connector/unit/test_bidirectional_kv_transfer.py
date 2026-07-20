@@ -27,6 +27,7 @@ external tokens > 0.
 
 import copy
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import msgspec
@@ -469,6 +470,7 @@ def test_p_node_pull_then_send_kv(dist_init):
     assert "req-p2" in done_recving
     worker._reqs_to_send["req-p2"] = time.perf_counter() + 60
     worker._reqs_to_process.add("req-p2")
+    worker._source_rosters["req-p2"] = SimpleNamespace(offer_generation=1)
     worker._install_pull_completion_state(
         "req-p2",
         ProducerLease(
@@ -479,6 +481,7 @@ def test_p_node_pull_then_send_kv(dist_init):
     )
     proof = PullReadComplete(
         producer_request_id="req-p2",
+        offer_generation=1,
         consumer_request_id="decode-request",
         consumer_index=0,
         consumer_rank=worker.tp_rank,

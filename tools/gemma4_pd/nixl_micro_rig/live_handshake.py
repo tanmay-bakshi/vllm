@@ -1,4 +1,4 @@
-"""Capture and replay live connector-v9 handshake evidence."""
+"""Capture and replay live connector-v11 handshake evidence."""
 
 import hashlib
 import inspect
@@ -17,6 +17,9 @@ from zmq.error import ZMQError
 from zmq.sugar.context import Context
 
 from tools.gemma4_pd.nixl_micro_rig.config import RigConfig
+from tools.gemma4_pd.nixl_micro_rig.handshake import (
+    SELECTED_PACKED_WRITE_CONTRACT,
+)
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
@@ -28,14 +31,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
     NixlHandshakePayload,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.packed_write_config import (
+    PackedWriteConfig,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     compute_tp_mapping,
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 
-LIVE_HANDSHAKE_SCHEMA_VERSION = 1
-LIVE_HANDSHAKE_EVIDENCE_SCOPE = "live_connector_v9_wire_capture"
+LIVE_HANDSHAKE_SCHEMA_VERSION = 3
+LIVE_HANDSHAKE_EVIDENCE_SCOPE = "live_connector_v11_wire_capture"
 _EXPECTED_ATTENTION_BACKEND = "FLASHINFER_GEMMA4_TRTLLM_GEN"
 
 
@@ -410,7 +416,7 @@ def _git_identity(code_root: Path) -> CapturedCodeIdentity:
 def _decode_wire_payload(
     payload: bytes,
 ) -> tuple[NixlHandshakePayload, NixlAgentMetadata]:
-    """Decode both typed connector-v9 MessagePack envelopes.
+    """Decode both typed connector-v11 MessagePack envelopes.
 
     :param payload: Exact scheduler response.
     :returns: Outer handshake and inner agent metadata.
@@ -424,7 +430,7 @@ def _decode_wire_payload(
         )
     except (msgspec.DecodeError, msgspec.ValidationError) as error:
         raise LiveHandshakeError(
-            "endpoint returned invalid connector-v9 metadata"
+            "endpoint returned invalid connector-v11 metadata"
         ) from error
     return handshake, metadata
 
@@ -444,6 +450,49 @@ def _region_contract(metadata: NixlAgentMetadata) -> tuple[tuple[object, ...], .
             region.layout,
         )
         for region in metadata.regions
+    )
+
+
+def _packed_producer_pool_contract(
+    metadata: NixlAgentMetadata,
+) -> tuple[int, ...] | None:
+    """Return address-independent producer gather-pool geometry.
+
+    Base addresses, devices, and registration generations are rank-local. The
+    remaining geometry must be identical across a packed TP producer roster.
+
+    :param metadata: Decoded connector-v11 rank metadata.
+    :returns: Comparable producer-pool geometry, when present.
+    """
+    pool = metadata.packed_write_producer_pool
+    if pool is None:
+        return None
+    return (
+        pool.registered_bytes,
+        pool.slot_size_bytes,
+        pool.slot_count,
+        pool.alignment_bytes,
+    )
+
+
+def _packed_consumer_pool_contract(
+    metadata: NixlAgentMetadata,
+) -> tuple[int, ...] | None:
+    """Return address-independent decoder receive-pool geometry.
+
+    :param metadata: Decoded connector-v11 rank metadata.
+    :returns: Comparable consumer-pool geometry, when present.
+    """
+    pool = metadata.packed_write_consumer_pool
+    if pool is None:
+        return None
+    return (
+        pool.registered_bytes,
+        pool.slot_size_bytes,
+        pool.slot_count,
+        pool.source_tp_size,
+        pool.rank_stride_bytes,
+        pool.alignment_bytes,
     )
 
 
@@ -467,6 +516,12 @@ def _normalized_contract_bytes(metadata: NixlAgentMetadata) -> bytes:
         "source_group_planes": metadata.source_group_planes,
         "physical_group_token_capacities": (metadata.physical_group_token_capacities),
         "region_geometry": _region_contract(metadata),
+        "packed_write_producer_pool_geometry": (
+            _packed_producer_pool_contract(metadata)
+        ),
+        "packed_write_consumer_pool_geometry": (
+            _packed_consumer_pool_contract(metadata)
+        ),
     }
     return json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
 
@@ -593,6 +648,7 @@ def _validate_metadata_geometry(
     metadata: NixlAgentMetadata,
     row_scale: int,
     expected_device: int,
+    decoder: bool,
 ) -> None:
     """Validate one live rank against exact production physical geometry.
 
@@ -600,6 +656,7 @@ def _validate_metadata_geometry(
     :param metadata: Decoded live rank metadata.
     :param row_scale: One for P and four for TP1 D.
     :param expected_device: Role-local CUDA device ordinal.
+    :param decoder: Whether this is the decoder endpoint.
     :raises LiveHandshakeError: If any physical or semantic fact differs.
     """
     expected_rows = tuple(region.row_bytes * row_scale for region in config.regions)
@@ -664,6 +721,65 @@ def _validate_metadata_geometry(
                 f"live region {region_index} semantic identity is incomplete"
             )
 
+    contract = SELECTED_PACKED_WRITE_CONTRACT
+    producer_pool = metadata.packed_write_producer_pool
+    consumer_pool = metadata.packed_write_consumer_pool
+    expected_pool: tuple[object, ...]
+    observed_pool: tuple[object, ...]
+    if decoder:
+        if producer_pool is not None or consumer_pool is None:
+            raise LiveHandshakeError(
+                "live decoder does not advertise exactly one packed-WRITE consumer pool"
+            )
+        expected_pool = (
+            contract.consumer_slot_count
+            * contract.source_tp_size
+            * contract.chunk_bytes_per_rank,
+            contract.source_tp_size * contract.chunk_bytes_per_rank,
+            contract.consumer_slot_count,
+            contract.source_tp_size,
+            contract.chunk_bytes_per_rank,
+            expected_device,
+            contract.alignment_bytes,
+            metadata.registration_generation,
+        )
+        observed_pool = (
+            consumer_pool.registered_bytes,
+            consumer_pool.slot_size_bytes,
+            consumer_pool.slot_count,
+            consumer_pool.source_tp_size,
+            consumer_pool.rank_stride_bytes,
+            consumer_pool.device_id,
+            consumer_pool.alignment_bytes,
+            consumer_pool.registration_generation,
+        )
+    else:
+        if producer_pool is None or consumer_pool is not None:
+            raise LiveHandshakeError(
+                "live producer does not advertise exactly one packed-WRITE gather pool"
+            )
+        expected_pool = (
+            contract.producer_slot_count * contract.chunk_bytes_per_rank,
+            contract.chunk_bytes_per_rank,
+            contract.producer_slot_count,
+            expected_device,
+            contract.alignment_bytes,
+            metadata.registration_generation,
+        )
+        observed_pool = (
+            producer_pool.registered_bytes,
+            producer_pool.slot_size_bytes,
+            producer_pool.slot_count,
+            producer_pool.device_id,
+            producer_pool.alignment_bytes,
+            producer_pool.registration_generation,
+        )
+    if observed_pool != expected_pool:
+        raise LiveHandshakeError(
+            "live packed-WRITE pool differs from the selected v11 contract: "
+            f"observed={observed_pool}, expected={expected_pool}"
+        )
+
 
 def _validate_live_contract(
     config: RigConfig,
@@ -674,18 +790,20 @@ def _validate_live_contract(
             f"unsupported live-handshake schema {capture.schema_version}"
         )
     if capture.evidence_scope != LIVE_HANDSHAKE_EVIDENCE_SCOPE:
-        raise LiveHandshakeError("capture evidence scope is not live connector-v9 wire")
+        raise LiveHandshakeError(
+            "capture evidence scope is not live connector-v11 wire"
+        )
     if (
         capture.connector_version != NIXL_CONNECTOR_VERSION
-        or NIXL_CONNECTOR_VERSION != 9
+        or NIXL_CONNECTOR_VERSION != 11
     ):
         raise LiveHandshakeError(
-            "capture connector version differs from loaded v9 code"
+            "capture connector version differs from loaded v11 code"
         )
     if capture.producer.tensor_parallel_size != len(config.producer_devices):
         raise LiveHandshakeError("producer TP size differs from the rig contract")
     if capture.decoder.tensor_parallel_size != 1:
-        raise LiveHandshakeError("Target 1 decoder capture must be TP1")
+        raise LiveHandshakeError("Gemma 4 decoder capture must be TP1")
     replay = capture.replay
     if replay.total_num_kv_heads != capture.model.total_num_kv_heads:
         raise LiveHandshakeError("replay KV-head count differs from model evidence")
@@ -715,12 +833,14 @@ def _validate_live_contract(
             metadata=metadata,
             row_scale=1,
             expected_device=rank,
+            decoder=False,
         )
     _validate_metadata_geometry(
         config=config,
         metadata=decoder_metadata,
         row_scale=len(config.producer_devices),
         expected_device=0,
+        decoder=True,
     )
 
     producer_contracts = {
@@ -805,7 +925,18 @@ def _replay_production_validator(
     ]
     worker.kv_transfer_config = cast(
         KVTransferConfig,
-        SimpleNamespace(enable_permute_local_kv=False),
+        SimpleNamespace(enable_permute_local_kv=False, kv_role="kv_consumer"),
+    )
+    packed_write = SELECTED_PACKED_WRITE_CONTRACT
+    worker._packed_write_config = PackedWriteConfig(
+        enabled=True,
+        chunk_bytes_per_rank=packed_write.chunk_bytes_per_rank,
+        min_descriptors_per_rank=packed_write.min_descriptors_per_rank,
+        producer_slot_count=packed_write.producer_slot_count,
+        consumer_slot_count=packed_write.consumer_slot_count,
+        alignment_bytes=packed_write.alignment_bytes,
+        warn_after_s=30.0,
+        fail_after_s=300.0,
     )
     worker.vllm_config = cast(
         VllmConfig,

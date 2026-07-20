@@ -1,10 +1,10 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "profiles": [
     {
       "name": "legacy-storm37b-roster-static-projection",
-      "connector_version": 9,
-      "evidence_scope": "static_model_free_connector_v9_contract_fixture",
+      "connector_version": 11,
+      "evidence_scope": "static_model_free_connector_v11_contract_fixture",
       "runtime_capture_authenticated": false,
       "rank_identity_field": "tp_rank",
       "group_semantic_names": [
@@ -64,12 +64,21 @@
       ],
       "descriptor_dtype": "uint8",
       "descriptor_element_size_bytes": 1,
-      "descriptor_layout": "packed"
+      "descriptor_layout": "packed",
+      "packed_write_contract": {
+        "direction": "producer_to_consumer_write",
+        "chunk_bytes_per_rank": 268435456,
+        "min_descriptors_per_rank": 1024,
+        "producer_slot_count": 2,
+        "consumer_slot_count": 2,
+        "source_tp_size": 4,
+        "alignment_bytes": 256
+      }
     },
     {
       "name": "production-2k-rig-static-projection",
-      "connector_version": 9,
-      "evidence_scope": "static_model_free_connector_v9_contract_fixture",
+      "connector_version": 11,
+      "evidence_scope": "static_model_free_connector_v11_contract_fixture",
       "runtime_capture_authenticated": false,
       "rank_identity_field": "tp_rank",
       "group_semantic_names": [
@@ -129,7 +138,16 @@
       ],
       "descriptor_dtype": "uint8",
       "descriptor_element_size_bytes": 1,
-      "descriptor_layout": "packed"
+      "descriptor_layout": "packed",
+      "packed_write_contract": {
+        "direction": "producer_to_consumer_write",
+        "chunk_bytes_per_rank": 268435456,
+        "min_descriptors_per_rank": 1024,
+        "producer_slot_count": 2,
+        "consumer_slot_count": 2,
+        "source_tp_size": 4,
+        "alignment_bytes": 256
+      }
     }
   ]
 }

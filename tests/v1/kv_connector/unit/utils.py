@@ -225,6 +225,7 @@ def create_request(
             remote_engine_id="my-engine-id",
             remote_request_id=f"prefill-{request_id}",
             remote_block_ids=list(range(num_remote_blocks)),
+            remote_num_tokens=min(num_tokens, num_remote_blocks * block_size),
             remote_host="my-host",
             remote_port=1234,
             tp_size=1,
@@ -509,6 +510,11 @@ def make_nixl_scheduler(
     sched._parallel_pull_publication_granularity = 16
     sched._parallel_pull_flights = {}
     sched._offer_cancellation_queue = queue.Queue()
+    sched._source_rosters = {}
+    sched._source_offer_generation = 0
+    sched._active_source_offer_generations = {}
+    sched._sparse_retired_source_generations = set()
+    sched._source_retired_through = 0
 
     if heartbeat:
         sched._heartbeat_by_engine = {}
@@ -518,7 +524,6 @@ def make_nixl_scheduler(
         # Fields touched by build_connector_meta / request_finished:
         sched._reqs_need_recv = {}
         sched._reqs_need_send = {}
-        sched._source_rosters = {}
         sched._reqs_in_batch = set()
         sched._reqs_not_processed = set()
         sched._reqs_need_save = {}
@@ -561,6 +566,11 @@ def make_nixl_push_scheduler(
     sched._reqs_not_processed = set()
     sched._reqs_need_save = {}
     sched._offer_cancellation_queue = queue.Queue()
+    sched._source_rosters = {}
+    sched._source_offer_generation = 0
+    sched._active_source_offer_generations = {}
+    sched._sparse_retired_source_generations = set()
+    sched._source_retired_through = 0
     sched._kv_lease_duration = 30
     sched.decoder_kv_blocks_ttl = decoder_kv_blocks_ttl
     sched.use_host_buffer = False

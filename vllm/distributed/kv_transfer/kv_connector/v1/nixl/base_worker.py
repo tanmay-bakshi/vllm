@@ -53,10 +53,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
+    PackedWriteConsumerPoolGeometry,
+    PackedWriteProducerPoolGeometry,
+    RemoteOfferKey,
     ReqId,
     ReqMeta,
     TransferHandle,
     compute_nixl_compatibility_hash,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.packed_write_config import (
+    PackedWriteConfig,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlCoalescedPlanTelemetry,
@@ -77,7 +83,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
     MambaConvSplitInfo,
     derive_mamba_conv_split,
 )
-from vllm.distributed.kv_transfer.nixl_contracts import NixlRegionDescriptor
+from vllm.distributed.kv_transfer.nixl_contracts import (
+    NixlRegionDescriptor,
+    NixlSourceRoster,
+)
 from vllm.distributed.kv_transfer.nixl_fingerprint import NixlDeviceFingerprinter
 from vllm.distributed.kv_transfer.nixl_localization import (
     IntegrityLeafKey,
@@ -91,7 +100,6 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlSourceContract,
     NixlSourceManifest,
     NixlSourceManifestRecord,
-    NixlSourceRoster,
     build_fingerprint_leaf,
     build_integrity_identity,
     build_integrity_leaf,
@@ -132,6 +140,10 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+_MAX_REMOTE_OFFER_FENCES = 65_536
+
+_PACKED_WRITE_SOURCE_TP_SIZE = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +197,8 @@ class _RemoteRankHandshakeContract:
     source_group_planes: tuple[int, ...]
     physical_group_token_capacities: tuple[int, ...]
     region_geometry: tuple[tuple[object, ...], ...]
+    packed_write_producer_pool_geometry: tuple[int, int, int, int] | None
+    packed_write_consumer_pool_geometry: tuple[int, int, int, int, int, int] | None
 
 
 class NixlHandshakeFailStopError(StagingSafetyError):
@@ -517,6 +531,7 @@ class NixlBaseConnectorWorker:
         self.tp_rank = get_tensor_model_parallel_rank()
         self.world_size = get_tensor_model_parallel_world_size()
         self._registration_generation = uuid.uuid4().hex
+        self._packed_write_config = PackedWriteConfig.from_environment()
 
         self.num_blocks = kv_cache_config.num_blocks
         self.enable_permute_local_kv = False
@@ -601,6 +616,24 @@ class NixlBaseConnectorWorker:
         # region index -> registered cache tensor (scatter destinations)
         self._region_tensors: list[torch.Tensor] = []
         self._region_descriptors: tuple[NixlRegionDescriptor, ...] = ()
+        self._packed_write_producer_pool_buffer: torch.Tensor | None = None
+        self._packed_write_producer_pool_geometry: (
+            PackedWriteProducerPoolGeometry | None
+        ) = None
+        self._packed_write_producer_pack_stream: torch.cuda.Stream | None = None
+        self._packed_write_consumer_pool_buffer: torch.Tensor | None = None
+        self._packed_write_consumer_pool_geometry: (
+            PackedWriteConsumerPoolGeometry | None
+        ) = None
+        self._packed_write_consumer_slot_size_bytes: int | None = None
+        self._packed_write_consumer_source_tp_size: int = _PACKED_WRITE_SOURCE_TP_SIZE
+        self._packed_write_scatter_stream: torch.cuda.Stream | None = None
+        self._remote_packed_write_producer_pools: dict[
+            EngineId, dict[int, PackedWriteProducerPoolGeometry]
+        ] = defaultdict(dict)
+        self._remote_packed_write_consumer_pools: dict[
+            EngineId, dict[int, PackedWriteConsumerPoolGeometry]
+        ] = defaultdict(dict)
         self._localization_config = NixlLocalizationConfig.from_environment()
         self._localization_fingerprinter = (
             NixlDeviceFingerprinter()
@@ -618,7 +651,7 @@ class NixlBaseConnectorWorker:
             if self._localization_config.enabled
             else None
         )
-        self._localization_source_rosters: dict[ReqId, NixlSourceRoster] = {}
+        self._source_rosters: dict[ReqId, NixlSourceRoster] = {}
         self._coalesced_localization_plans: dict[ReqId, _CoalescedLocalizationPlan] = {}
         self._localization_pre_read_plans: dict[ReqId, _CoalescedLocalizationPlan] = {}
         self._localization_zero_recorded: set[ReqId] = set()
@@ -694,13 +727,17 @@ class NixlBaseConnectorWorker:
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
-        # Release fence: remote rids whose producer blocks are known to be
-        # released after all expected consumers completed. Bounded FIFO. A pull
-        # must never be issued for, nor committed against, a released rid.
-        self._released_rids: dict[str, float] = {}
-        # Consumer side: completed pulls per rid; the rid is released once
-        # this reaches the request's expected_consumers.
-        self._rid_completion_counts: dict[str, int] = {}
+        # Release fences remain exact until an authoritative producer retirement
+        # floor proves that every older allocation has been returned.
+        self._released_remote_offers: dict[RemoteOfferKey, float] = {}
+        self._remote_source_retired_through: dict[EngineId, int] = {}
+        # Consumer side: completed pulls per generation-scoped offer; the
+        # producer allocation is released at the expected-consumer quorum.
+        self._remote_offer_completion_counts: dict[RemoteOfferKey, int] = {}
+        # Per-child proof that every remote source actor has drained. This is
+        # distinct from decoder-local publication: scatter, validation, or
+        # telemetry may still fail after the producer is authorized to free.
+        self._remote_source_consumption_proven: dict[ReqId, RemoteOfferKey] = {}
         # ---- resident-KV checksum auditor (VLLM_GEMMA4_KV_AUDIT) ----
         # Snapshot content sums of immutable prompt rows at pull commit;
         # re-verify periodically. Debug instrument, off by default.
@@ -1370,6 +1407,287 @@ class NixlBaseConnectorWorker:
         # Forwarding a real layer name rather than a synthetic key
         self.register_kv_caches({first_layer: kv_cache})
 
+    def _validate_packed_write_region_rows(self, label: str) -> None:
+        """Require canonical CUDA rows for a packed transport role.
+
+        :param label: Human-readable source or destination role.
+        :raises RuntimeError: If registered cache rows cannot be packed safely.
+        """
+        if (
+            len(self._region_tensors) == 0
+            or len(self._region_descriptors) != len(self._region_tensors)
+            or self._coalesce_region_rows() is False
+            or self._region_rows is None
+            or len(self._region_rows) != len(self._region_tensors)
+        ):
+            raise RuntimeError(
+                f"packed write requires canonical registered {label}-region rows"
+            )
+        for region_index, rows in enumerate(self._region_rows):
+            if (
+                rows.dtype != torch.uint8
+                or rows.dim() != 2
+                or rows.is_contiguous() is False
+                or rows.device.type != "cuda"
+                or rows.device.index != self.device_id
+            ):
+                raise RuntimeError(
+                    f"packed write {label} region is not a canonical CUDA row "
+                    f"view: region={region_index}"
+                )
+
+    def _initialize_packed_write_producer_pool(self) -> None:
+        """Allocate and register the bounded producer gather pool.
+
+        :raises RuntimeError: If enabled packing cannot use the registered cache.
+        """
+        role = self.kv_transfer_config.kv_role
+        if self._packed_write_config.enabled is False or role not in {
+            "kv_producer",
+            "kv_both",
+        }:
+            return
+        if (
+            self._packed_write_producer_pool_buffer is not None
+            or self._packed_write_producer_pool_geometry is not None
+            or self._packed_write_producer_pack_stream is not None
+        ):
+            raise RuntimeError("packed write producer pool is already initialized")
+        if self.device_type != "cuda" or self.use_host_buffer:
+            raise RuntimeError("packed write requires direct CUDA KV registrations")
+        self._validate_packed_write_region_rows("source")
+
+        device = torch.device(self.device_type, self.device_id)
+        registered_bytes = self._packed_write_config.producer_pool_bytes
+        pool = torch.empty(
+            registered_bytes,
+            dtype=torch.uint8,
+            device=device,
+        )
+        if (
+            pool.dtype != torch.uint8
+            or pool.dim() != 1
+            or pool.is_contiguous() is False
+            or pool.device.type != "cuda"
+            or pool.device.index != self.device_id
+            or pool.numel() != registered_bytes
+        ):
+            raise RuntimeError("packed write producer pool allocation is invalid")
+        base_address = pool.data_ptr()
+        alignment = self._packed_write_config.alignment_bytes
+        if base_address % alignment != 0:
+            raise RuntimeError("packed write producer pool is not suitably aligned")
+        geometry = PackedWriteProducerPoolGeometry(
+            registration_generation=self._registration_generation,
+            base_address=base_address,
+            registered_bytes=registered_bytes,
+            slot_size_bytes=self._packed_write_config.chunk_bytes_per_rank,
+            slot_count=self._packed_write_config.producer_slot_count,
+            device_id=self.device_id,
+            alignment_bytes=alignment,
+        )
+        pack_stream = torch.cuda.Stream(device=device)
+        registration = self.nixl_wrapper.get_reg_descs(
+            [(base_address, registered_bytes, self.device_id, "")],
+            self.nixl_memory_type,
+        )
+        self.nixl_wrapper.register_memory(
+            registration,
+            backends=self.nixl_backends,
+        )
+        self._registered_descs.append(registration)
+        self._packed_write_producer_pool_buffer = pool
+        self._packed_write_producer_pool_geometry = geometry
+        self._packed_write_producer_pack_stream = pack_stream
+        logger.info(
+            "packed write: registered %d producer slots of %d MiB",
+            self._packed_write_config.producer_slot_count,
+            self._packed_write_config.chunk_bytes_per_rank >> 20,
+        )
+
+    def _initialize_packed_write_consumer_pool(self) -> None:
+        """Allocate and register the bounded decoder receive pool.
+
+        :raises RuntimeError: If enabled packing cannot use canonical CUDA cache
+            rows.
+        """
+        role = self.kv_transfer_config.kv_role
+        if self._packed_write_config.enabled is False or role not in {
+            "kv_consumer",
+            "kv_both",
+        }:
+            return
+        if (
+            self._packed_write_consumer_pool_buffer is not None
+            or self._packed_write_consumer_pool_geometry is not None
+            or self._packed_write_consumer_slot_size_bytes is not None
+            or self._packed_write_scatter_stream is not None
+        ):
+            raise RuntimeError("packed write consumer pool is already initialized")
+        if self.device_type != "cuda" or self.use_host_buffer:
+            raise RuntimeError("packed write requires direct CUDA KV registrations")
+        self._validate_packed_write_region_rows("destination")
+
+        source_tp_size = self._packed_write_consumer_source_tp_size
+        slot_size_bytes = (
+            source_tp_size * self._packed_write_config.chunk_bytes_per_rank
+        )
+        registered_bytes = self._packed_write_config.consumer_pool_bytes(source_tp_size)
+        device = torch.device(self.device_type, self.device_id)
+        pool = torch.empty(
+            registered_bytes,
+            dtype=torch.uint8,
+            device=device,
+        )
+        if (
+            pool.dtype != torch.uint8
+            or pool.dim() != 1
+            or pool.is_contiguous() is False
+            or pool.device.type != "cuda"
+            or pool.device.index != self.device_id
+            or pool.numel() != registered_bytes
+        ):
+            raise RuntimeError("packed write consumer pool allocation is invalid")
+        base_address = pool.data_ptr()
+        alignment = self._packed_write_config.alignment_bytes
+        if base_address % alignment != 0 or slot_size_bytes % alignment != 0:
+            raise RuntimeError("packed write consumer pool is not suitably aligned")
+
+        geometry = PackedWriteConsumerPoolGeometry(
+            registration_generation=self._registration_generation,
+            base_address=base_address,
+            registered_bytes=registered_bytes,
+            slot_size_bytes=slot_size_bytes,
+            slot_count=self._packed_write_config.consumer_slot_count,
+            source_tp_size=source_tp_size,
+            rank_stride_bytes=self._packed_write_config.chunk_bytes_per_rank,
+            device_id=self.device_id,
+            alignment_bytes=alignment,
+        )
+        scatter_stream = torch.cuda.Stream(device=device)
+        registration = self.nixl_wrapper.get_reg_descs(
+            [(base_address, registered_bytes, self.device_id, "")],
+            self.nixl_memory_type,
+        )
+        self.nixl_wrapper.register_memory(
+            registration,
+            backends=self.nixl_backends,
+        )
+        self._registered_descs.append(registration)
+        self._packed_write_consumer_pool_buffer = pool
+        self._packed_write_consumer_pool_geometry = geometry
+        self._packed_write_consumer_slot_size_bytes = slot_size_bytes
+        self._packed_write_scatter_stream = scatter_stream
+        logger.info(
+            "packed write: registered %d decoder slots of %d MiB for TP%d sources",
+            self._packed_write_config.consumer_slot_count,
+            slot_size_bytes >> 20,
+            source_tp_size,
+        )
+
+    def _packed_write_handshake_pools(
+        self,
+    ) -> tuple[
+        PackedWriteProducerPoolGeometry | None,
+        PackedWriteConsumerPoolGeometry | None,
+    ]:
+        """Return complete role-appropriate pools for handshake publication.
+
+        :returns: Producer and consumer pool geometry, when owned by this role.
+        :raises RuntimeError: If local packed registration is incomplete or stale.
+        """
+        role = self.kv_transfer_config.kv_role
+        producer_required = self._packed_write_config.enabled and role in {
+            "kv_producer",
+            "kv_both",
+        }
+        consumer_required = self._packed_write_config.enabled and role in {
+            "kv_consumer",
+            "kv_both",
+        }
+        producer_pool = self._packed_write_producer_pool_geometry
+        consumer_pool = self._packed_write_consumer_pool_geometry
+
+        if producer_required:
+            if (
+                self._packed_write_producer_pool_buffer is None
+                or producer_pool is None
+                or self._packed_write_producer_pack_stream is None
+            ):
+                raise RuntimeError("packed write producer registration is incomplete")
+            observed_producer = (
+                producer_pool.registration_generation,
+                producer_pool.registered_bytes,
+                producer_pool.slot_size_bytes,
+                producer_pool.slot_count,
+                producer_pool.device_id,
+                producer_pool.alignment_bytes,
+            )
+            expected_producer = (
+                self._registration_generation,
+                self._packed_write_config.producer_pool_bytes,
+                self._packed_write_config.chunk_bytes_per_rank,
+                self._packed_write_config.producer_slot_count,
+                self.device_id,
+                self._packed_write_config.alignment_bytes,
+            )
+            if observed_producer != expected_producer:
+                raise RuntimeError("packed write producer registration is stale")
+        elif (
+            self._packed_write_producer_pool_buffer is not None
+            or producer_pool is not None
+            or self._packed_write_producer_pack_stream is not None
+        ):
+            raise RuntimeError("inactive role owns packed write producer resources")
+
+        if consumer_required:
+            if (
+                self._packed_write_consumer_pool_buffer is None
+                or consumer_pool is None
+                or self._packed_write_consumer_slot_size_bytes is None
+                or self._packed_write_scatter_stream is None
+            ):
+                raise RuntimeError("packed write consumer registration is incomplete")
+            expected_slot_size = (
+                self._packed_write_consumer_source_tp_size
+                * self._packed_write_config.chunk_bytes_per_rank
+            )
+            observed_consumer = (
+                consumer_pool.registration_generation,
+                consumer_pool.registered_bytes,
+                consumer_pool.slot_size_bytes,
+                consumer_pool.slot_count,
+                consumer_pool.source_tp_size,
+                consumer_pool.rank_stride_bytes,
+                consumer_pool.device_id,
+                consumer_pool.alignment_bytes,
+                self._packed_write_consumer_slot_size_bytes,
+            )
+            expected_consumer = (
+                self._registration_generation,
+                self._packed_write_config.consumer_pool_bytes(
+                    self._packed_write_consumer_source_tp_size
+                ),
+                expected_slot_size,
+                self._packed_write_config.consumer_slot_count,
+                self._packed_write_consumer_source_tp_size,
+                self._packed_write_config.chunk_bytes_per_rank,
+                self.device_id,
+                self._packed_write_config.alignment_bytes,
+                expected_slot_size,
+            )
+            if observed_consumer != expected_consumer:
+                raise RuntimeError("packed write consumer registration is stale")
+        elif (
+            self._packed_write_consumer_pool_buffer is not None
+            or consumer_pool is not None
+            or self._packed_write_consumer_slot_size_bytes is not None
+            or self._packed_write_scatter_stream is not None
+        ):
+            raise RuntimeError("inactive role owns packed write consumer resources")
+
+        return producer_pool, consumer_pool
+
     def _register_packed_kv_cache(
         self,
         storage: torch.UntypedStorage,
@@ -1380,6 +1698,11 @@ class NixlBaseConnectorWorker:
         block_stride-byte chunk is one logical block.  We register 1
         NIXL region and create 1 descriptor per block.
         """
+        if self._packed_write_config.enabled:
+            raise RuntimeError(
+                "packed write requires canonical per-region cache tensors and is "
+                "incompatible with cross-layer packed KV storage"
+            )
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.world_size,
@@ -1444,6 +1767,10 @@ class NixlBaseConnectorWorker:
         self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
         self._registered_descs.append(descs)
 
+        self._initialize_packed_write_producer_pool()
+        self._initialize_packed_write_consumer_pool()
+        producer_pool, consumer_pool = self._packed_write_handshake_pools()
+
         self.dst_num_blocks[self.engine_id] = self.num_blocks
 
         self.src_xfer_handles_by_block_size[self.block_size], (self.src_blocks_data) = (
@@ -1473,6 +1800,8 @@ class NixlBaseConnectorWorker:
                 1 if flag else 2 for flag in self._sp_group_flags()
             ),
             physical_group_token_capacities=(self._physical_group_token_capacities()),
+            packed_write_producer_pool=producer_pool,
+            packed_write_consumer_pool=consumer_pool,
         )
         assert self.compat_hash is not None
         encoder = msgspec.msgpack.Encoder()
@@ -1740,6 +2069,10 @@ class NixlBaseConnectorWorker:
         logger.debug("Done registering descs")
         self._registered_descs.append(descs)
 
+        self._initialize_packed_write_producer_pool()
+        self._initialize_packed_write_consumer_pool()
+        producer_pool, consumer_pool = self._packed_write_handshake_pools()
+
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
 
@@ -1786,6 +2119,8 @@ class NixlBaseConnectorWorker:
                 1 if flag else 2 for flag in self._sp_group_flags()
             ),
             physical_group_token_capacities=(self._physical_group_token_capacities()),
+            packed_write_producer_pool=producer_pool,
+            packed_write_consumer_pool=consumer_pool,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -2021,6 +2356,36 @@ class NixlBaseConnectorWorker:
         # NIXL_INIT_AGENT to be used for preparations of local descs.
         return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs), blocks_data
 
+    def _record_remote_packed_write_pools(
+        self,
+        metadata: NixlAgentMetadata,
+        remote_tp_rank: int,
+    ) -> None:
+        """Retain validated packed pools for one imported remote rank.
+
+        :param metadata: Validated metadata for the imported rank.
+        :param remote_tp_rank: Imported remote tensor-parallel rank.
+        """
+        engine_id = metadata.engine_id
+        producer_pool = metadata.packed_write_producer_pool
+        if producer_pool is not None:
+            self._remote_packed_write_producer_pools[engine_id][remote_tp_rank] = (
+                producer_pool
+            )
+        consumer_pool = metadata.packed_write_consumer_pool
+        if consumer_pool is not None:
+            self._remote_packed_write_consumer_pools[engine_id][remote_tp_rank] = (
+                consumer_pool
+            )
+
+    def _clear_remote_packed_write_pools(self, engine_id: EngineId) -> None:
+        """Forget all packed-pool geometry for one removed remote engine.
+
+        :param engine_id: Removed remote engine identity.
+        """
+        self._remote_packed_write_producer_pools.pop(engine_id, None)
+        self._remote_packed_write_consumer_pools.pop(engine_id, None)
+
     def add_remote_agent(
         self,
         nixl_agent_meta: NixlAgentMetadata,
@@ -2071,8 +2436,18 @@ class NixlBaseConnectorWorker:
         tp_ratio < 0 (P_TP > D_TP) are supported by the 3-read transfer.
         """  # noqa: E501
         engine_id = nixl_agent_meta.engine_id
-        # TODO re-evaluate refreshing for scaling/recovery
         if remote_tp_rank in self._remote_agents.get(engine_id, {}):
+            retained_generation = self._remote_registration_generations.get(
+                engine_id,
+                {},
+            ).get(remote_tp_rank)
+            if retained_generation != nixl_agent_meta.registration_generation:
+                reason = self._latch_handshake_fail_stop(
+                    engine_id,
+                    "a cached remote engine/rank reused its identity with a "
+                    "different registration generation",
+                )
+                raise NixlHandshakeFailStopError(reason)
             logger.debug(
                 "Remote agent with engine_id %s and rank"
                 "%s already exchanged metadata, skip handshake.",
@@ -2152,6 +2527,7 @@ class NixlBaseConnectorWorker:
         self._remote_rank_contracts[engine_id][remote_tp_rank] = (
             self._rank_handshake_contract(nixl_agent_meta)
         )
+        self._record_remote_packed_write_pools(nixl_agent_meta, remote_tp_rank)
 
         # This is 1 when P and D `--tensor-parallel-size` match. Otherwise,
         # this is the ratio between the two sizes.
@@ -2364,6 +2740,90 @@ class NixlBaseConnectorWorker:
             fail("remote attention backend name is empty")
         if len(nixl_agent_meta.registration_generation) == 0:
             fail("remote registration generation is empty")
+        producer_pool = nixl_agent_meta.packed_write_producer_pool
+        consumer_pool = nixl_agent_meta.packed_write_consumer_pool
+        if (
+            producer_pool is not None
+            and type(producer_pool) is not PackedWriteProducerPoolGeometry
+        ):
+            fail("packed write producer pool has the wrong wire type")
+        if (
+            consumer_pool is not None
+            and type(consumer_pool) is not PackedWriteConsumerPoolGeometry
+        ):
+            fail("packed write consumer pool has the wrong wire type")
+        for pool_name, pool in (
+            ("producer", producer_pool),
+            ("consumer", consumer_pool),
+        ):
+            if pool is None:
+                continue
+            if pool.registration_generation != nixl_agent_meta.registration_generation:
+                fail(f"packed write {pool_name} pool registration generation differs")
+            if pool.device_id != nixl_agent_meta.device_id:
+                fail(
+                    f"packed write {pool_name} pool device differs from the KV "
+                    "registration"
+                )
+            registration_end = pool.base_address + pool.registered_bytes
+            if registration_end <= pool.base_address or registration_end > (1 << 64):
+                fail(
+                    f"packed write {pool_name} pool registration exceeds the "
+                    "uint64 address space"
+                )
+
+        if self._packed_write_config.enabled is False:
+            return
+        local_role = self.kv_transfer_config.kv_role
+        if local_role in {"kv_consumer", "kv_both"}:
+            if producer_pool is None:
+                fail("packed write is enabled but the producer has no pack pool")
+            expected_producer = (
+                self._packed_write_config.producer_pool_bytes,
+                self._packed_write_config.chunk_bytes_per_rank,
+                self._packed_write_config.producer_slot_count,
+                self._packed_write_config.alignment_bytes,
+            )
+            observed_producer = (
+                producer_pool.registered_bytes,
+                producer_pool.slot_size_bytes,
+                producer_pool.slot_count,
+                producer_pool.alignment_bytes,
+            )
+            if observed_producer != expected_producer:
+                fail(
+                    "packed write producer pool geometry differs from local "
+                    f"configuration: remote={observed_producer}, "
+                    f"local={expected_producer}"
+                )
+        if local_role in {"kv_producer", "kv_both"}:
+            if consumer_pool is None:
+                fail("packed write is enabled but the consumer has no receive pool")
+            if self.transfer_topo is None:
+                fail("local transfer topology is unavailable")
+            local_source_tp_size = self.transfer_topo.tp_size
+            expected_consumer = (
+                self._packed_write_config.consumer_pool_bytes(local_source_tp_size),
+                local_source_tp_size * self._packed_write_config.chunk_bytes_per_rank,
+                self._packed_write_config.consumer_slot_count,
+                local_source_tp_size,
+                self._packed_write_config.chunk_bytes_per_rank,
+                self._packed_write_config.alignment_bytes,
+            )
+            observed_consumer = (
+                consumer_pool.registered_bytes,
+                consumer_pool.slot_size_bytes,
+                consumer_pool.slot_count,
+                consumer_pool.source_tp_size,
+                consumer_pool.rank_stride_bytes,
+                consumer_pool.alignment_bytes,
+            )
+            if observed_consumer != expected_consumer:
+                fail(
+                    "packed write consumer pool geometry differs from local "
+                    f"configuration: remote={observed_consumer}, "
+                    f"local={expected_consumer}"
+                )
 
     def _validate_region_descriptor_set(
         self,
@@ -2585,6 +3045,97 @@ class NixlBaseConnectorWorker:
             for region in regions
         )
 
+    def _validate_remote_packed_write_pool_ranges(
+        self,
+        metadata: NixlAgentMetadata,
+        remote_tp_rank: int,
+    ) -> None:
+        """Require remote pools to be disjoint from KV and each other.
+
+        :param metadata: Validated remote rank metadata.
+        :param remote_tp_rank: Remote tensor-parallel rank.
+        :raises RuntimeError: If independently owned registrations overlap.
+        """
+        ranges = [
+            (
+                region.base_address,
+                region.base_address + region.registered_bytes,
+                f"KV region {region_index}",
+            )
+            for region_index, region in enumerate(metadata.regions)
+        ]
+        producer_pool = metadata.packed_write_producer_pool
+        if producer_pool is not None:
+            ranges.append(
+                (
+                    producer_pool.base_address,
+                    producer_pool.base_address + producer_pool.registered_bytes,
+                    "producer pool",
+                )
+            )
+        consumer_pool = metadata.packed_write_consumer_pool
+        if consumer_pool is not None:
+            ranges.append(
+                (
+                    consumer_pool.base_address,
+                    consumer_pool.base_address + consumer_pool.registered_bytes,
+                    "consumer pool",
+                )
+            )
+        ranges.sort()
+        for previous, current in zip(ranges, ranges[1:]):
+            if previous[1] <= current[0]:
+                continue
+            self._raise_handshake_contract_error(
+                metadata,
+                remote_tp_rank,
+                "packed write registrations overlap: "
+                f"{previous[2]}=[{previous[0]}, {previous[1]}) and "
+                f"{current[2]}=[{current[0]}, {current[1]})",
+            )
+
+    @staticmethod
+    def _rank_packed_write_producer_pool_contract(
+        pool: PackedWriteProducerPoolGeometry | None,
+    ) -> tuple[int, int, int, int] | None:
+        """Return address-independent producer-pool geometry.
+
+        :param pool: Rank-local producer pool, when packed write is enabled.
+        :returns: Comparable bytes, slot shape, and alignment.
+        """
+        if pool is None:
+            return None
+        if type(pool) is not PackedWriteProducerPoolGeometry:
+            raise ValueError("packed write producer pool has the wrong wire type")
+        return (
+            pool.registered_bytes,
+            pool.slot_size_bytes,
+            pool.slot_count,
+            pool.alignment_bytes,
+        )
+
+    @staticmethod
+    def _rank_packed_write_consumer_pool_contract(
+        pool: PackedWriteConsumerPoolGeometry | None,
+    ) -> tuple[int, int, int, int, int, int] | None:
+        """Return address-independent consumer-pool geometry.
+
+        :param pool: Rank-local consumer pool, when packed write is enabled.
+        :returns: Comparable bytes, slot shape, TP width, and alignment.
+        """
+        if pool is None:
+            return None
+        if type(pool) is not PackedWriteConsumerPoolGeometry:
+            raise ValueError("packed write consumer pool has the wrong wire type")
+        return (
+            pool.registered_bytes,
+            pool.slot_size_bytes,
+            pool.slot_count,
+            pool.source_tp_size,
+            pool.rank_stride_bytes,
+            pool.alignment_bytes,
+        )
+
     @classmethod
     def _rank_handshake_contract(
         cls,
@@ -2609,6 +3160,16 @@ class NixlBaseConnectorWorker:
             source_group_planes=metadata.source_group_planes,
             physical_group_token_capacities=(metadata.physical_group_token_capacities),
             region_geometry=cls._rank_region_contract(metadata.regions),
+            packed_write_producer_pool_geometry=(
+                cls._rank_packed_write_producer_pool_contract(
+                    metadata.packed_write_producer_pool
+                )
+            ),
+            packed_write_consumer_pool_geometry=(
+                cls._rank_packed_write_consumer_pool_contract(
+                    metadata.packed_write_consumer_pool
+                )
+            ),
         )
 
     @staticmethod
@@ -2657,6 +3218,16 @@ class NixlBaseConnectorWorker:
                 "region_geometry",
                 reference.region_geometry,
                 current.region_geometry,
+            ),
+            (
+                "packed_write_producer_pool_geometry",
+                reference.packed_write_producer_pool_geometry,
+                current.packed_write_producer_pool_geometry,
+            ),
+            (
+                "packed_write_consumer_pool_geometry",
+                reference.packed_write_consumer_pool_geometry,
+                current.packed_write_consumer_pool_geometry,
             ),
         )
         return tuple(name for name, first, second in fields if first != second)
@@ -2937,6 +3508,10 @@ class NixlBaseConnectorWorker:
             nixl_agent_meta.num_blocks,
             group_count,
             nixl_agent_meta.kv_cache_layout,
+        )
+        self._validate_remote_packed_write_pool_ranges(
+            nixl_agent_meta,
+            remote_tp_rank,
         )
         if len(local_regions) != len(nixl_agent_meta.regions):
             fail(
@@ -3257,26 +3832,37 @@ class NixlBaseConnectorWorker:
     # Diagnostic P-to-D source snapshots
     # ------------------------------------------------------------------
 
-    def _localization_capture_source_rosters(
+    def _capture_source_rosters(
         self,
         rosters: dict[ReqId, NixlSourceRoster],
     ) -> None:
-        """Retain newly offered producer allocations until read completion.
+        """Retain physical producer allocations until remote consumption.
 
         :param rosters: Exact post-clipping logical block rosters from the
             scheduler.
         """
-        if self._localization_config.enabled is False:
-            if len(rosters) > 0:
-                raise LocalizationError(
-                    "source rosters arrived while localization is disabled"
-                )
-            return
         for req_id, logical_roster in rosters.items():
-            if self._localization_config.enabled_for_producer(req_id) is False:
-                continue
-            if req_id in self._localization_source_rosters:
+            if req_id in self._source_rosters:
                 raise LocalizationError(f"duplicate source roster for {req_id}")
+            if (
+                type(logical_roster.offer_generation) is not int
+                or logical_roster.offer_generation < 1
+                or type(logical_roster.iteration) is not int
+                or logical_roster.iteration < 0
+                or type(logical_roster.expected_consumers) is not int
+                or logical_roster.expected_consumers < 1
+                or type(logical_roster.valid_token_extent) is not int
+                or logical_roster.valid_token_extent < 1
+            ):
+                raise LocalizationError(f"invalid source roster for {req_id}")
+            if len(logical_roster.block_ids) != len(
+                self.kv_cache_config.kv_cache_groups
+            ):
+                raise LocalizationError(
+                    f"source roster group count differs for {req_id}"
+                )
+            if not any(len(group) > 0 for group in logical_roster.block_ids):
+                raise LocalizationError(f"source roster is empty for {req_id}")
             physical_groups = self._logical_to_kernel_block_ids(
                 [list(group) for group in logical_roster.block_ids]
             )
@@ -3315,7 +3901,7 @@ class NixlBaseConnectorWorker:
                     for group in physical_groups
                 ),
             )
-            self._localization_source_rosters[req_id] = physical_roster
+            self._source_rosters[req_id] = physical_roster
 
     def _localization_materialize_fingerprint_leaves(
         self,
@@ -3683,7 +4269,7 @@ class NixlBaseConnectorWorker:
         """
         if self._localization_config.enabled_for_producer(req_id) is False:
             return
-        roster = self._localization_source_rosters.get(req_id)
+        roster = self._source_rosters.get(req_id)
         if roster is None:
             raise LocalizationError(
                 f"completed target read has no retained source roster for {req_id}"
@@ -3693,7 +4279,6 @@ class NixlBaseConnectorWorker:
             roster,
             IntegrityStage.SOURCE_POST,
         )
-        del self._localization_source_rosters[req_id]
 
     def _localization_capture_staging(
         self,
@@ -4610,11 +5195,13 @@ class NixlBaseConnectorWorker:
         self,
         plan: CoalescedStagingPlan,
         reason: str,
+        failure_reason: KVTransferFailureReason = KVTransferFailureReason.TRANSFER,
     ) -> None:
         """Fail one request after every native and device actor is quiescent.
 
         :param plan: Exact staging owner being retired.
         :param reason: Stable request-failure detail.
+        :param failure_reason: Request-scoped failure classification.
         """
         if plan.operation_failed is False:
             plan.fail(reason)
@@ -4642,7 +5229,7 @@ class NixlBaseConnectorWorker:
         self._localization_pre_read_plans.pop(plan.request_id, None)
         self._record_failed_receive(
             plan.request_id,
-            KVTransferFailureReason.TRANSFER,
+            failure_reason,
             meta,
         )
         self.xfer_stats.record_failed_transfer()
@@ -4873,6 +5460,17 @@ class NixlBaseConnectorWorker:
                     plan,
                     "native transfer exceeded the fail-stop deadline",
                 )
+            if plan.source_consumption_proven:
+                meta = self._recving_metadata.get(plan.request_id)
+                if meta is None:
+                    self._fail_coalesced_plan(
+                        plan,
+                        "source consumption proof lost request metadata",
+                    )
+                self._record_remote_source_consumption_proven(
+                    plan.request_id,
+                    meta,
+                )
             if plan.operation_failed:
                 if plan.native_quiescent:
                     self._finish_quiescent_coalesced_request_failure(
@@ -4881,6 +5479,26 @@ class NixlBaseConnectorWorker:
                     )
                 continue
             if plan.ready_to_scatter is False:
+                continue
+            meta = self._recving_metadata.get(plan.request_id)
+            if (
+                meta is not None
+                and meta.remote is not None
+                and (
+                    meta.remote.offer_key in self._released_remote_offers
+                    or self._remote_offer_retired_by_floor(meta.remote.offer_key)
+                )
+            ):
+                reason = (
+                    "producer source offer retired after native READ and before "
+                    "destination scatter"
+                )
+                plan.fail(reason)
+                self._finish_quiescent_coalesced_request_failure(
+                    plan,
+                    reason,
+                    KVTransferFailureReason.INTEGRITY,
+                )
                 continue
             try:
                 wire_bytes = sum(
@@ -5269,12 +5887,15 @@ class NixlBaseConnectorWorker:
         stock_handle_count = sum(
             len(handles) for handles in self._recving_transfers.values()
         )
+        packed_active_count, packed_pending_count = self._packed_transfer_work_count()
         if (
             self._transfer_phase_active
             or len(self._deferred_phase_sending) > 0
             or len(self._deferred_phase_recving) > 0
             or len(self._coalesce_plans) > 0
             or len(self._coalesce_pending) > 0
+            or packed_active_count > 0
+            or packed_pending_count > 0
             or stock_handle_count > 0
         ):
             self._transfer_phase_violation_count += 1
@@ -5357,8 +5978,11 @@ class NixlBaseConnectorWorker:
             stock_handle_count = sum(
                 len(handles) for handles in self._recving_transfers.values()
             )
-            active_plan_count = len(self._coalesce_plans)
-            pending_request_count = len(self._coalesce_pending)
+            packed_active_count, packed_pending_count = (
+                self._packed_transfer_work_count()
+            )
+            active_plan_count = len(self._coalesce_plans) + packed_active_count
+            pending_request_count = len(self._coalesce_pending) + packed_pending_count
             if stock_handle_count > 0:
                 self._transfer_phase_violation_count += 1
                 raise StagingSafetyError(
@@ -5387,9 +6011,12 @@ class NixlBaseConnectorWorker:
         stock_handle_count = sum(
             len(handles) for handles in self._recving_transfers.values()
         )
+        packed_active_count, packed_pending_count = self._packed_transfer_work_count()
         if (
             len(self._coalesce_plans) > 0
             or len(self._coalesce_pending) > 0
+            or packed_active_count > 0
+            or packed_pending_count > 0
             or stock_handle_count > 0
         ):
             self._transfer_phase_violation_count += 1
@@ -5501,6 +6128,7 @@ class NixlBaseConnectorWorker:
             self._transfer_phase_active
             or len(self._coalesce_plans) > 0
             or len(self._coalesce_pending) > 0
+            or any(value > 0 for value in self._packed_transfer_work_count())
             or sum(len(handles) for handles in self._recving_transfers.values()) > 0
         ):
             self._transfer_phase_violation_count += 1
@@ -5534,6 +6162,7 @@ class NixlBaseConnectorWorker:
         assert self.transfer_topo is not None
         done_sending = self._get_new_notifs()
         done_recving = self._pop_done_transfers(self._recving_transfers)
+        done_recving.update(self._pop_packed_done_recving())
 
         while not self._failed_recv_outcomes.empty():
             try:
@@ -5578,6 +6207,13 @@ class NixlBaseConnectorWorker:
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
 
+            # Direct and zero-byte reads prove source consumption when their
+            # request completes successfully. Coalesced READ and packed WRITE
+            # record the same proof at their earlier source-drained boundary,
+            # before any decoder-local work which can still fail.
+            if meta.remote is not None and req_id not in failed_recv_reqs:
+                self._record_remote_source_consumption_proven(req_id, meta)
+
             # Release fence: this pull completed for a rid whose producer
             # blocks were already released after all expected consumers
             # completed. The bytes may come from reused pages, so fail the
@@ -5586,7 +6222,10 @@ class NixlBaseConnectorWorker:
             # are exempt.
             if (
                 meta.remote is not None
-                and meta.remote.request_id in self._released_rids
+                and (
+                    meta.remote.offer_key in self._released_remote_offers
+                    or self._remote_offer_retired_by_floor(meta.remote.offer_key)
+                )
                 and req_id not in failed_recv_reqs
                 and sum(len(g) for g in meta.local_physical_block_ids) > 0
             ):
@@ -5603,16 +6242,8 @@ class NixlBaseConnectorWorker:
                     meta,
                 )
                 failed_recv_reqs.add(req_id)
-            elif meta.remote is not None and req_id not in failed_recv_reqs:
-                # Count this completion; the producer frees its blocks at
-                # expected_consumers completions, so mirror that release
-                # point locally.
-                rid = meta.remote.request_id
-                n_done = self._rid_completion_counts.get(rid, 0) + 1
-                self._rid_completion_counts[rid] = n_done
-                if n_done >= meta.remote.expected_consumers:
-                    self._rid_completion_counts.pop(rid, None)
-                    self._mark_rid_released(rid)
+            if meta.remote is not None:
+                self._consume_remote_source_consumption_proof(req_id, meta)
 
             # Skip KV sync and post-processing for failed requests
             if req_id in failed_recv_reqs:
@@ -5885,6 +6516,44 @@ class NixlBaseConnectorWorker:
         """Overridden by the pull worker; push has no pull staging."""
         return
 
+    def _packed_transfer_work_count(self) -> tuple[int, int]:
+        """Return active packed requests and pending packed chunks.
+
+        :returns: Zero counts for workers without packed write support.
+        """
+        return 0, 0
+
+    def _pop_packed_done_recving(self) -> set[ReqId]:
+        """Consume packed completions on pull-capable workers.
+
+        :returns: Empty completion set for workers without packed write support.
+        """
+        return set()
+
+    def _packed_remote_engine_active(self, engine_id: EngineId) -> bool:
+        """Return whether packed state owns one remote engine.
+
+        :param engine_id: Candidate remote engine identity.
+        :returns: False for workers without packed write support.
+        """
+        return False
+
+    def _packed_remote_engine_cleanup(self, engine_id: EngineId) -> None:
+        """Clear packed metadata for one quiescent remote engine.
+
+        :param engine_id: Remote engine proven free of packed work.
+        """
+
+    def _packed_registered_ownership_active(self) -> bool:
+        """Return whether packed state still owns registered memory.
+
+        :returns: False for workers without packed write support.
+        """
+        return False
+
+    def _packed_shutdown_cleanup(self) -> None:
+        """Release connector-specific packed resources before deregistration."""
+
     def _sync_device_after_mamba_recv(
         self,
         done_recving: set[str],
@@ -5908,11 +6577,132 @@ class NixlBaseConnectorWorker:
         """
         raise NotImplementedError
 
-    def _mark_rid_released(self, rid: str) -> None:
-        self._released_rids[rid] = time.perf_counter()
-        if len(self._released_rids) > 8192:
-            for k in list(self._released_rids)[:2048]:
-                del self._released_rids[k]
+    def _mark_remote_offer_released(self, offer_key: RemoteOfferKey) -> None:
+        """Fence one exact producer allocation after its consumer quorum.
+
+        :param offer_key: Generation-scoped remote producer allocation.
+        """
+        if self._remote_offer_retired_by_floor(offer_key):
+            return
+        if (
+            offer_key not in self._released_remote_offers
+            and len(self._released_remote_offers) >= _MAX_REMOTE_OFFER_FENCES
+        ):
+            raise StagingSafetyError(
+                "remote source-release fences exceeded their fail-stop bound"
+            )
+        self._released_remote_offers[offer_key] = time.perf_counter()
+
+    def _record_remote_source_consumption_proven(
+        self,
+        request_id: ReqId,
+        meta: ReqMeta,
+    ) -> None:
+        """Bind one decoder child to its exact drained producer offer.
+
+        :param request_id: Decoder child whose remote source actors drained.
+        :param meta: Immutable request metadata carrying the producer offer.
+        :raises StagingSafetyError: If the child is rebound to another offer.
+        """
+        if meta.remote is None:
+            raise StagingSafetyError(
+                "remote source consumption proof has no producer metadata"
+            )
+        offer_key = meta.remote.offer_key
+        prior = self._remote_source_consumption_proven.get(request_id)
+        if prior is not None and prior != offer_key:
+            raise StagingSafetyError(
+                "decoder child source consumption proof changed producer offer"
+            )
+        self._remote_source_consumption_proven[request_id] = offer_key
+
+    def _consume_remote_source_consumption_proof(
+        self,
+        request_id: ReqId,
+        meta: ReqMeta,
+    ) -> bool:
+        """Advance one offer quorum from an exact source-drained child proof.
+
+        :param request_id: Terminal decoder child.
+        :param meta: Immutable request metadata carrying the producer contract.
+        :returns: Whether a source-drained proof was consumed.
+        :raises StagingSafetyError: If the proof and terminal metadata differ.
+        """
+        if meta.remote is None:
+            raise StagingSafetyError(
+                "remote source consumption terminal has no producer metadata"
+            )
+        offer_key = self._remote_source_consumption_proven.pop(request_id, None)
+        if offer_key is None:
+            return False
+        if offer_key != meta.remote.offer_key:
+            raise StagingSafetyError(
+                "decoder child terminal differs from its source consumption proof"
+            )
+        if (
+            offer_key in self._released_remote_offers
+            or self._remote_offer_retired_by_floor(offer_key)
+        ):
+            return True
+        n_done = self._remote_offer_completion_counts.get(offer_key, 0) + 1
+        if n_done > meta.remote.expected_consumers:
+            raise StagingSafetyError(
+                "remote source consumption exceeded its consumer contract"
+            )
+        if n_done == meta.remote.expected_consumers:
+            self._remote_offer_completion_counts.pop(offer_key, None)
+            self._mark_remote_offer_released(offer_key)
+            return True
+        self._remote_offer_completion_counts[offer_key] = n_done
+        return True
+
+    def _advance_remote_source_retirement_floor(
+        self,
+        producer_engine_id: EngineId,
+        retired_through: int,
+    ) -> int:
+        """Apply one producer-committed contiguous source-retirement floor.
+
+        :param producer_engine_id: Producer process identity for the generation
+            sequence.
+        :param retired_through: Highest contiguous generation whose source
+            allocation was returned by every producer rank.
+        :returns: Monotonic floor retained for that producer.
+        """
+        if type(producer_engine_id) is not str or len(producer_engine_id) == 0:
+            raise ValueError("producer_engine_id must be a non-empty string")
+        if type(retired_through) is not int or retired_through < 0:
+            raise ValueError("retired_through must be a non-negative integer")
+        current = self._remote_source_retired_through.get(producer_engine_id, 0)
+        if retired_through <= current:
+            return current
+        self._remote_source_retired_through[producer_engine_id] = retired_through
+        self._released_remote_offers = {
+            key: released_at
+            for key, released_at in self._released_remote_offers.items()
+            if key[0] != producer_engine_id
+            or key[2] is None
+            or key[2] > retired_through
+        }
+        self._remote_offer_completion_counts = {
+            key: count
+            for key, count in self._remote_offer_completion_counts.items()
+            if key[0] != producer_engine_id
+            or key[2] is None
+            or key[2] > retired_through
+        }
+        return retired_through
+
+    def _remote_offer_retired_by_floor(self, offer_key: RemoteOfferKey) -> bool:
+        """Return whether the producer has authoritatively retired an offer.
+
+        :param offer_key: Remote producer allocation identity.
+        :returns: Whether its generation is at or below the committed floor.
+        """
+        generation = offer_key[2]
+        if generation is None:
+            return False
+        return generation <= self._remote_source_retired_through.get(offer_key[0], 0)
 
     def _handle_heartbeat(self, payload: str) -> None:
         """Extend leases for requests referenced in a heartbeat.
@@ -6433,11 +7223,14 @@ class NixlBaseConnectorWorker:
                 for plan in self._coalesce_plans.values()
                 if plan.remote_engine_id == eid
             ]
-            if len(active_plans) > 0:
+            if len(active_plans) > 0 or self._packed_remote_engine_active(eid):
                 self._engine_last_active[eid] = now
+                ownership = "; ".join(plan.describe(now) for plan in active_plans)
+                if len(ownership) == 0:
+                    ownership = "packed write active"
                 logger.warning(
-                    "Skipping remote-engine eviction while staging is owned: %s",
-                    "; ".join(plan.describe(now) for plan in active_plans),
+                    "Skipping remote-engine eviction while transfer state is owned: %s",
+                    ownership,
                 )
                 continue
             if now - last_active > self._engine_ttl:
@@ -6458,11 +7251,13 @@ class NixlBaseConnectorWorker:
             for plan in self._coalesce_plans.values()
             if plan.remote_engine_id == engine_id
         ]
-        if len(active_plans) > 0:
+        if len(active_plans) > 0 or self._packed_remote_engine_active(engine_id):
             raise StagingSafetyError(
-                "remote-engine cleanup would release resources with live staging "
+                "remote-engine cleanup would release live transfer resources "
                 + "; ".join(plan.describe() for plan in active_plans)
             )
+
+        self._packed_remote_engine_cleanup(engine_id)
 
         for handle in self.dst_xfer_side_handles.pop(engine_id).values():
             self.nixl_wrapper.release_dlist_handle(handle)
@@ -6477,6 +7272,7 @@ class NixlBaseConnectorWorker:
         self._remote_registration_generations.pop(engine_id, None)
         self._remote_source_semantics.pop(engine_id, None)
         self._remote_rank_contracts.pop(engine_id, None)
+        self._clear_remote_packed_write_pools(engine_id)
         if self.transfer_topo is not None:
             self.transfer_topo.unregister_remote_engine(engine_id)
 
@@ -6503,6 +7299,11 @@ class NixlBaseConnectorWorker:
             # error happens during init, no need to shutdown
             return
         self._raise_if_handshake_fail_stopped()
+        if self._packed_registered_ownership_active():
+            raise StagingSafetyError(
+                "in-process shutdown cannot deregister memory with live packed "
+                "ownership"
+            )
         unsafe_plans = [
             plan for plan in self._coalesce_plans.values() if plan.reusable is False
         ]
@@ -6539,8 +7340,18 @@ class NixlBaseConnectorWorker:
             for handle in handles:
                 self.nixl_wrapper.release_dlist_handle(handle)
         self.src_xfer_handles_by_tp_ratio.clear()
+        self._packed_shutdown_cleanup()
         for engine_id in list(self._remote_agents):
             self._cleanup_remote_engine(engine_id, log_eviction=False)
         for desc in self._registered_descs:
             self.nixl_wrapper.deregister_memory(desc)
         self._registered_descs.clear()
+        self._packed_write_producer_pool_buffer = None
+        self._packed_write_producer_pool_geometry = None
+        self._packed_write_producer_pack_stream = None
+        self._packed_write_consumer_pool_buffer = None
+        self._packed_write_consumer_pool_geometry = None
+        self._packed_write_consumer_slot_size_bytes = None
+        self._packed_write_scatter_stream = None
+        self._remote_packed_write_producer_pools.clear()
+        self._remote_packed_write_consumer_pools.clear()

@@ -38,7 +38,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
     NixlPullConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpec
-from vllm.distributed.kv_transfer.nixl_contracts import NixlRegionDescriptor
+from vllm.distributed.kv_transfer.nixl_contracts import (
+    NixlRegionDescriptor,
+    NixlSourceRoster,
+)
 from vllm.distributed.kv_transfer.nixl_localization import (
     LocalizationArtifactWriter,
     LocalizationError,
@@ -55,7 +58,6 @@ from vllm.distributed.kv_transfer.nixl_localization import (
     NixlSourceContract,
     NixlSourceManifest,
     NixlSourceManifestRecord,
-    NixlSourceRoster,
     build_fingerprint_leaf,
     build_integrity_identity,
     build_integrity_leaf,
@@ -1358,6 +1360,10 @@ def test_normal_consumer_metadata_names_only_the_actual_forward() -> None:
     scheduler._reqs_need_save = {}
     scheduler._reqs_need_send = {}
     scheduler._source_rosters = {}
+    scheduler._source_offer_generation = 0
+    scheduler._active_source_offer_generations = {}
+    scheduler._sparse_retired_source_generations = set()
+    scheduler._source_retired_through = 0
     scheduler._reqs_in_batch = set()
     scheduler._reqs_not_processed = set()
     scheduler._audit_finished_reqs = set()
@@ -1547,7 +1553,7 @@ def _contract_worker(
             remote_num_tokens=manifest.valid_token_extent,
             p2d_run_id=config.run_id,
             p2d_transport_arm=config.transport_arm,
-            p2d_offer_generation=manifest.offer_generation,
+            source_offer_generation=manifest.offer_generation,
             p2d_iteration=manifest.iteration,
         ),
     )
@@ -1657,7 +1663,7 @@ def test_source_contract_rejects_handshake_outside_native_registration(
 
 
 @pytest.mark.cpu_test
-def test_completed_source_roster_captures_source_post_then_retires(
+def test_completed_source_roster_captures_source_post_and_remains_leased(
     tmp_path: Path,
 ) -> None:
     req_id = f"{TARGET_REQUEST_ID_BASE}-11111111"
@@ -1671,14 +1677,14 @@ def test_completed_source_roster_captures_source_post_then_retires(
     )
     worker = object.__new__(NixlPullConnectorWorker)
     worker._localization_config = _config(tmp_path)
-    worker._localization_source_rosters = {req_id: roster}
+    worker._source_rosters = {req_id: roster}
     capture = MagicMock()
     worker._localization_capture_source_manifest = capture
 
     worker._localization_capture_source_post(req_id)
 
     capture.assert_called_once_with(req_id, roster, IntegrityStage.SOURCE_POST)
-    assert worker._localization_source_rosters == {}
+    assert worker._source_rosters == {req_id: roster}
 
 
 @pytest.mark.cpu_test

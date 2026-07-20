@@ -361,17 +361,6 @@ class NixlIntegrityLeaf(msgspec.Struct, array_like=True, frozen=True):
     digest: bytes
 
 
-class NixlSourceRoster(msgspec.Struct, array_like=True, frozen=True):
-    """Exact producer block roster retained until transfer completion."""
-
-    offer_generation: int
-    iteration: int
-    expected_consumers: int
-    valid_token_extent: int
-    group_token_capacities: tuple[int, ...]
-    block_ids: tuple[tuple[int, ...], ...]
-
-
 class NixlSourceContract(msgspec.Struct, array_like=True, frozen=True):
     """Content-free identity and geometry of one producer-rank transfer."""
 

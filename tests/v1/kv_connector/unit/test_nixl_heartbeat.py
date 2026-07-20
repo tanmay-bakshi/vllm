@@ -4,6 +4,8 @@
 
 import queue
 import time
+from collections import deque
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +28,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     RemoteMeta,
     ReqMeta,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.packed_write_config import (
+    PackedWriteConfig,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
     _consumer_tp_size,
     _expected_consumers,
@@ -34,11 +39,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
     _consumer_ranks_for_producer,
     _parallel_consumer_index,
 )
+from vllm.distributed.kv_transfer.staging_ownership import StagingSafetyError
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import create_request, make_nixl_scheduler
 
 _ENGINE_A = "my-engine-id"
+_OFFER_GENERATION = 7
 
 
 def _sched(kv_lease_duration: int = 30):
@@ -65,20 +72,41 @@ def _worker_stub():
     w.world_size = 1
     w._pull_completion_states = {}
     w._buffered_pull_completions = {}
+    w._buffered_packed_source_drained = {}
     w._buffered_offer_cancellations = {}
     w._pending_offer_cancellations = []
     w._completed_pull_contracts = {}
     w._cancelled_remote_offers = set()
     w._recving_metadata = {}
-    w._rid_completion_counts = {}
-    w._released_rids = {}
-    w._localization_source_rosters = {}
+    w._remote_offer_completion_counts = {}
+    w._released_remote_offers = {}
+    w._remote_source_retired_through = {}
+    w._remote_source_consumption_proven = {}
+    w._local_source_retired_through = 0
+    w._source_rosters = {}
+    w._packed_write_config = PackedWriteConfig(
+        enabled=False,
+        chunk_bytes_per_rank=64 * 1024 * 1024,
+        min_descriptors_per_rank=1,
+        producer_slot_count=1,
+        consumer_slot_count=1,
+        alignment_bytes=256,
+        warn_after_s=1.0,
+        fail_after_s=2.0,
+    )
+    w._packed_source_ready_events = {}
+    w._packed_producer_pool = None
+    w._packed_producer_pending = deque()
+    w._packed_producer_operations = {}
+    w._packed_completion_bindings = {}
+    w._packed_done_recving = set()
     return w
 
 
 def _completion_proof(
     *,
     producer_request_id: str = "prefill-1",
+    offer_generation: int = _OFFER_GENERATION,
     consumer_index: int,
     consumer_rank: int = 0,
     consumer_tp_size: int = 1,
@@ -86,6 +114,7 @@ def _completion_proof(
 ) -> bytes:
     proof = PullReadComplete(
         producer_request_id=producer_request_id,
+        offer_generation=offer_generation,
         consumer_request_id=(
             f"{consumer_index}_decode-request"
             if expected_consumers > 1
@@ -102,12 +131,14 @@ def _completion_proof(
 def _cancellation_proof(
     *,
     producer_request_id: str = "prefill-1",
+    offer_generation: int = _OFFER_GENERATION,
     consumer_rank: int = 0,
     consumer_tp_size: int = 1,
     expected_consumers: int = 4,
 ) -> PullOfferCancelled:
     return PullOfferCancelled(
         producer_request_id=producer_request_id,
+        offer_generation=offer_generation,
         consumer_rank=consumer_rank,
         consumer_tp_size=consumer_tp_size,
         expected_consumers=expected_consumers,
@@ -119,6 +150,8 @@ def _offer_params(
     producer_tp_size: int,
     consumer_tp_size: int,
     expected_consumers: int = 8,
+    offer_generation: int = _OFFER_GENERATION,
+    source_retired_through: int = 0,
 ) -> dict[str, Any]:
     return {
         "do_remote_prefill": True,
@@ -127,9 +160,71 @@ def _offer_params(
         "remote_host": "producer-host",
         "remote_port": 1234,
         "tp_size": producer_tp_size,
+        "source_offer_generation": offer_generation,
+        "source_retired_through": source_retired_through,
         "expected_consumers": expected_consumers,
         "consumer_tp_size": consumer_tp_size,
     }
+
+
+def _remote_req_meta(
+    *,
+    offer_generation: int,
+    source_retired_through: int,
+    producer_request_id: str = "prefill-1",
+) -> ReqMeta:
+    """Build one exact generation-scoped remote read contract.
+
+    :param offer_generation: Producer allocation generation to read.
+    :param source_retired_through: Producer-authored contiguous retirement floor.
+    :param producer_request_id: Producer request identity.
+    :returns: Minimal non-empty decoder receive metadata.
+    """
+    return ReqMeta(
+        local_block_ids=([1],),
+        local_physical_block_ids=([1],),
+        tp_size=1,
+        remote=RemoteMeta(
+            block_ids=([2],),
+            host="producer-host",
+            port=1234,
+            engine_id="producer-engine",
+            request_id=producer_request_id,
+            expected_consumers=1,
+            consumer_tp_size=1,
+            source_offer_generation=offer_generation,
+            source_retired_through=source_retired_through,
+        ),
+    )
+
+
+def _prepare_remote_read_stub(worker: Any) -> None:
+    """Install the downstream state needed after retirement-fence checks.
+
+    :param worker: Synthetic pull worker under test.
+    """
+    worker._handle_failed_transfer = MagicMock()
+    worker._localization_config = MagicMock()
+    worker._localization_config.enabled_for.return_value = False
+    worker._read_completion_notification = MagicMock(return_value=b"completion")
+    worker._engine_last_active = {}
+    worker.transfer_topo = MagicMock()
+    worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
+        remote_tp_size=1,
+        remote_physical_blocks_per_logical=1,
+    )
+    worker.transfer_topo.tp_ratio.return_value = 1
+    worker.tp_mappings = {
+        "producer-engine": SimpleNamespace(
+            all_source_ranks=(),
+            source_ranks_per_group=(),
+        )
+    }
+    worker.use_mla = False
+    worker._coalesce_gate = MagicMock(return_value=False)
+    worker._sp_group_flags = MagicMock(return_value=())
+    worker._no_stock_dma = MagicMock(return_value=False)
+    worker._stock_read_specs = MagicMock()
 
 
 # ===================================================================
@@ -265,6 +360,32 @@ def test_update_connector_output_stops_heartbeat():
     assert len(s._heartbeat_req_engine) == 0
 
 
+def test_source_retirement_floor_waits_for_gaps_then_closes_sparse_prefix() -> None:
+    """Out-of-order retirements advance only after every earlier offer retires."""
+    scheduler = _sched()
+    for generation in range(1, 4):
+        scheduler._source_offer_generation = generation
+        scheduler._register_source_offer(f"prefill-{generation}", generation)
+
+    scheduler._retire_source_offer("prefill-3")
+    assert scheduler._source_retired_through == 0
+    assert scheduler._sparse_retired_source_generations == {3}
+    assert scheduler._active_source_offer_generations == {
+        "prefill-1": 1,
+        "prefill-2": 2,
+    }
+
+    scheduler._retire_source_offer("prefill-1")
+    assert scheduler._source_retired_through == 1
+    assert scheduler._sparse_retired_source_generations == {3}
+
+    scheduler._retire_source_offer("prefill-2")
+    assert scheduler._source_retired_through == 3
+    assert scheduler._sparse_retired_source_generations == set()
+    assert scheduler._active_source_offer_generations == {}
+    assert scheduler.build_connector_meta(MagicMock()).source_retired_through == 3
+
+
 def test_request_finished_stops_heartbeat():
     s = _sched()
     r = _req(1)
@@ -307,6 +428,9 @@ def test_overdue_lease_retains_producer_ownership() -> None:
         "prefill-1": time.perf_counter() - 1,
     }
     worker._reqs_to_process = {"prefill-future", "prefill-1"}
+    worker._source_rosters = {
+        "prefill-1": SimpleNamespace(offer_generation=_OFFER_GENERATION)
+    }
     worker._install_pull_completion_state(
         "prefill-1",
         ProducerLease(
@@ -341,10 +465,131 @@ def test_overdue_lease_retains_producer_ownership() -> None:
     worker._localization_capture_source_post.assert_called_once_with("prefill-1")
 
 
+@pytest.mark.parametrize("packed_owner", ["pending", "active"])
+def test_terminal_proof_waits_for_packed_producer_quiescence(
+    packed_owner: str,
+) -> None:
+    worker = _worker_stub()
+    request_id = "prefill-1"
+    deadline = time.perf_counter() + 30
+    worker._reqs_to_process = {request_id}
+    worker._reqs_to_send = {request_id: deadline}
+    worker._source_rosters = {
+        request_id: SimpleNamespace(offer_generation=_OFFER_GENERATION)
+    }
+    worker._packed_source_ready_events = {request_id: MagicMock()}
+    worker._install_pull_completion_state(
+        request_id,
+        ProducerLease(
+            deadline=deadline,
+            expected_consumers=1,
+            consumer_tp_size=1,
+        ),
+    )
+    packed_request = MagicMock()
+    packed_request.command.chunk.producer_request_id = request_id
+    if packed_owner == "pending":
+        pending = MagicMock()
+        pending.request = packed_request
+        worker._packed_producer_pending.append(pending)
+    else:
+        operation = MagicMock()
+        operation.request = packed_request
+        worker._packed_producer_operations[packed_request.command.chunk] = operation
+
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.get_new_notifs.return_value = {
+        "decoder-agent": [
+            _completion_proof(
+                producer_request_id=request_id,
+                consumer_index=0,
+                expected_consumers=1,
+            )
+        ]
+    }
+    worker._localization_capture_source_post = MagicMock()
+
+    assert worker._get_new_notifs() == set()
+    state = worker._pull_completion_states[request_id]
+    assert state.read_completions == state.expected_read_completions
+    assert request_id in worker._reqs_to_process
+    assert request_id in worker._source_rosters
+    assert request_id in worker._packed_source_ready_events
+    with pytest.raises(
+        StagingSafetyError,
+        match="cannot release source pages while packed producer work still owns them",
+    ):
+        worker._complete_pull_contract(request_id, state, "read_complete")
+
+    worker._packed_producer_pending.clear()
+    worker._packed_producer_operations.clear()
+    worker.nixl_wrapper.get_new_notifs.return_value = {}
+
+    assert worker._get_new_notifs() == {request_id}
+    assert request_id not in worker._reqs_to_process
+    assert request_id not in worker._source_rosters
+    assert request_id not in worker._packed_source_ready_events
+    worker._localization_capture_source_post.assert_called_once_with(request_id)
+
+
+def test_offer_cancellation_waits_for_packed_producer_quiescence() -> None:
+    worker = _worker_stub()
+    request_id = "prefill-1"
+    deadline = time.perf_counter() + 30
+    worker._reqs_to_process = {request_id}
+    worker._reqs_to_send = {request_id: deadline}
+    worker._source_rosters = {
+        request_id: SimpleNamespace(offer_generation=_OFFER_GENERATION)
+    }
+    worker._packed_source_ready_events = {request_id: MagicMock()}
+    worker._install_pull_completion_state(
+        request_id,
+        ProducerLease(
+            deadline=deadline,
+            expected_consumers=1,
+            consumer_tp_size=1,
+        ),
+    )
+    packed_request = MagicMock()
+    packed_request.command.chunk.producer_request_id = request_id
+    operation = MagicMock()
+    operation.request = packed_request
+    worker._packed_producer_operations[packed_request.command.chunk] = operation
+    worker._pending_offer_cancellations = [
+        _cancellation_proof(
+            producer_request_id=request_id,
+            consumer_rank=0,
+            consumer_tp_size=1,
+            expected_consumers=1,
+        )
+    ]
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.get_new_notifs.return_value = {}
+
+    assert worker._get_new_notifs() == set()
+    state = worker._pull_completion_states[request_id]
+    assert state.offer_cancellations == state.expected_offer_cancellations
+    assert request_id in worker._source_rosters
+    assert request_id in worker._packed_source_ready_events
+
+    worker._packed_producer_operations.clear()
+
+    assert worker._get_new_notifs() == {request_id}
+    assert request_id not in worker._source_rosters
+    assert request_id not in worker._packed_source_ready_events
+    assert (
+        worker._completed_pull_contracts[(request_id, _OFFER_GENERATION)].terminal_mode
+        == "offer_cancelled"
+    )
+
+
 def test_completion_proofs_are_idempotent_and_contract_exact() -> None:
     worker = _worker_stub()
     worker._reqs_to_process = {"prefill-1"}
     worker._reqs_to_send = {"prefill-1": time.perf_counter() + 30}
+    worker._source_rosters = {
+        "prefill-1": SimpleNamespace(offer_generation=_OFFER_GENERATION)
+    }
     worker._install_pull_completion_state(
         "prefill-1",
         ProducerLease(
@@ -432,6 +677,9 @@ def test_completion_proof_waits_for_async_producer_contract() -> None:
     }
 
     deadline = time.perf_counter() + 30
+    worker._source_rosters = {
+        "prefill-1": SimpleNamespace(offer_generation=_OFFER_GENERATION)
+    }
     worker._install_pull_completion_state(
         "prefill-1",
         ProducerLease(
@@ -454,7 +702,9 @@ def test_whole_offer_cancellation_uses_rank_quorum_not_consumer_count() -> None:
     worker._reqs_to_process = {"prefill-1"}
     deadline = time.perf_counter() + 30
     worker._reqs_to_send = {"prefill-1": deadline}
-    worker._localization_source_rosters = {"prefill-1": MagicMock()}
+    worker._source_rosters = {
+        "prefill-1": SimpleNamespace(offer_generation=_OFFER_GENERATION)
+    }
     worker._install_pull_completion_state(
         "prefill-1",
         ProducerLease(
@@ -488,9 +738,10 @@ def test_whole_offer_cancellation_uses_rank_quorum_not_consumer_count() -> None:
     assert worker._get_new_notifs() == {"prefill-1"}
     assert worker._reqs_to_process == set()
     assert worker._reqs_to_send == {}
-    assert worker._localization_source_rosters == {}
+    assert worker._source_rosters == {}
     assert (
-        worker._completed_pull_contracts["prefill-1"].terminal_mode == "offer_cancelled"
+        worker._completed_pull_contracts[("prefill-1", _OFFER_GENERATION)].terminal_mode
+        == "offer_cancelled"
     )
 
 
@@ -499,6 +750,9 @@ def test_read_and_cancellation_mixture_permanently_pins_offer() -> None:
     worker._reqs_to_process = {"prefill-1"}
     deadline = time.perf_counter() + 30
     worker._reqs_to_send = {"prefill-1": deadline}
+    worker._source_rosters = {
+        "prefill-1": SimpleNamespace(offer_generation=_OFFER_GENERATION)
+    }
     worker._install_pull_completion_state(
         "prefill-1",
         ProducerLease(
@@ -575,6 +829,9 @@ def test_offer_cancellation_buffers_only_for_owned_pre_contract_request() -> Non
 
     deadline = time.perf_counter() + 30
     worker._reqs_to_send = {"prefill-1": deadline}
+    worker._source_rosters = {
+        "prefill-1": SimpleNamespace(offer_generation=_OFFER_GENERATION)
+    }
     worker._install_pull_completion_state(
         "prefill-1",
         ProducerLease(
@@ -611,6 +868,7 @@ def test_side_channel_atomically_queues_typed_offer_cancellation() -> None:
     assert msgspec.msgpack.decode(response, type=PullOfferCancellationAck) == (
         PullOfferCancellationAck(
             producer_request_id="prefill-1",
+            offer_generation=_OFFER_GENERATION,
             producer_ranks=(0, 1),
             accepted=True,
         )
@@ -669,6 +927,9 @@ def test_offer_cancellation_rejects_rank_outside_producer_mapping() -> None:
     worker._reqs_to_process = {"prefill-1"}
     deadline = time.perf_counter() + 30
     worker._reqs_to_send = {"prefill-1": deadline}
+    worker._source_rosters = {
+        "prefill-1": SimpleNamespace(offer_generation=_OFFER_GENERATION)
+    }
     worker._install_pull_completion_state(
         "prefill-1",
         ProducerLease(
@@ -717,6 +978,7 @@ def test_decoder_sends_typed_control_to_exact_producer_ranks(
     socket.recv.return_value = msgspec.msgpack.encode(
         PullOfferCancellationAck(
             producer_request_id="prefill-1",
+            offer_generation=_OFFER_GENERATION,
             producer_ranks=expected_producer_ranks,
             accepted=True,
         )
@@ -749,12 +1011,15 @@ def test_decoder_sends_typed_control_to_exact_producer_ranks(
         producer_ranks=expected_producer_ranks,
         proof=PullOfferCancelled(
             producer_request_id="prefill-1",
+            offer_generation=_OFFER_GENERATION,
             consumer_rank=decoder_rank,
             consumer_tp_size=decoder_tp_size,
             expected_consumers=8,
         ),
     )
-    assert set(worker._cancelled_remote_offers) == {("producer-engine", "prefill-1")}
+    assert set(worker._cancelled_remote_offers) == {
+        ("producer-engine", "prefill-1", _OFFER_GENERATION)
+    }
 
 
 def test_offer_cancellation_fails_closed_when_producer_rejects_control() -> None:
@@ -764,6 +1029,7 @@ def test_offer_cancellation_fails_closed_when_producer_rejects_control() -> None
     socket.recv.return_value = msgspec.msgpack.encode(
         PullOfferCancellationAck(
             producer_request_id="prefill-1",
+            offer_generation=_OFFER_GENERATION,
             producer_ranks=(0,),
             accepted=False,
         )
@@ -781,7 +1047,9 @@ def test_offer_cancellation_fails_closed_when_producer_rejects_control() -> None
             "capacity rejection",
         )
 
-    assert set(worker._cancelled_remote_offers) == {("producer-engine", "prefill-1")}
+    assert set(worker._cancelled_remote_offers) == {
+        ("producer-engine", "prefill-1", _OFFER_GENERATION)
+    }
     worker.xfer_stats.record_failed_notification.assert_called_once_with()
 
 
@@ -800,6 +1068,7 @@ def test_offer_cancellation_refuses_existing_decoder_read_state() -> None:
                 request_id="prefill-1",
                 expected_consumers=8,
                 consumer_tp_size=1,
+                source_offer_generation=_OFFER_GENERATION,
             ),
         )
     }
@@ -814,9 +1083,179 @@ def test_offer_cancellation_refuses_existing_decoder_read_state() -> None:
     assert worker._cancelled_remote_offers == set()
 
 
+def test_remote_retirement_floor_is_monotonic_and_engine_scoped() -> None:
+    """One producer floor compacts only its proven-retired exact fences."""
+    worker = _worker_stub()
+    worker._released_remote_offers = {
+        ("producer-a", "offer-1", 1): 1.0,
+        ("producer-a", "offer-3", 3): 3.0,
+        ("producer-a", "legacy", None): 4.0,
+        ("producer-b", "offer-1", 1): 5.0,
+    }
+    worker._remote_offer_completion_counts = {
+        ("producer-a", "offer-2", 2): 1,
+        ("producer-a", "offer-4", 4): 1,
+        ("producer-b", "offer-1", 1): 1,
+    }
+
+    assert worker._advance_remote_source_retirement_floor("producer-a", 2) == 2
+    assert worker._remote_source_retired_through == {"producer-a": 2}
+    assert worker._released_remote_offers == {
+        ("producer-a", "offer-3", 3): 3.0,
+        ("producer-a", "legacy", None): 4.0,
+        ("producer-b", "offer-1", 1): 5.0,
+    }
+    assert worker._remote_offer_completion_counts == {
+        ("producer-a", "offer-4", 4): 1,
+        ("producer-b", "offer-1", 1): 1,
+    }
+
+    released = dict(worker._released_remote_offers)
+    completions = dict(worker._remote_offer_completion_counts)
+    assert worker._advance_remote_source_retirement_floor("producer-a", 1) == 2
+    assert worker._released_remote_offers == released
+    assert worker._remote_offer_completion_counts == completions
+
+
+def test_exact_release_fences_fail_stop_at_capacity_without_eviction() -> None:
+    """A full exact-fence table retains its oldest proof and rejects growth."""
+    worker = _worker_stub()
+    retained = ("producer-a", "offer-1", 1)
+    rejected = ("producer-a", "offer-2", 2)
+    worker._released_remote_offers = {retained: 1.0}
+
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker."
+            "_MAX_REMOTE_OFFER_FENCES",
+            1,
+        ),
+        pytest.raises(StagingSafetyError, match="fail-stop bound"),
+    ):
+        worker._mark_remote_offer_released(rejected)
+
+    assert set(worker._released_remote_offers) == {retained}
+
+
+def test_source_floor_compacts_only_matching_cancellation_fences() -> None:
+    """Cancellation tombstones disappear only under their producer's floor."""
+    worker = _worker_stub()
+    worker._cancelled_remote_offers = {
+        ("producer-a", "offer-1", 1),
+        ("producer-a", "offer-3", 3),
+        ("producer-a", "legacy", None),
+        ("producer-b", "offer-1", 1),
+    }
+
+    assert worker._apply_remote_source_retirement("producer-a", 2) == 2
+    assert worker._cancelled_remote_offers == {
+        ("producer-a", "offer-3", 3),
+        ("producer-a", "legacy", None),
+        ("producer-b", "offer-1", 1),
+    }
+    assert worker._fence_remote_offer("producer-a", "retired-offer", 2)
+    assert ("producer-a", "retired-offer", 2) not in worker._cancelled_remote_offers
+
+
+def test_retirement_floor_rejects_stale_reads_but_allows_newer_offer() -> None:
+    """Pre-post reads honor both the compact floor and exact newer fences."""
+    worker = _worker_stub()
+    _prepare_remote_read_stub(worker)
+    worker._remote_source_retired_through = {"producer-engine": 2}
+
+    retired = _remote_req_meta(
+        offer_generation=2,
+        source_retired_through=1,
+        producer_request_id="retired-offer",
+    )
+    worker._read_blocks_for_req("retired-read", retired)
+    worker._handle_failed_transfer.assert_called_once_with("retired-read", None)
+    worker._stock_read_specs.assert_not_called()
+
+    current = _remote_req_meta(
+        offer_generation=3,
+        source_retired_through=2,
+        producer_request_id="current-offer",
+    )
+    worker._read_blocks_for_req("current-read", current)
+    worker._stock_read_specs.assert_called_once()
+
+    released_key = ("producer-engine", "released-offer", 4)
+    worker._released_remote_offers[released_key] = 1.0
+    released = _remote_req_meta(
+        offer_generation=4,
+        source_retired_through=2,
+        producer_request_id="released-offer",
+    )
+    worker._read_blocks_for_req("released-read", released)
+    assert worker._handle_failed_transfer.call_args_list[-1].args == (
+        "released-read",
+        None,
+    )
+    assert worker._stock_read_specs.call_count == 1
+
+    fenced_key = ("producer-engine", "fenced-offer", 5)
+    worker._cancelled_remote_offers.add(fenced_key)
+    fenced = _remote_req_meta(
+        offer_generation=5,
+        source_retired_through=2,
+        producer_request_id="fenced-offer",
+    )
+    worker._read_blocks_for_req("fenced-read", fenced)
+    assert worker._handle_failed_transfer.call_args_list[-1].args == (
+        "fenced-read",
+        None,
+    )
+    assert worker._stock_read_specs.call_count == 1
+
+
+def test_batch_applies_all_source_floors_before_posting_any_read() -> None:
+    """A later metadata entry fences an earlier stale offer before its post."""
+    worker = _worker_stub()
+    _prepare_remote_read_stub(worker)
+    worker._remote_agents = {"producer-engine": {0: "producer-agent"}}
+    worker._ready_requests = queue.Queue()
+    worker._update_heartbeat_targets = MagicMock()
+    worker._service_heartbeats = MagicMock()
+    worker._begin_transfer_phase = MagicMock()
+    worker._audit_retire = MagicMock()
+    worker._capture_source_rosters = MagicMock()
+    worker._record_packed_source_readiness = MagicMock()
+    worker._service_packed_producer = MagicMock()
+    worker._logical_to_kernel_block_ids = MagicMock(
+        side_effect=lambda block_ids: block_ids
+    )
+    worker._drain_transfer_phase = MagicMock()
+    worker._localization_capture_pre_read = MagicMock()
+    worker._record_transfer_decode_boundary = MagicMock()
+
+    metadata = NixlConnectorMetadata()
+    metadata.reqs_to_recv = {
+        "stale-read": _remote_req_meta(
+            offer_generation=5,
+            source_retired_through=0,
+            producer_request_id="stale-offer",
+        ),
+        "current-read": _remote_req_meta(
+            offer_generation=6,
+            source_retired_through=5,
+            producer_request_id="current-offer",
+        ),
+    }
+
+    worker.start_load_kv(metadata)
+
+    assert worker._remote_source_retired_through == {"producer-engine": 5}
+    worker._handle_failed_transfer.assert_called_once_with("stale-read", None)
+    worker._stock_read_specs.assert_called_once()
+    assert worker._stock_read_specs.call_args.args[0] == "current-read"
+
+
 def test_offer_cancellation_never_evicts_an_existing_local_fence() -> None:
     worker = _worker_stub()
-    worker._cancelled_remote_offers = {("older-engine", "older-offer")}
+    worker._cancelled_remote_offers = {
+        ("older-engine", "older-offer", _OFFER_GENERATION)
+    }
     worker._send_offer_cancellation_control = MagicMock()
 
     with patch(
@@ -830,13 +1269,19 @@ def test_offer_cancellation_never_evicts_an_existing_local_fence() -> None:
             "capacity rejection",
         )
 
-    assert worker._cancelled_remote_offers == {("older-engine", "older-offer")}
+    assert worker._cancelled_remote_offers == {
+        ("older-engine", "older-offer", _OFFER_GENERATION)
+    }
     worker._send_offer_cancellation_control.assert_not_called()
 
 
 def test_cancelled_offer_fence_rejects_late_read_before_notification() -> None:
     worker = _worker_stub()
-    assert worker._fence_remote_offer("producer-engine", "prefill-1")
+    assert worker._fence_remote_offer(
+        "producer-engine",
+        "prefill-1",
+        _OFFER_GENERATION,
+    )
     worker._handle_failed_transfer = MagicMock()
     worker._read_completion_notification = MagicMock()
     meta = ReqMeta(
@@ -851,6 +1296,7 @@ def test_cancelled_offer_fence_rejects_late_read_before_notification() -> None:
             request_id="prefill-1",
             expected_consumers=1,
             consumer_tp_size=1,
+            source_offer_generation=_OFFER_GENERATION,
         ),
     )
 
@@ -940,6 +1386,7 @@ def test_decoder_completion_proof_uses_source_owned_contract() -> None:
             request_id="prefill-1",
             expected_consumers=4,
             consumer_tp_size=2,
+            source_offer_generation=_OFFER_GENERATION,
         ),
     )
 
@@ -951,6 +1398,7 @@ def test_decoder_completion_proof_uses_source_owned_contract() -> None:
 
     assert proof == PullReadComplete(
         producer_request_id="prefill-1",
+        offer_generation=_OFFER_GENERATION,
         consumer_request_id="3_decode-request",
         consumer_index=3,
         consumer_rank=1,

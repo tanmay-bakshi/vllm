@@ -73,12 +73,12 @@ PRODUCTION_CONFIG_PATH = CONFIG_PATH.with_name("gemma4_tp4_to_tp1_2k.json")
 
 EXPECTED_CONFIG_IDENTITIES = {
     CONFIG_PATH.name: (
-        "b3fb21cb3e675f072e6937baee9c15e4b81d516f56e88cf19ce51002013682f7",
-        "95130eca063f580dd069759eff7b49df14cd8a4e7531a401101b8aec7ec8c6f0",
+        "fe418c0949c340423a34c2f4281ce6bcf36d4df5eb336e4b7a551a4b783034d5",
+        "9fc4a7ea34b7257e634a2d32934c1970f089d6ad4c343f0509f39137b89cb8e9",
     ),
     PRODUCTION_CONFIG_PATH.name: (
-        "69489f6106a5269d3e60a10c907a8e06f6c5f268158f094f576d6becf42f5ebb",
-        "ccb718a5d689e7c8d63ce69d72ad11f1337de269ea4793a90dce8b68c3761e60",
+        "4d831a475c286e8bc43ad5b8cf753c512e850355cb9ede0f57391cd4335719c5",
+        "ffabd1b3dd86ffdf0a0060cffdcd4b56c37ee25488081c7163755279240bf06b",
     ),
 }
 
@@ -147,13 +147,13 @@ def test_default_geometry_matches_legacy_storm37b_physical_capture() -> None:
             "destination_manifest": "storm37b-d1-handshake.json",
             "sha256_authenticated": True,
             "evidence_scope": "legacy_storm37b_physical_geometry_only",
-            "connector_v9_semantics_authenticated": False,
+            "connector_v11_semantics_authenticated": False,
         },
-        "connector_v9_semantic_fixture": {
-            "manifest": "connector-v9-semantic-fixtures.json",
+        "connector_v11_semantic_fixture": {
+            "manifest": "connector-v11-semantic-fixtures.json",
             "profile": "legacy-storm37b-roster-static-projection",
             "sha256_authenticated": True,
-            "evidence_scope": "static_model_free_connector_v9_contract_fixture",
+            "evidence_scope": "static_model_free_connector_v11_contract_fixture",
             "runtime_capture_authenticated": False,
         },
     }
@@ -510,7 +510,7 @@ def test_configuration_rejects_handshake_transcription_drift(tmp_path: Path) -> 
     for manifest_name in (
         "storm37b-p-handshake.json",
         "storm37b-d1-handshake.json",
-        "connector-v9-semantic-fixtures.json",
+        "connector-v11-semantic-fixtures.json",
     ):
         (tmp_path / manifest_name).write_bytes(
             (CONFIG_PATH.parent / manifest_name).read_bytes()

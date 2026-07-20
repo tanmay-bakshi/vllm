@@ -57,9 +57,9 @@ def _make_parallel_consumer(
         expected_consumers=expected_consumers,
     )
     if generation is None:
-        params.pop("p2d_offer_generation", None)
+        params.pop("source_offer_generation", None)
     else:
-        params["p2d_offer_generation"] = generation
+        params["source_offer_generation"] = generation
     return request
 
 

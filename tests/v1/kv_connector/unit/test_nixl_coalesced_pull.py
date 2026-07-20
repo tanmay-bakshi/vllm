@@ -12,6 +12,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     RemoteMeta,
     ReqMeta,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.packed_write_config import (
+    PackedWriteConfig,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
     NixlPullConnectorWorker,
 )
@@ -48,6 +51,20 @@ def _region(base_address: int) -> NixlRegionDescriptor:
     )
 
 
+def _disabled_packed_write_config() -> PackedWriteConfig:
+    """Build the disabled adaptive transport configuration."""
+    return PackedWriteConfig(
+        enabled=False,
+        chunk_bytes_per_rank=64 * 1024 * 1024,
+        min_descriptors_per_rank=1,
+        producer_slot_count=1,
+        consumer_slot_count=1,
+        alignment_bytes=256,
+        warn_after_s=1.0,
+        fail_after_s=2.0,
+    )
+
+
 @pytest.mark.cpu_test
 def test_descriptor_construction_failure_records_prepare_failure() -> None:
     """Descriptor exceptions take the typed, quiescent failure path."""
@@ -66,6 +83,7 @@ def test_descriptor_construction_failure_records_prepare_failure() -> None:
     worker.transfer_topo.get_engine_info.return_value = remote_info
     worker._localization_config = MagicMock()
     worker._localization_config.enabled_for.return_value = False
+    worker._packed_write_config = _disabled_packed_write_config()
     worker._apply_prefix_caching = MagicMock(return_value=([[20]], [[10]]))
     worker._sp_group_flags = MagicMock(return_value=[False])
     worker._remote_layout = {remote_engine_id: {0: ([8], 64, 0)}}
@@ -210,6 +228,7 @@ def test_descriptors_follow_rank_major_region_runs_exactly() -> None:
     )
     worker._localization_config = MagicMock()
     worker._localization_config.enabled_for.return_value = False
+    worker._packed_write_config = _disabled_packed_write_config()
     worker._apply_prefix_caching = MagicMock(
         return_value=(
             [[30, 31, 32], [40, 41]],

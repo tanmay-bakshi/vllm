@@ -447,7 +447,7 @@ class RigConfig:
     :ivar legacy_source_handshake_sha256: Expected source-manifest identity.
     :ivar legacy_destination_handshake_sha256: Expected destination-manifest
         identity.
-    :ivar semantic_handshake_manifest: Static connector-v9 semantic fixture.
+    :ivar semantic_handshake_manifest: Static connector-v11 semantic fixture.
     :ivar semantic_handshake_sha256: Expected semantic-fixture identity.
     :ivar semantic_handshake_profile: Selected semantic projection identity.
     :ivar producer_devices: Physical GPUs used to emulate P TP ranks.

@@ -512,9 +512,9 @@ def describe_plan(
                 "destination_manifest": (config.legacy_destination_handshake_manifest),
                 "sha256_authenticated": True,
                 "evidence_scope": "legacy_storm37b_physical_geometry_only",
-                "connector_v9_semantics_authenticated": False,
+                "connector_v11_semantics_authenticated": False,
             },
-            "connector_v9_semantic_fixture": {
+            "connector_v11_semantic_fixture": {
                 "manifest": config.semantic_handshake_manifest,
                 "profile": config.semantic_handshake_profile,
                 "sha256_authenticated": True,

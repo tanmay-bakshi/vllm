@@ -8,7 +8,8 @@ import traceback
 from typing import TYPE_CHECKING, Any
 
 import msgspec
-import zmq
+from zmq.constants import SocketOption, SocketType
+from zmq.error import Again
 
 from vllm import envs
 from vllm.distributed.kv_transfer.kv_connector.utils import (
@@ -33,9 +34,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
+from vllm.distributed.kv_transfer.nixl_contracts import NixlSourceRoster
 from vllm.distributed.kv_transfer.nixl_localization import (
     NixlLocalizationConfig,
-    NixlSourceRoster,
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _MAX_PENDING_OFFER_CANCELLATIONS = 65_536
+_MAX_SPARSE_RETIRED_SOURCE_OFFERS = 65_536
 
 
 class NixlBaseConnectorScheduler:
@@ -118,7 +120,10 @@ class NixlBaseConnectorScheduler:
         )
         self._localization_config = NixlLocalizationConfig.from_environment()
         self._source_rosters: dict[ReqId, NixlSourceRoster] = {}
-        self._localization_offer_generation = 0
+        self._source_offer_generation = 0
+        self._active_source_offer_generations: dict[ReqId, int] = {}
+        self._sparse_retired_source_generations: set[int] = set()
+        self._source_retired_through = 0
         if self._localization_config.enabled:
             logger.warning(
                 "P-to-D localization observer enabled: run=%s arm=%s "
@@ -395,13 +400,13 @@ class NixlBaseConnectorScheduler:
         # Listen for new requests for metadata.
         path = make_zmq_path("tcp", host, port)
         logger.debug("Starting listening on path: %s", path)
-        with zmq_ctx(zmq.ROUTER, path) as sock:
-            sock.setsockopt(zmq.RCVTIMEO, 1000)
+        with zmq_ctx(SocketType.ROUTER, path) as sock:
+            sock.setsockopt(SocketOption.RCVTIMEO, 1000)
             ready_event.set()
             while True:
                 try:
                     identity, _, msg = sock.recv_multipart()
-                except zmq.Again:
+                except Again:
                     if stop_event.is_set():
                         break
                     continue
@@ -474,6 +479,8 @@ class NixlBaseConnectorScheduler:
             )
             and type(proof.producer_request_id) is str
             and len(proof.producer_request_id) > 0
+            and type(proof.offer_generation) is int
+            and proof.offer_generation > 0
             and type(proof.consumer_rank) is int
             and type(proof.consumer_tp_size) is int
             and proof.consumer_tp_size > 0
@@ -504,6 +511,7 @@ class NixlBaseConnectorScheduler:
 
         ack = PullOfferCancellationAck(
             producer_request_id=proof.producer_request_id,
+            offer_generation=proof.offer_generation,
             producer_ranks=target_ranks,
             accepted=accepted,
         )
@@ -629,6 +637,7 @@ class NixlBaseConnectorScheduler:
 
         meta.reqs_to_send = self._reqs_need_send
         meta.source_rosters = self._source_rosters
+        meta.source_retired_through = self._source_retired_through
         meta.scheduled_request_ids = set(scheduler_output.num_scheduled_tokens)
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
@@ -657,15 +666,74 @@ class NixlBaseConnectorScheduler:
         return meta
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
-        """Stop heartbeating for requests whose KV transfer completed."""
+        """Commit worker-authorized source retirements and receive terminals.
+
+        :param connector_output: Rank-aggregated worker transfer completions.
+        """
         worker_meta = connector_output.kv_connector_worker_meta
         if worker_meta is not None:
             raise RuntimeError("NIXL does not emit connector worker metadata")
+
+        finished_sending = connector_output.finished_sending
+        if finished_sending is not None:
+            for req_id in finished_sending:
+                self._retire_source_offer(req_id)
 
         completed_receive_ids = set(connector_output.finished_recving or ())
         completed_receive_ids.update(connector_output.failed_recving)
         for req_id in completed_receive_ids:
             self._stop_heartbeat(req_id)
+
+    def _register_source_offer(self, request_id: ReqId, generation: int) -> None:
+        """Bind one retained producer allocation to its gap-free generation.
+
+        :param request_id: Producer request retaining source blocks.
+        :param generation: Newly issued source-offer generation.
+        """
+        if type(request_id) is not str or len(request_id) == 0:
+            raise ValueError("source-offer request_id must be a non-empty string")
+        if type(generation) is not int or generation <= self._source_retired_through:
+            raise ValueError("source-offer generation must exceed the retirement floor")
+        if generation != self._source_offer_generation:
+            raise RuntimeError("source-offer generation is not the current issuance")
+        if request_id in self._active_source_offer_generations:
+            raise RuntimeError(f"source offer {request_id} is already active")
+        self._active_source_offer_generations[request_id] = generation
+
+    def _retire_source_offer(self, request_id: ReqId) -> None:
+        """Advance the contiguous producer retirement floor when possible.
+
+        ``finished_sending`` is the exact rank-aggregated point at which the
+        scheduler may return the producer blocks to the allocator. Generations
+        above a gap remain explicit until every earlier allocation also retires.
+
+        :param request_id: Producer request committed by every worker rank.
+        """
+        generation = self._active_source_offer_generations.pop(request_id, None)
+        if generation is None:
+            return
+        if (
+            generation <= self._source_retired_through
+            or generation in self._sparse_retired_source_generations
+        ):
+            raise RuntimeError("source-offer generation retired more than once")
+        if generation > self._source_retired_through + 1:
+            if (
+                len(self._sparse_retired_source_generations)
+                >= _MAX_SPARSE_RETIRED_SOURCE_OFFERS
+            ):
+                raise RuntimeError(
+                    "source-offer retirement gap exceeded its fail-stop bound"
+                )
+            self._sparse_retired_source_generations.add(generation)
+            return
+
+        self._source_retired_through = generation
+        while (
+            self._source_retired_through + 1 in self._sparse_retired_source_generations
+        ):
+            self._source_retired_through += 1
+            self._sparse_retired_source_generations.remove(self._source_retired_through)
 
     def has_pending_push_work(self) -> bool:
         return False
@@ -676,7 +744,7 @@ class NixlBaseConnectorScheduler:
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         raise NotImplementedError
 
     def update_state_after_alloc(

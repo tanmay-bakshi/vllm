@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for NIXL transfer-plan telemetry."""
+"""Unit tests for NIXL transfer-plan and packed-WRITE telemetry."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +11,7 @@ from prometheus_client import Counter, Gauge, Histogram
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlCoalescedPlanTelemetry,
     NixlKVConnectorStats,
+    NixlPackedWriteTelemetry,
     NixlPromMetrics,
 )
 
@@ -90,6 +91,29 @@ def _plan_telemetry(
     )
 
 
+def _packed_write_telemetry(
+    scatter_gpu_duration_seconds: float | None = 0.00019,
+) -> NixlPackedWriteTelemetry:
+    """Build one packed-WRITE record from two chunks across four ranks.
+
+    :param scatter_gpu_duration_seconds: Aggregate CUDA timing, or ``None`` when
+        exact event timing was unavailable.
+    :returns: Validated completed-request telemetry.
+    """
+    return NixlPackedWriteTelemetry.from_completed_request(
+        logical_bytes=2048,
+        source_bytes=1024,
+        direct_descriptor_count=200,
+        chunk_count=2,
+        source_tp_size=4,
+        arrival_wait_seconds=0.003,
+        scatter_enqueue_duration_seconds=0.0002,
+        scatter_wall_duration_seconds=0.0008,
+        scatter_gpu_duration_seconds=scatter_gpu_duration_seconds,
+        staging_residency_seconds=0.02,
+    )
+
+
 @pytest.mark.cpu_test
 def test_native_factory_aggregates_one_complete_plan() -> None:
     """Derive wire work and explicit sum/max duration semantics."""
@@ -157,6 +181,120 @@ def test_plan_telemetry_rejects_invalid_observations(
 
 
 @pytest.mark.cpu_test
+def test_packed_write_factory_aggregates_one_complete_request() -> None:
+    """Derive exact packed wire work and direct descriptor savings."""
+    telemetry = _packed_write_telemetry()
+
+    assert telemetry.logical_bytes == 2048
+    assert telemetry.source_bytes == 1024
+    assert telemetry.wire_bytes == 1024
+    assert telemetry.avoided_direct_descriptor_count == 192
+    assert telemetry.packed_descriptor_count == 8
+    assert telemetry.direct_descriptor_count == 200
+    assert telemetry.chunk_count == 2
+    assert telemetry.arrival_wait_seconds == pytest.approx(0.003)
+    assert telemetry.scatter_enqueue_duration_seconds == pytest.approx(0.0002)
+    assert telemetry.scatter_wall_duration_seconds == pytest.approx(0.0008)
+    assert telemetry.scatter_gpu_duration_seconds == pytest.approx(0.00019)
+    assert telemetry.staging_residency_seconds == pytest.approx(0.02)
+
+
+@pytest.mark.cpu_test
+def test_packed_request_schema_contains_only_decoder_observations() -> None:
+    """Keep cross-process native WRITE clocks out of decoder telemetry."""
+    assert {field.name for field in fields(NixlPackedWriteTelemetry)} == {
+        "logical_bytes",
+        "source_bytes",
+        "wire_bytes",
+        "avoided_direct_descriptor_count",
+        "packed_descriptor_count",
+        "chunk_count",
+        "arrival_wait_seconds",
+        "scatter_enqueue_duration_seconds",
+        "scatter_wall_duration_seconds",
+        "scatter_gpu_duration_seconds",
+        "staging_residency_seconds",
+    }
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("changes", "match"),
+    [
+        ({"logical_bytes": -1}, "logical_bytes"),
+        ({"source_bytes": 2049}, "cannot exceed"),
+        ({"wire_bytes": 1023}, "must equal"),
+        ({"source_bytes": 0, "wire_bytes": 0}, "must be positive"),
+        ({"avoided_direct_descriptor_count": 1.5}, "avoided_direct"),
+        ({"packed_descriptor_count": 0}, "packed_descriptor_count"),
+        ({"packed_descriptor_count": 7}, "same producer quorum"),
+        ({"chunk_count": 0}, "chunk_count"),
+        ({"arrival_wait_seconds": float("nan")}, "arrival_wait_seconds"),
+        ({"scatter_gpu_duration_seconds": -0.1}, "scatter_gpu_duration_seconds"),
+        ({"scatter_enqueue_duration_seconds": 0.001}, "enqueue duration"),
+    ],
+)
+def test_packed_write_telemetry_rejects_invalid_observations(
+    changes: dict[str, object],
+    match: str,
+) -> None:
+    """Reject lossy, empty, non-finite, and internally inconsistent records."""
+    values: dict[str, object] = {
+        "logical_bytes": 2048,
+        "source_bytes": 1024,
+        "wire_bytes": 1024,
+        "avoided_direct_descriptor_count": 192,
+        "packed_descriptor_count": 8,
+        "chunk_count": 2,
+        "arrival_wait_seconds": 0.003,
+        "scatter_enqueue_duration_seconds": 0.0002,
+        "scatter_wall_duration_seconds": 0.0008,
+        "scatter_gpu_duration_seconds": 0.00019,
+        "staging_residency_seconds": 0.02,
+    }
+    values.update(changes)
+
+    with pytest.raises(ValueError, match=match):
+        NixlPackedWriteTelemetry(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.cpu_test
+def test_packed_write_factory_rejects_direct_plan_smaller_than_write() -> None:
+    """Require descriptor savings to be derived from a real direct baseline."""
+    with pytest.raises(ValueError, match="cannot be smaller"):
+        NixlPackedWriteTelemetry.from_completed_request(
+            logical_bytes=1024,
+            source_bytes=1024,
+            direct_descriptor_count=1,
+            chunk_count=1,
+            source_tp_size=4,
+            arrival_wait_seconds=0.001,
+            scatter_enqueue_duration_seconds=0.0001,
+            scatter_wall_duration_seconds=0.0002,
+            scatter_gpu_duration_seconds=0.0001,
+            staging_residency_seconds=0.002,
+        )
+
+
+@pytest.mark.cpu_test
+def test_packed_write_factory_rejects_empty_source_topology() -> None:
+    """Require every packed descriptor count to represent producer work."""
+    with pytest.raises(ValueError, match="source_tp_size must be positive"):
+        NixlPackedWriteTelemetry.from_completed_request(
+            logical_bytes=1024,
+            source_bytes=1024,
+            direct_descriptor_count=4,
+            chunk_count=1,
+            source_tp_size=0,
+            arrival_wait_seconds=0.001,
+            scatter_enqueue_duration_seconds=0.0001,
+            scatter_wall_duration_seconds=0.0002,
+            scatter_gpu_duration_seconds=0.0001,
+            staging_residency_seconds=0.002,
+        )
+
+
+@pytest.mark.cpu_test
 def test_stats_record_reduce_clone_and_aggregate_plan_rows() -> None:
     """Keep plan columns aligned through reduction, snapshots, and aggregation."""
     first = NixlKVConnectorStats()
@@ -188,6 +326,49 @@ def test_stats_record_reduce_clone_and_aggregate_plan_rows() -> None:
     snapshot.aggregate(second)
     assert snapshot.num_coalesced_plans == 2
     assert len(snapshot.data["coalesced_plan_staging_residency"]) == 2
+
+
+@pytest.mark.cpu_test
+def test_stats_record_reduce_clone_and_aggregate_packed_requests() -> None:
+    """Keep packed-request columns intact through snapshots and aggregation."""
+    first = NixlKVConnectorStats()
+    assert first.is_empty()
+    assert first.reduce()["Num packed write requests"] == 0
+
+    first.record_packed_write(_packed_write_telemetry())
+    assert not first.is_empty()
+    assert first.num_successful_transfers == 0
+    assert first.num_coalesced_plans == 0
+    assert first.num_packed_write_requests == 1
+
+    reduced = first.reduce()
+    assert reduced["Num packed write requests"] == 1
+    assert reduced["Avg logical MB per packed write"] == round(2048 / 2**20, 3)
+    assert reduced["Avg source MB per packed write"] == round(1024 / 2**20, 3)
+    assert reduced["Avg wire MB per packed write"] == round(1024 / 2**20, 3)
+    assert reduced["Packed write source bytes elided (%)"] == 50.0
+    assert reduced["Avg packed write avoided direct descriptors"] == 192.0
+    assert reduced["Avg packed write descriptors"] == 8.0
+    assert reduced["Avg packed write chunks"] == 2.0
+    assert reduced["Avg packed write arrival wait (ms)"] == 3.0
+    assert reduced["Avg packed write scatter enqueue time (ms)"] == 0.2
+    assert reduced["Avg packed write scatter wall time (ms)"] == 0.8
+    assert reduced["Num packed write scatter GPU timings"] == 1
+    assert reduced["Avg packed write scatter GPU time (ms)"] == 0.19
+    assert reduced["Avg packed write staging residency (ms)"] == 20.0
+
+    snapshot = first.clone_and_reset()
+    assert snapshot.num_packed_write_requests == 1
+    assert first.is_empty()
+
+    second = NixlKVConnectorStats()
+    second.record_packed_write(_packed_write_telemetry(None))
+    snapshot.aggregate(second)
+    assert snapshot.num_packed_write_requests == 2
+    assert len(snapshot.data["packed_write_staging_residency"]) == 2
+    reduced = snapshot.reduce()
+    assert reduced["Num packed write scatter GPU timings"] == 1
+    assert reduced["Avg packed write scatter GPU time (ms)"] == 0.19
 
 
 @pytest.mark.cpu_test
@@ -247,7 +428,7 @@ def test_prometheus_omits_only_an_unavailable_gpu_timing() -> None:
 
 @pytest.mark.cpu_test
 def test_existing_native_transfer_metrics_keep_their_contract() -> None:
-    """Retain existing per-handle units, reduction names, and Prom observations."""
+    """Retain ordinary per-handle metrics for producer native WRITEs."""
     stats = NixlKVConnectorStats()
     native = _NativeTelemetry(2000, 500, 2**20, 8)
     stats.record_transfer(native)  # type: ignore[arg-type]
@@ -259,6 +440,7 @@ def test_existing_native_transfer_metrics_keep_their_contract() -> None:
     assert reduced["Avg MB per transfer"] == 1.0
     assert reduced["Avg number of descriptors"] == 8.0
     assert reduced["Num coalesced plans"] == 0
+    assert reduced["Num packed write requests"] == 0
 
 
 @pytest.mark.cpu_test
@@ -339,3 +521,108 @@ def test_prometheus_observes_every_plan_metric_on_the_selected_engine() -> None:
         assert engine_one.observed == [pytest.approx(observation)]
         assert engine_one.kwargs["name"] == metric_name
         assert engine_one.labelvalues == ("model", "1")
+
+
+@pytest.mark.cpu_test
+def test_prometheus_observes_every_packed_write_metric_on_selected_engine() -> None:
+    """Export one completed packed request through the Prometheus surface."""
+    prom_metrics = NixlPromMetrics(
+        vllm_config=SimpleNamespace(kv_transfer_config=None),  # type: ignore[arg-type]
+        metric_types={
+            Gauge: _FakeMetric,
+            Counter: _FakeMetric,
+            Histogram: _FakeMetric,
+        },
+        labelnames=["model_name", "engine"],
+        per_engine_labelvalues={
+            0: ["model", "0"],
+            1: ["model", "1"],
+        },
+    )
+    stats = NixlKVConnectorStats()
+    stats.record_packed_write(_packed_write_telemetry())
+
+    prom_metrics.observe(stats.data, engine_idx=1)
+
+    expected = {
+        "packed_write_logical_bytes": (
+            "vllm:nixl_packed_write_logical_bytes",
+            2048,
+        ),
+        "packed_write_source_bytes": (
+            "vllm:nixl_packed_write_source_bytes",
+            1024,
+        ),
+        "packed_write_wire_bytes": (
+            "vllm:nixl_packed_write_wire_bytes",
+            1024,
+        ),
+        "packed_write_avoided_direct_descriptors": (
+            "vllm:nixl_packed_write_avoided_direct_descriptors",
+            192,
+        ),
+        "packed_write_num_descriptors": (
+            "vllm:nixl_packed_write_num_descriptors",
+            8,
+        ),
+        "packed_write_num_chunks": (
+            "vllm:nixl_packed_write_num_chunks",
+            2,
+        ),
+        "packed_write_arrival_wait": (
+            "vllm:nixl_packed_write_arrival_wait_seconds",
+            0.003,
+        ),
+        "packed_write_scatter_enqueue_duration": (
+            "vllm:nixl_packed_write_scatter_enqueue_time_seconds",
+            0.0002,
+        ),
+        "packed_write_scatter_wall_duration": (
+            "vllm:nixl_packed_write_scatter_wall_time_seconds",
+            0.0008,
+        ),
+        "packed_write_scatter_gpu_duration": (
+            "vllm:nixl_packed_write_scatter_gpu_time_seconds",
+            0.00019,
+        ),
+        "packed_write_staging_residency": (
+            "vllm:nixl_packed_write_staging_residency_seconds",
+            0.02,
+        ),
+    }
+    assert set(prom_metrics.packed_write_histograms) == set(expected)
+    for data_key, (metric_name, observation) in expected.items():
+        engine_zero = prom_metrics.packed_write_histograms[data_key][0]
+        engine_one = prom_metrics.packed_write_histograms[data_key][1]
+        assert engine_zero.observed == []
+        assert engine_one.observed == [pytest.approx(observation)]
+        assert engine_one.kwargs["name"] == metric_name
+        assert engine_one.labelvalues == ("model", "1")
+
+
+@pytest.mark.cpu_test
+def test_prometheus_omits_only_unavailable_packed_write_gpu_timing() -> None:
+    """Do not manufacture a packed CUDA duration from wall-clock timing."""
+    prom_metrics = NixlPromMetrics(
+        vllm_config=SimpleNamespace(kv_transfer_config=None),  # type: ignore[arg-type]
+        metric_types={
+            Gauge: _FakeMetric,
+            Counter: _FakeMetric,
+            Histogram: _FakeMetric,
+        },
+        labelnames=["model_name", "engine"],
+        per_engine_labelvalues={0: ["model", "0"]},
+    )
+    stats = NixlKVConnectorStats()
+    stats.record_packed_write(_packed_write_telemetry(None))
+
+    prom_metrics.observe(stats.data)
+
+    gpu_histogram = prom_metrics.packed_write_histograms[
+        "packed_write_scatter_gpu_duration"
+    ][0]
+    wall_histogram = prom_metrics.packed_write_histograms[
+        "packed_write_scatter_wall_duration"
+    ][0]
+    assert gpu_histogram.observed == []
+    assert wall_histogram.observed == [pytest.approx(0.0008)]

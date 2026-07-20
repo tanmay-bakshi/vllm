@@ -359,10 +359,18 @@ def _worker(
     worker._coalesced_localization_plans = {}
     worker._localization_pre_read_plans = {}
     worker._localization_record_event = MagicMock()
-    worker._recving_metadata = {}
+    worker._recving_metadata = {
+        plan.request_id: SimpleNamespace(remote=None) for plan in plans
+    }
+    worker._record_remote_source_consumption_proven = MagicMock()
     worker._record_failed_receive = MagicMock()
     worker._audit_enabled = False
     worker._audit_pending = []
+    worker._packed_remote_engine_active = MagicMock(return_value=False)
+    worker._packed_remote_engine_cleanup = MagicMock()
+    worker._packed_registered_ownership_active = MagicMock(return_value=False)
+    worker._packed_shutdown_cleanup = MagicMock()
+    worker._clear_remote_packed_write_pools = MagicMock()
     worker.nixl_wrapper = MagicMock()
     worker.xfer_stats = MagicMock()
     return worker
@@ -407,16 +415,21 @@ def test_not_processed_bookkeeping_never_cancels_owned_receive(
     worker._service_heartbeats = MagicMock()
     worker._begin_transfer_phase = MagicMock()
     worker._audit_retire = MagicMock()
-    worker._localization_capture_source_rosters = MagicMock()
+    worker._capture_source_rosters = MagicMock()
+    worker._record_packed_source_readiness = MagicMock()
+    worker._service_packed_producer = MagicMock()
     worker._localization_record_event = MagicMock()
     worker._drain_transfer_phase = MagicMock()
     worker._localization_capture_pre_read = MagicMock()
     worker._record_transfer_decode_boundary = MagicMock()
     worker._record_failed_receive = MagicMock()
     worker._handle_failed_transfer = MagicMock()
+    worker._apply_local_source_retirement = MagicMock()
+    worker._apply_remote_source_retirement = MagicMock()
     metadata = SimpleNamespace(
         reqs_to_recv={},
         source_rosters={},
+        source_retired_through=0,
         reqs_in_batch=set(),
         reqs_not_processed={request_id},
         reqs_to_send={},
@@ -1130,7 +1143,7 @@ def test_unresolved_shutdown_and_cleanup_touch_no_native_resources() -> None:
     worker._handshake_initiation_executor = MagicMock()
     worker._raise_if_handshake_fail_stopped = MagicMock()
 
-    with pytest.raises(StagingSafetyError, match="live staging"):
+    with pytest.raises(StagingSafetyError, match="live transfer resources"):
         worker._cleanup_remote_engine("producer")
     with pytest.raises(StagingSafetyError, match="cannot quiesce"):
         worker.shutdown()
@@ -1147,6 +1160,13 @@ def test_quiescent_shutdown_closes_and_releases_every_resource_once() -> None:
     worker_type = _production_worker_methods("_cleanup_remote_engine", "shutdown")
     worker = worker_type()
     worker._coalesce_plans = {}
+    worker._coalesced_localization_plans = {}
+    worker._localization_pre_read_plans = {}
+    worker._packed_remote_engine_active = MagicMock(return_value=False)
+    worker._packed_remote_engine_cleanup = MagicMock()
+    worker._packed_registered_ownership_active = MagicMock(return_value=False)
+    worker._packed_shutdown_cleanup = MagicMock()
+    worker._clear_remote_packed_write_pools = MagicMock()
     worker._localization_writer = MagicMock()
     writer = worker._localization_writer
     worker._handshake_initiation_executor = MagicMock()
@@ -1164,6 +1184,8 @@ def test_quiescent_shutdown_closes_and_releases_every_resource_once() -> None:
     worker._remote_registration_generations = {"producer": object()}
     worker._remote_source_semantics = {"producer": object()}
     worker._remote_rank_contracts = {"producer": object()}
+    worker._remote_packed_write_producer_pools = {"producer": object()}
+    worker._remote_packed_write_consumer_pools = {"producer": object()}
     worker.transfer_topo = MagicMock()
     worker._engine_last_active = {"producer": 0.0}
     worker._registered_descs = ["registered-memory"]

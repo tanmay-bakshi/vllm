@@ -85,7 +85,7 @@ def compute_rig_semantic_contract_digest(
     )
     contract = {
         "schema_version": IntegrityIdentity.SCHEMA_VERSION,
-        "contract": "gemma4-nixl-micro-rig-synthetic-v1",
+        "contract": "gemma4-nixl-micro-rig-synthetic-v2",
         "group_index": group.index,
         "group_name": group.name,
         "group_token_capacity": group.token_capacity,

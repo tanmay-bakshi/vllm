@@ -562,7 +562,8 @@ def test_read_blocks_for_req_expands_remote_ids(
     worker.use_mla = False
     worker._localization_config = MagicMock(spec=NixlLocalizationConfig)
     worker._localization_config.enabled_for.return_value = False
-    worker._released_rids = set()
+    worker._released_remote_offers = {}
+    worker._remote_source_retired_through = {}
     worker._cancelled_remote_offers = set()
     worker._read_completion_notification = MagicMock(return_value=b"")
     worker.coalesce_pull = False

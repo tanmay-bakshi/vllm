@@ -10,6 +10,9 @@ import torch
 from vllm.distributed.kv_transfer.coalesced_layout import (
     DUAL_PLANE_DESTINATION_HALF,
     CoalescedTransferPlan,
+    PackedTransferChunk,
+    PackedTransferPlan,
+    validate_packed_transfer_plan,
 )
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
@@ -215,6 +218,68 @@ def scatter_coalesced_reference(
                 ].copy_(staging[source_start : source_start + source_plane_bytes])
 
 
+def scatter_packed_chunk_reference(
+    staging: torch.Tensor,
+    destinations: tuple[torch.Tensor, ...],
+    destination_plan: CoalescedTransferPlan,
+    packed_plan: PackedTransferPlan,
+    chunk_index: int,
+    *,
+    staging_base_offset_bytes: int,
+    staging_rank_stride_bytes: int,
+) -> None:
+    """Apply one packed chunk synchronously on CPU tensors."""
+    chunk = _validate_packed_scatter_tensors(
+        staging,
+        destinations,
+        destination_plan,
+        packed_plan,
+        chunk_index,
+        staging_base_offset_bytes,
+        staging_rank_stride_bytes,
+        "cpu",
+    )
+
+    for region_slice in chunk.region_slices:
+        region = destination_plan.regions[region_slice.region_index]
+        source_row_bytes = region.ownership.row_bytes
+        source_plane_bytes = source_row_bytes // 2
+        destination_row_bytes = _SOURCE_RANK_COUNT * source_row_bytes
+        destination_flat = destinations[region_slice.region_index].reshape(-1)
+        position_end = region_slice.position_start + region_slice.position_count
+        positions = region.positions[region_slice.position_start : position_end]
+        for source_rank_index, rank_slot in enumerate(destination_plan.rank_slots):
+            source_start = (
+                staging_base_offset_bytes
+                + source_rank_index * staging_rank_stride_bytes
+                + region_slice.offset_within_rank
+            )
+            for position_index, position in enumerate(positions):
+                row_start = source_start + position_index * source_row_bytes
+                destination_row_start = position.local_block_id * destination_row_bytes
+                if position.destination_half == DUAL_PLANE_DESTINATION_HALF:
+                    for source_plane in range(2):
+                        plane_start = row_start + source_plane * source_plane_bytes
+                        destination_start = (
+                            destination_row_start
+                            + source_plane * _SOURCE_RANK_COUNT * source_plane_bytes
+                            + rank_slot * source_plane_bytes
+                        )
+                        destination_flat[
+                            destination_start : destination_start + source_plane_bytes
+                        ].copy_(staging[plane_start : plane_start + source_plane_bytes])
+                    continue
+
+                destination_start = (
+                    destination_row_start
+                    + rank_slot * source_row_bytes
+                    + position.destination_half * source_plane_bytes
+                )
+                destination_flat[
+                    destination_start : destination_start + source_plane_bytes
+                ].copy_(staging[row_start : row_start + source_plane_bytes])
+
+
 def launch_coalesced_scatter(
     staging: torch.Tensor,
     destinations: tuple[torch.Tensor, ...],
@@ -330,6 +395,109 @@ def launch_coalesced_scatter(
     )
 
 
+def launch_packed_chunk_scatter(
+    staging: torch.Tensor,
+    destinations: tuple[torch.Tensor, ...],
+    destination_plan: CoalescedTransferPlan,
+    packed_plan: PackedTransferPlan,
+    chunk_index: int,
+    stream: torch.cuda.Stream,
+    *,
+    staging_base_offset_bytes: int,
+    staging_rank_stride_bytes: int,
+) -> ScatterLaunch:
+    """Enqueue one bounded packed chunk on a caller-owned CUDA stream."""
+    if not HAS_TRITON:
+        raise RuntimeError("Triton is required for CUDA packed scatter")
+    chunk = _validate_packed_scatter_tensors(
+        staging,
+        destinations,
+        destination_plan,
+        packed_plan,
+        chunk_index,
+        staging_base_offset_bytes,
+        staging_rank_stride_bytes,
+        "cuda",
+    )
+    if torch.device(stream.device) != staging.device:
+        raise ValueError("the caller-supplied stream must match the tensor device")
+
+    keepalive: list[torch.Tensor] = [staging, *destinations]
+    enqueued_region_count = 0
+    start_event = torch.cuda.Event(enable_timing=True)
+    try:
+        with torch.cuda.stream(stream):
+            start_event.record(stream)
+            for region_slice in chunk.region_slices:
+                region = destination_plan.regions[region_slice.region_index]
+                position_end = region_slice.position_start + region_slice.position_count
+                positions = region.positions[region_slice.position_start : position_end]
+                region_metadata = torch.tensor(
+                    (
+                        tuple(position.local_block_id for position in positions),
+                        tuple(position.destination_half for position in positions),
+                    ),
+                    dtype=torch.int64,
+                    device=staging.device,
+                )
+                keepalive.append(region_metadata)
+
+                source_row_bytes = region.ownership.row_bytes
+                source_plane_bytes = source_row_bytes // 2
+                destination_row_bytes = _SOURCE_RANK_COUNT * source_row_bytes
+                grid = (region_slice.position_count, _SOURCE_RANK_COUNT)
+                _coalesced_scatter_kernel[grid](
+                    staging,
+                    destinations[region_slice.region_index].reshape(-1),
+                    region_metadata,
+                    staging_base_offset_bytes + region_slice.offset_within_rank,
+                    staging_rank_stride_bytes,
+                    region_slice.position_count,
+                    *destination_plan.rank_slots,
+                    SOURCE_ROW_BYTES=source_row_bytes,
+                    SOURCE_PLANE_BYTES=source_plane_bytes,
+                    DESTINATION_ROW_BYTES=destination_row_bytes,
+                    SOURCE_RANK_COUNT=_SOURCE_RANK_COUNT,
+                    BLOCK_BYTES=_KERNEL_BLOCK_BYTES,
+                    num_warps=8,
+                )
+                enqueued_region_count += 1
+
+            completion_event = torch.cuda.Event(enable_timing=True)
+            completion_event.record(stream)
+    except Exception as error:
+        launch_traceback = traceback.format_exc()
+        recovery_launch: ScatterLaunch | None = None
+        try:
+            with torch.cuda.stream(stream):
+                recovery_event = torch.cuda.Event(enable_timing=True)
+                recovery_event.record(stream)
+            recovery_launch = ScatterLaunch(
+                start_event=start_event,
+                completion_event=recovery_event,
+                enqueued_region_count=enqueued_region_count,
+                _keepalive=tuple(keepalive),
+            )
+            recovery_traceback = ""
+        except Exception:
+            recovery_traceback = (
+                "\ncompletion-event recovery also failed\n" + traceback.format_exc()
+            )
+        raise ScatterEnqueueError(
+            "packed scatter enqueue failed after validation\n"
+            + launch_traceback
+            + recovery_traceback,
+            recovery_launch,
+        ) from error
+
+    return ScatterLaunch(
+        start_event=start_event,
+        completion_event=completion_event,
+        enqueued_region_count=enqueued_region_count,
+        _keepalive=tuple(keepalive),
+    )
+
+
 def validate_coalesced_scatter(
     staging: torch.Tensor,
     destinations: tuple[torch.Tensor, ...],
@@ -416,6 +584,82 @@ def _validate_tensors(
                 f"destination region {region_index} has {destination.numel()} "
                 f"bytes, expected exactly {destination_size_bytes}"
             )
+
+
+def _validate_packed_scatter_tensors(
+    staging: torch.Tensor,
+    destinations: tuple[torch.Tensor, ...],
+    destination_plan: CoalescedTransferPlan,
+    packed_plan: PackedTransferPlan,
+    chunk_index: int,
+    staging_base_offset_bytes: int,
+    staging_rank_stride_bytes: int,
+    device_type: str,
+) -> PackedTransferChunk:
+    """Validate one packed chunk before any destination write begins."""
+    _validate_plan(destination_plan)
+    validate_packed_transfer_plan(
+        packed_plan,
+        source_digest=destination_plan.source_digest,
+        source_ranks=destination_plan.source_ranks,
+        region_position_counts=tuple(
+            len(region.positions) for region in destination_plan.regions
+        ),
+        region_row_bytes=tuple(
+            region.ownership.row_bytes for region in destination_plan.regions
+        ),
+        rank_stride_bytes=destination_plan.rank_stride_bytes,
+        transfer_size_bytes=destination_plan.staging_size_bytes,
+    )
+    if type(chunk_index) is not int or not 0 <= chunk_index < len(packed_plan.chunks):
+        raise ValueError("packed chunk index is outside the plan")
+    if type(staging_base_offset_bytes) is not int or staging_base_offset_bytes < 0:
+        raise ValueError("staging_base_offset_bytes must be non-negative")
+    if (
+        type(staging_rank_stride_bytes) is not int
+        or staging_rank_stride_bytes < packed_plan.max_chunk_bytes_per_rank
+    ):
+        raise ValueError("staging rank stride is smaller than the packed chunk bound")
+    if staging.device.type != device_type:
+        raise ValueError(f"staging must be on a {device_type} device")
+    if staging.dtype is not torch.uint8 or staging.ndim != 1:
+        raise TypeError("staging must be a one-dimensional uint8 tensor")
+    if not staging.is_contiguous():
+        raise ValueError("staging must be contiguous")
+    if len(destinations) != len(destination_plan.regions):
+        raise ValueError("destinations and canonical regions must have equal lengths")
+
+    chunk = packed_plan.chunks[chunk_index]
+    required_end = (
+        staging_base_offset_bytes
+        + (len(destination_plan.source_ranks) - 1) * staging_rank_stride_bytes
+        + chunk.rank_stride_bytes
+    )
+    if required_end > staging.numel():
+        raise ValueError("the packed staging slot exceeds the tensor")
+
+    for region_index, (destination, region) in enumerate(
+        zip(destinations, destination_plan.regions, strict=True)
+    ):
+        if destination.device != staging.device:
+            raise ValueError(
+                f"destination region {region_index} must share the staging device"
+            )
+        if destination.dtype is not torch.uint8 or not destination.is_contiguous():
+            raise TypeError(
+                f"destination region {region_index} must be contiguous uint8"
+            )
+        expected_bytes = (
+            region.ownership.destination_row_count
+            * _SOURCE_RANK_COUNT
+            * region.ownership.row_bytes
+        )
+        if destination.numel() != expected_bytes:
+            raise ValueError(
+                f"destination region {region_index} has {destination.numel()} "
+                f"bytes, expected exactly {expected_bytes}"
+            )
+    return chunk
 
 
 def _validate_plan(plan: CoalescedTransferPlan) -> None:

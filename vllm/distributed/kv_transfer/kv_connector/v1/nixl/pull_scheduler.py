@@ -14,7 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ProducerLease,
     ReqId,
 )
-from vllm.distributed.kv_transfer.nixl_localization import NixlSourceRoster
+from vllm.distributed.kv_transfer.nixl_contracts import NixlSourceRoster
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
@@ -82,9 +82,9 @@ def _producer_offer_identity(
     ):
         return None
 
-    generation = params.get("p2d_offer_generation")
-    if generation is not None and (type(generation) is not int or generation < 0):
-        raise ValueError("p2d_offer_generation must be a non-negative integer")
+    generation = params.get("source_offer_generation")
+    if generation is not None and (type(generation) is not int or generation < 1):
+        raise ValueError("source_offer_generation must be a positive integer")
     return _ProducerOfferIdentity(engine_id, request_id, generation)
 
 
@@ -545,7 +545,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         )
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
         remote_num_tokens = 0
-        localization_params: dict[str, Any] = {}
+        source_params: dict[str, Any] = {}
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
             request_deadline_duration = self._kv_lease_duration
@@ -562,11 +562,10 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                 expected_consumers=expected_consumers,
                 consumer_tp_size=consumer_tp_size,
             )
-            if is_p_node and self._localization_config.enabled_for_producer(
-                request.request_id
-            ):
-                self._localization_offer_generation += 1
-                offer_generation = self._localization_offer_generation
+            if is_p_node:
+                self._source_offer_generation += 1
+                offer_generation = self._source_offer_generation
+                self._register_source_offer(request.request_id, offer_generation)
                 self._source_rosters[request.request_id] = NixlSourceRoster(
                     offer_generation=offer_generation,
                     iteration=0,
@@ -581,12 +580,20 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         for group in block_ids
                     ),
                 )
-                localization_params = {
-                    "p2d_run_id": self._localization_config.run_id,
-                    "p2d_transport_arm": self._localization_config.transport_arm,
-                    "p2d_offer_generation": offer_generation,
-                    "p2d_iteration": 0,
+                source_params = {
+                    "source_offer_generation": offer_generation,
+                    "source_retired_through": self._source_retired_through,
                 }
+                if self._localization_config.enabled_for_producer(request.request_id):
+                    source_params.update(
+                        {
+                            "p2d_run_id": self._localization_config.run_id,
+                            "p2d_transport_arm": (
+                                self._localization_config.transport_arm
+                            ),
+                            "p2d_iteration": 0,
+                        }
+                    )
 
             remote_num_tokens = settled_num_computed_tokens
 
@@ -602,5 +609,5 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             remote_num_tokens=remote_num_tokens,
             expected_consumers=expected_consumers,
             consumer_tp_size=consumer_tp_size,
-            **localization_params,
+            **source_params,
         )

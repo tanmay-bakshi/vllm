@@ -32,3 +32,22 @@ class NixlRegionDescriptor(msgspec.Struct, array_like=True, frozen=True):
     dtype: str
     element_size_bytes: int
     layout: str
+
+
+class NixlSourceRoster(msgspec.Struct, array_like=True, frozen=True):
+    """Exact producer block roster retained through remote consumption.
+
+    :ivar offer_generation: Monotonic producer allocation generation.
+    :ivar iteration: Producer content generation within the allocation.
+    :ivar expected_consumers: Logical decoder consumers sharing the offer.
+    :ivar valid_token_extent: Number of settled source tokens.
+    :ivar group_token_capacities: Physical tokens represented by each group row.
+    :ivar block_ids: Exact physical producer rows in group order.
+    """
+
+    offer_generation: int
+    iteration: int
+    expected_consumers: int
+    valid_token_extent: int
+    group_token_capacities: tuple[int, ...]
+    block_ids: tuple[tuple[int, ...], ...]

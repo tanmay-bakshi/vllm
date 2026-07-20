@@ -22,6 +22,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
+    PackedWriteConsumerPoolGeometry,
+    PackedWriteProducerPoolGeometry,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.packed_write_config import (
+    PackedWriteConfig,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     TPMapping,
@@ -31,6 +36,10 @@ from vllm.distributed.kv_transfer.nixl_contracts import NixlRegionDescriptor
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 REMOTE_ENGINE_ID = "remote-engine"
+_MIB = 1024 * 1024
+_CHUNK_BYTES = 64 * _MIB
+_PACKED_SLOT_COUNT = 2
+_PACKED_ALIGNMENT_BYTES = 256
 
 
 class _FakeAttentionBackend:
@@ -73,7 +82,12 @@ def _regions(
     )
 
 
-def _worker() -> NixlBaseConnectorWorker:
+def _worker(
+    *,
+    role: str = "kv_consumer",
+    packed_write_enabled: bool = False,
+    local_tp_size: int = 1,
+) -> NixlBaseConnectorWorker:
     """Build only the state consumed by handshake validation."""
     worker = cast(
         NixlBaseConnectorWorker,
@@ -97,7 +111,10 @@ def _worker() -> NixlBaseConnectorWorker:
     worker._is_hma_required = False
     worker._physical_blocks_per_logical_kv_block = 1
     worker._sp_flags_cache = None
-    worker.kv_transfer_config = SimpleNamespace(enable_permute_local_kv=False)
+    worker.kv_transfer_config = SimpleNamespace(
+        enable_permute_local_kv=False,
+        kv_role=role,
+    )
     worker.vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(enable_prefix_caching=False)
     )
@@ -109,7 +126,7 @@ def _worker() -> NixlBaseConnectorWorker:
     worker._group_spec_types = (FullAttentionSpec, FullAttentionSpec)
     worker.transfer_topo = TransferTopology(
         tp_rank=0,
-        tp_size=1,
+        tp_size=local_tp_size,
         block_size=16,
         engine_id=worker.engine_id,
         is_mla=False,
@@ -121,9 +138,22 @@ def _worker() -> NixlBaseConnectorWorker:
     worker.dst_num_blocks = {worker.engine_id: worker.num_blocks}
     worker._remote_agents = defaultdict(dict)
     worker._remote_regions = defaultdict(dict)
+    worker._remote_registration_generations = defaultdict(dict)
     worker._remote_layout = defaultdict(dict)
     worker._remote_source_semantics = defaultdict(dict)
     worker._remote_rank_contracts = defaultdict(dict)
+    worker._remote_packed_write_producer_pools = defaultdict(dict)
+    worker._remote_packed_write_consumer_pools = defaultdict(dict)
+    worker._packed_write_config = PackedWriteConfig(
+        enabled=packed_write_enabled,
+        chunk_bytes_per_rank=_CHUNK_BYTES,
+        min_descriptors_per_rank=1024,
+        producer_slot_count=_PACKED_SLOT_COUNT,
+        consumer_slot_count=_PACKED_SLOT_COUNT,
+        alignment_bytes=_PACKED_ALIGNMENT_BYTES,
+        warn_after_s=30.0,
+        fail_after_s=300.0,
+    )
     worker.tp_mappings = {}
     worker.nixl_wrapper = MagicMock()
     worker._handshake_lock = threading.RLock()
@@ -136,14 +166,61 @@ def _worker() -> NixlBaseConnectorWorker:
     return worker
 
 
+def _producer_pool(
+    *,
+    device_id: int,
+    registration_generation: str,
+    base_address: int,
+    slot_count: int = _PACKED_SLOT_COUNT,
+) -> PackedWriteProducerPoolGeometry:
+    """Build one valid flat producer pool."""
+    return PackedWriteProducerPoolGeometry(
+        registration_generation=registration_generation,
+        base_address=base_address,
+        registered_bytes=slot_count * _CHUNK_BYTES,
+        slot_size_bytes=_CHUNK_BYTES,
+        slot_count=slot_count,
+        device_id=device_id,
+        alignment_bytes=_PACKED_ALIGNMENT_BYTES,
+    )
+
+
+def _consumer_pool(
+    *,
+    device_id: int,
+    registration_generation: str,
+    base_address: int,
+    source_tp_size: int,
+    slot_count: int = _PACKED_SLOT_COUNT,
+) -> PackedWriteConsumerPoolGeometry:
+    """Build one valid rank-major consumer pool."""
+    slot_size_bytes = source_tp_size * _CHUNK_BYTES
+    return PackedWriteConsumerPoolGeometry(
+        registration_generation=registration_generation,
+        base_address=base_address,
+        registered_bytes=slot_count * slot_size_bytes,
+        slot_size_bytes=slot_size_bytes,
+        slot_count=slot_count,
+        source_tp_size=source_tp_size,
+        rank_stride_bytes=_CHUNK_BYTES,
+        device_id=device_id,
+        alignment_bytes=_PACKED_ALIGNMENT_BYTES,
+    )
+
+
 def _metadata(
     row_bytes: int = 1024,
     num_blocks: int = 3,
     base_address: int = 0x200000,
     device_id: int = 0,
+    *,
+    include_producer_pool: bool = False,
+    include_consumer_pool: bool = False,
+    consumer_source_tp_size: int = 1,
 ) -> NixlAgentMetadata:
     """Build a complete valid remote handshake."""
     regions = _regions(row_bytes, num_blocks, base_address)
+    registration_generation = f"rank-{device_id}-generation"
     return NixlAgentMetadata(
         engine_id=REMOTE_ENGINE_ID,
         tp_rank=device_id,
@@ -157,10 +234,29 @@ def _metadata(
         ssm_sizes=(0, 0),
         attn_backend_name="FLASH_ATTN",
         physical_blocks_per_logical_kv_block=1,
-        registration_generation=f"rank-{device_id}-generation",
+        registration_generation=registration_generation,
         regions=regions,
         source_group_planes=(2, 2),
         physical_group_token_capacities=(16, 16),
+        packed_write_producer_pool=(
+            _producer_pool(
+                device_id=device_id,
+                registration_generation=registration_generation,
+                base_address=0x1000_0000 + device_id * 0x4000_0000,
+            )
+            if include_producer_pool
+            else None
+        ),
+        packed_write_consumer_pool=(
+            _consumer_pool(
+                device_id=device_id,
+                registration_generation=registration_generation,
+                base_address=0x4000_0000 + device_id * 0x4000_0000,
+                source_tp_size=consumer_source_tp_size,
+            )
+            if include_consumer_pool
+            else None
+        ),
     )
 
 
@@ -268,6 +364,267 @@ def test_valid_contract_and_tp_mapping_are_accepted() -> None:
     assert contract.enable_heterogeneous_attn_post_process is False
 
 
+@pytest.mark.parametrize(
+    (
+        "role",
+        "local_tp_size",
+        "include_producer_pool",
+        "include_consumer_pool",
+    ),
+    [
+        ("kv_consumer", 1, True, False),
+        ("kv_producer", 4, False, True),
+        ("kv_both", 4, True, True),
+    ],
+)
+def test_enabled_packed_write_accepts_exact_role_appropriate_remote_pools(
+    role: str,
+    local_tp_size: int,
+    include_producer_pool: bool,
+    include_consumer_pool: bool,
+) -> None:
+    worker = _worker(
+        role=role,
+        packed_write_enabled=True,
+        local_tp_size=local_tp_size,
+    )
+    metadata = _metadata(
+        include_producer_pool=include_producer_pool,
+        include_consumer_pool=include_consumer_pool,
+        consumer_source_tp_size=local_tp_size,
+    )
+
+    worker._validate_remote_handshake_envelope(metadata, 0, 1)
+
+
+@pytest.mark.parametrize(
+    (
+        "role",
+        "include_producer_pool",
+        "include_consumer_pool",
+        "message",
+    ),
+    [
+        ("kv_consumer", False, False, "producer has no pack pool"),
+        ("kv_producer", False, False, "consumer has no receive pool"),
+        ("kv_both", True, False, "consumer has no receive pool"),
+        ("kv_both", False, True, "producer has no pack pool"),
+    ],
+)
+def test_enabled_packed_write_rejects_missing_remote_role_pools(
+    role: str,
+    include_producer_pool: bool,
+    include_consumer_pool: bool,
+    message: str,
+) -> None:
+    worker = _worker(
+        role=role,
+        packed_write_enabled=True,
+        local_tp_size=4,
+    )
+    metadata = _metadata(
+        include_producer_pool=include_producer_pool,
+        include_consumer_pool=include_consumer_pool,
+        consumer_source_tp_size=4,
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        worker._validate_remote_handshake_envelope(metadata, 0, 1)
+
+
+@pytest.mark.parametrize("pool", ["producer", "consumer"])
+def test_remote_pool_generation_and_device_must_match_agent_metadata(
+    pool: str,
+) -> None:
+    role = "kv_consumer" if pool == "producer" else "kv_producer"
+    worker = _worker(
+        role=role,
+        packed_write_enabled=True,
+        local_tp_size=4,
+    )
+    metadata = _metadata(
+        include_producer_pool=pool == "producer",
+        include_consumer_pool=pool == "consumer",
+        consumer_source_tp_size=4,
+    )
+    if pool == "producer":
+        bad_generation = replace(
+            metadata,
+            packed_write_producer_pool=_producer_pool(
+                device_id=0,
+                registration_generation="other-generation",
+                base_address=0x1000_0000,
+            ),
+        )
+        bad_device = replace(
+            metadata,
+            packed_write_producer_pool=_producer_pool(
+                device_id=1,
+                registration_generation=metadata.registration_generation,
+                base_address=0x1000_0000,
+            ),
+        )
+    else:
+        bad_generation = replace(
+            metadata,
+            packed_write_consumer_pool=_consumer_pool(
+                device_id=0,
+                registration_generation="other-generation",
+                base_address=0x4000_0000,
+                source_tp_size=4,
+            ),
+        )
+        bad_device = replace(
+            metadata,
+            packed_write_consumer_pool=_consumer_pool(
+                device_id=1,
+                registration_generation=metadata.registration_generation,
+                base_address=0x4000_0000,
+                source_tp_size=4,
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match=f"{pool} pool registration generation"):
+        worker._validate_remote_handshake_envelope(bad_generation, 0, 1)
+    with pytest.raises(RuntimeError, match=f"{pool} pool device differs"):
+        worker._validate_remote_handshake_envelope(bad_device, 0, 1)
+
+
+def test_remote_pool_wire_types_are_role_exact() -> None:
+    worker = _worker(role="kv_consumer", packed_write_enabled=True)
+    metadata = _metadata(include_producer_pool=True)
+    wrong_type = _consumer_pool(
+        device_id=0,
+        registration_generation=metadata.registration_generation,
+        base_address=0x4000_0000,
+        source_tp_size=1,
+    )
+    metadata = replace(metadata, packed_write_producer_pool=wrong_type)
+
+    with pytest.raises(RuntimeError, match="producer pool has the wrong wire type"):
+        worker._validate_remote_handshake_envelope(metadata, 0, 1)
+
+
+def test_remote_producer_pool_must_match_chunk_and_slot_configuration() -> None:
+    worker = _worker(role="kv_consumer", packed_write_enabled=True)
+    metadata = _metadata(include_producer_pool=True)
+    metadata = replace(
+        metadata,
+        packed_write_producer_pool=_producer_pool(
+            device_id=0,
+            registration_generation=metadata.registration_generation,
+            base_address=0x1000_0000,
+            slot_count=1,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="producer pool geometry differs"):
+        worker._validate_remote_handshake_envelope(metadata, 0, 1)
+
+
+@pytest.mark.parametrize(
+    ("source_tp_size", "slot_count"),
+    [(2, _PACKED_SLOT_COUNT), (4, 1)],
+)
+def test_remote_consumer_pool_must_match_local_producer_shape(
+    source_tp_size: int,
+    slot_count: int,
+) -> None:
+    worker = _worker(
+        role="kv_producer",
+        packed_write_enabled=True,
+        local_tp_size=4,
+    )
+    metadata = _metadata(include_consumer_pool=True, consumer_source_tp_size=4)
+    metadata = replace(
+        metadata,
+        packed_write_consumer_pool=_consumer_pool(
+            device_id=0,
+            registration_generation=metadata.registration_generation,
+            base_address=0x4000_0000,
+            source_tp_size=source_tp_size,
+            slot_count=slot_count,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="consumer pool geometry differs"):
+        worker._validate_remote_handshake_envelope(metadata, 0, 1)
+
+
+def test_remote_packed_pool_cannot_alias_kv_registration() -> None:
+    worker = _worker(role="kv_consumer", packed_write_enabled=True)
+    metadata = _metadata(include_producer_pool=True)
+    metadata = replace(
+        metadata,
+        packed_write_producer_pool=_producer_pool(
+            device_id=0,
+            registration_generation=metadata.registration_generation,
+            base_address=metadata.regions[0].base_address,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="packed write registrations overlap"):
+        worker._validate_remote_agent_handshake(
+            metadata,
+            remote_tp_rank=0,
+            remote_tp_size=1,
+            plan=_plan(worker, 1),
+        )
+
+
+def test_kv_both_remote_pools_cannot_alias_each_other() -> None:
+    worker = _worker(
+        role="kv_both",
+        packed_write_enabled=True,
+        local_tp_size=1,
+    )
+    metadata = _metadata(
+        include_producer_pool=True,
+        include_consumer_pool=True,
+        consumer_source_tp_size=1,
+    )
+    assert metadata.packed_write_producer_pool is not None
+    metadata = replace(
+        metadata,
+        packed_write_consumer_pool=_consumer_pool(
+            device_id=0,
+            registration_generation=metadata.registration_generation,
+            base_address=metadata.packed_write_producer_pool.base_address,
+            source_tp_size=1,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="packed write registrations overlap"):
+        worker._validate_remote_agent_handshake(
+            metadata,
+            remote_tp_rank=0,
+            remote_tp_size=1,
+            plan=_plan(worker, 1),
+        )
+
+
+def test_remote_pool_maps_record_both_roles_and_cleanup_together() -> None:
+    worker = _worker()
+    metadata = _metadata(
+        include_producer_pool=True,
+        include_consumer_pool=True,
+    )
+
+    worker._record_remote_packed_write_pools(metadata, remote_tp_rank=0)
+
+    assert worker._remote_packed_write_producer_pools[REMOTE_ENGINE_ID] == {
+        0: metadata.packed_write_producer_pool
+    }
+    assert worker._remote_packed_write_consumer_pools[REMOTE_ENGINE_ID] == {
+        0: metadata.packed_write_consumer_pool
+    }
+
+    worker._clear_remote_packed_write_pools(REMOTE_ENGINE_ID)
+
+    assert REMOTE_ENGINE_ID not in worker._remote_packed_write_producer_pools
+    assert REMOTE_ENGINE_ID not in worker._remote_packed_write_consumer_pools
+
+
 def test_metadata_rank_mismatch_is_rejected_before_nixl_import() -> None:
     worker = _worker()
     metadata = _metadata(device_id=1)
@@ -284,13 +641,51 @@ def test_metadata_rank_mismatch_is_rejected_before_nixl_import() -> None:
     assert REMOTE_ENGINE_ID not in worker._remote_regions
 
 
+def test_cached_remote_rank_requires_the_same_registration_generation() -> None:
+    """Cached identity replay is idempotent, but process replacement fail-stops."""
+    worker = _worker()
+    metadata = _metadata()
+    worker._remote_agents[REMOTE_ENGINE_ID][0] = "cached-agent"
+    worker._remote_registration_generations[REMOTE_ENGINE_ID][0] = (
+        metadata.registration_generation
+    )
+
+    assert worker.add_remote_agent(metadata, remote_tp_rank=0) == "cached-agent"
+    worker.nixl_wrapper.add_remote_agent.assert_not_called()
+    assert worker._handshake_mutation_engine_id is None
+
+    changed = replace(
+        metadata,
+        registration_generation="replacement-generation",
+    )
+    with pytest.raises(
+        NixlHandshakeFailStopError,
+        match="cached remote engine/rank reused its identity",
+    ):
+        worker.add_remote_agent(changed, remote_tp_rank=0)
+
+    assert worker._remote_agents[REMOTE_ENGINE_ID] == {0: "cached-agent"}
+    assert worker._remote_registration_generations[REMOTE_ENGINE_ID] == {
+        0: metadata.registration_generation
+    }
+    worker.nixl_wrapper.add_remote_agent.assert_not_called()
+    assert worker._handshake_mutation_engine_id is None
+    assert worker._handshake_fail_stop_reason is not None
+    assert worker.transfer_topo is not None
+    with pytest.raises(KeyError):
+        worker.transfer_topo.get_engine_info(REMOTE_ENGINE_ID)
+
+
 def test_failed_validation_does_not_mutate_postprocess_state() -> None:
     worker = _worker()
     worker.kv_cache_layout = "NHD"
     worker._region_descriptors = (
         msgspec.structs.replace(worker._region_descriptors[0], layout="NHD"),
     )
-    worker.kv_transfer_config = SimpleNamespace(enable_permute_local_kv=True)
+    worker.kv_transfer_config = SimpleNamespace(
+        enable_permute_local_kv=True,
+        kv_role="kv_consumer",
+    )
     metadata = replace(
         _metadata(),
         physical_group_token_capacities=(17, 16),
@@ -314,7 +709,10 @@ def test_remote_engines_cannot_require_different_postprocess_contracts() -> None
     worker._region_descriptors = (
         msgspec.structs.replace(worker._region_descriptors[0], layout="NHD"),
     )
-    worker.kv_transfer_config = SimpleNamespace(enable_permute_local_kv=True)
+    worker.kv_transfer_config = SimpleNamespace(
+        enable_permute_local_kv=True,
+        kv_role="kv_consumer",
+    )
     worker._remote_agents["existing-engine"][0] = "existing-agent"
 
     with pytest.raises(RuntimeError, match="incompatible destination post-processing"):
@@ -435,7 +833,10 @@ def test_multi_rank_roster_rejects_per_rank_layout_differences() -> None:
     worker._region_descriptors = (
         msgspec.structs.replace(worker._region_descriptors[0], layout="NHD"),
     )
-    worker.kv_transfer_config = SimpleNamespace(enable_permute_local_kv=True)
+    worker.kv_transfer_config = SimpleNamespace(
+        enable_permute_local_kv=True,
+        kv_role="kv_consumer",
+    )
     remote_tp_size = 2
     plan = _plan(worker, remote_tp_size)
     rank_zero = _metadata(row_bytes=1024, device_id=0)
@@ -524,6 +925,40 @@ def test_rank_contract_binds_all_cross_rank_geometry() -> None:
         "source_group_planes",
         "physical_group_token_capacities",
         "region_geometry",
+    )
+
+
+def test_rank_contract_binds_both_packed_pool_geometries() -> None:
+    worker = _worker()
+    reference = _metadata(
+        include_producer_pool=True,
+        include_consumer_pool=True,
+    )
+    current = replace(
+        reference,
+        packed_write_producer_pool=_producer_pool(
+            device_id=0,
+            registration_generation=reference.registration_generation,
+            base_address=0x1000_0000,
+            slot_count=1,
+        ),
+        packed_write_consumer_pool=_consumer_pool(
+            device_id=0,
+            registration_generation=reference.registration_generation,
+            base_address=0x4000_0000,
+            source_tp_size=1,
+            slot_count=1,
+        ),
+    )
+
+    differences = worker._rank_handshake_contract_differences(
+        worker._rank_handshake_contract(reference),
+        worker._rank_handshake_contract(current),
+    )
+
+    assert differences == (
+        "packed_write_producer_pool_geometry",
+        "packed_write_consumer_pool_geometry",
     )
 
 

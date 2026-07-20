@@ -2812,7 +2812,7 @@ class Scheduler(SchedulerInterface):
         """
         remote_engine_id = kv_transfer_params.get("remote_engine_id")
         remote_request_id = kv_transfer_params.get("remote_request_id")
-        offer_generation = kv_transfer_params.get("p2d_offer_generation")
+        offer_generation = kv_transfer_params.get("source_offer_generation")
         if (
             type(remote_engine_id) is not str
             or len(remote_engine_id) == 0
@@ -2820,7 +2820,7 @@ class Scheduler(SchedulerInterface):
             or len(remote_request_id) == 0
             or (
                 offer_generation is not None
-                and (type(offer_generation) is not int or offer_generation < 0)
+                and (type(offer_generation) is not int or offer_generation < 1)
             )
         ):
             return False
@@ -2832,7 +2832,7 @@ class Scheduler(SchedulerInterface):
             if (
                 owned_params.get("remote_engine_id") == remote_engine_id
                 and owned_params.get("remote_request_id") == remote_request_id
-                and owned_params.get("p2d_offer_generation") == offer_generation
+                and owned_params.get("source_offer_generation") == offer_generation
             ):
                 return True
         return False

@@ -36,6 +36,18 @@ _PLAN_SCATTER_DURATION = "coalesced_plan_scatter_duration"
 _PLAN_SCATTER_GPU_DURATION = "coalesced_plan_scatter_gpu_duration"
 _PLAN_STAGING_RESIDENCY = "coalesced_plan_staging_residency"
 
+_PACKED_WRITE_LOGICAL_BYTES = "packed_write_logical_bytes"
+_PACKED_WRITE_SOURCE_BYTES = "packed_write_source_bytes"
+_PACKED_WRITE_WIRE_BYTES = "packed_write_wire_bytes"
+_PACKED_WRITE_AVOIDED_DIRECT_DESCRIPTORS = "packed_write_avoided_direct_descriptors"
+_PACKED_WRITE_NUM_DESCRIPTORS = "packed_write_num_descriptors"
+_PACKED_WRITE_NUM_CHUNKS = "packed_write_num_chunks"
+_PACKED_WRITE_ARRIVAL_WAIT = "packed_write_arrival_wait"
+_PACKED_WRITE_SCATTER_ENQUEUE_DURATION = "packed_write_scatter_enqueue_duration"
+_PACKED_WRITE_SCATTER_WALL_DURATION = "packed_write_scatter_wall_duration"
+_PACKED_WRITE_SCATTER_GPU_DURATION = "packed_write_scatter_gpu_duration"
+_PACKED_WRITE_STAGING_RESIDENCY = "packed_write_staging_residency"
+
 
 @dataclass(frozen=True, slots=True)
 class NixlCoalescedPlanTelemetry:
@@ -181,6 +193,153 @@ class NixlCoalescedPlanTelemetry:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class NixlPackedWriteTelemetry:
+    """One completed adaptive producer-packed write request.
+
+    ``source_bytes`` is the exact selected source payload after logical pruning.
+    Producer packing and the native WRITE are lossless, so the wire byte count
+    is exactly the source byte count. Native handle timing is recorded on the
+    producer by the connector's ordinary transfer metrics. This request-level
+    decoder record covers the phases the decoder can observe soundly.
+
+    :ivar logical_bytes: Bytes in the unpruned logical request.
+    :ivar source_bytes: Exact bytes selected from authoritative producer storage.
+    :ivar wire_bytes: Exact bytes written into decoder staging.
+    :ivar avoided_direct_descriptor_count: Direct-transfer descriptors eliminated.
+    :ivar packed_descriptor_count: One native WRITE descriptor per rank and chunk.
+    :ivar chunk_count: Bounded packed chunks completed across the request.
+    :ivar arrival_wait_seconds: Aggregate WRITE-arrival wait time.
+    :ivar scatter_enqueue_duration_seconds: Aggregate CPU scatter enqueue time.
+    :ivar scatter_wall_duration_seconds: Aggregate enqueue-to-completion wall time.
+    :ivar scatter_gpu_duration_seconds: Aggregate CUDA-event scatter time, or
+        ``None`` when exact GPU timing was unavailable.
+    :ivar staging_residency_seconds: First staging lease acquisition through final
+        slot release wall time.
+    """
+
+    logical_bytes: int
+    source_bytes: int
+    wire_bytes: int
+    avoided_direct_descriptor_count: int
+    packed_descriptor_count: int
+    chunk_count: int
+    arrival_wait_seconds: float
+    scatter_enqueue_duration_seconds: float
+    scatter_wall_duration_seconds: float
+    scatter_gpu_duration_seconds: float | None
+    staging_residency_seconds: float
+
+    def __post_init__(self) -> None:
+        """Validate units and lossless packed-transfer invariants."""
+        for name, value in (
+            ("logical_bytes", self.logical_bytes),
+            ("source_bytes", self.source_bytes),
+            ("wire_bytes", self.wire_bytes),
+            (
+                "avoided_direct_descriptor_count",
+                self.avoided_direct_descriptor_count,
+            ),
+            ("packed_descriptor_count", self.packed_descriptor_count),
+            ("chunk_count", self.chunk_count),
+        ):
+            _require_non_negative_int(name, value)
+        if self.source_bytes > self.logical_bytes:
+            raise ValueError("source_bytes cannot exceed logical_bytes")
+        if self.wire_bytes != self.source_bytes:
+            raise ValueError("wire_bytes must equal source_bytes")
+        if self.source_bytes == 0:
+            raise ValueError("source_bytes must be positive for a packed write")
+        if self.packed_descriptor_count == 0:
+            raise ValueError(
+                "packed_descriptor_count must be positive for a packed write"
+            )
+        if self.chunk_count == 0:
+            raise ValueError("chunk_count must be positive for a packed write")
+        if self.packed_descriptor_count % self.chunk_count != 0:
+            raise ValueError(
+                "packed_descriptor_count must contain the same producer quorum "
+                "for every chunk"
+            )
+        duration_fields: tuple[tuple[str, float], ...] = (
+            ("arrival_wait_seconds", self.arrival_wait_seconds),
+            (
+                "scatter_enqueue_duration_seconds",
+                self.scatter_enqueue_duration_seconds,
+            ),
+            ("scatter_wall_duration_seconds", self.scatter_wall_duration_seconds),
+            ("staging_residency_seconds", self.staging_residency_seconds),
+        )
+        for duration_name, duration_value in duration_fields:
+            _require_duration(duration_name, duration_value)
+        if self.scatter_gpu_duration_seconds is not None:
+            _require_duration(
+                "scatter_gpu_duration_seconds", self.scatter_gpu_duration_seconds
+            )
+        if self.scatter_enqueue_duration_seconds > self.scatter_wall_duration_seconds:
+            raise ValueError("scatter enqueue duration cannot exceed scatter wall time")
+
+    @property
+    def direct_descriptor_count(self) -> int:
+        """Return the equivalent direct-transfer descriptor count."""
+        return self.avoided_direct_descriptor_count + self.packed_descriptor_count
+
+    @classmethod
+    def from_completed_request(
+        cls,
+        *,
+        logical_bytes: int,
+        source_bytes: int,
+        direct_descriptor_count: int,
+        chunk_count: int,
+        source_tp_size: int,
+        arrival_wait_seconds: float,
+        scatter_enqueue_duration_seconds: float,
+        scatter_wall_duration_seconds: float,
+        scatter_gpu_duration_seconds: float | None,
+        staging_residency_seconds: float,
+    ) -> Self:
+        """Build one request record from decoder-observable completion facts.
+
+        :param logical_bytes: Bytes in the unpruned logical request.
+        :param source_bytes: Exact selected source bytes.
+        :param direct_descriptor_count: Equivalent direct-transfer descriptor count.
+        :param chunk_count: Number of bounded packed chunks completed.
+        :param source_tp_size: Producer ranks that WRITE every chunk.
+        :param arrival_wait_seconds: Aggregate producer WRITE-arrival wait time.
+        :param scatter_enqueue_duration_seconds: Aggregate CPU scatter enqueue time.
+        :param scatter_wall_duration_seconds: Aggregate scatter wall time.
+        :param scatter_gpu_duration_seconds: Aggregate exact CUDA-event time, or
+            ``None`` when unavailable.
+        :param staging_residency_seconds: End-to-end packed staging residency.
+        :returns: A validated completed-request telemetry record.
+        """
+        _require_non_negative_int("direct_descriptor_count", direct_descriptor_count)
+        _require_non_negative_int("source_tp_size", source_tp_size)
+        if source_tp_size == 0:
+            raise ValueError("source_tp_size must be positive")
+        packed_descriptor_count = chunk_count * source_tp_size
+        if direct_descriptor_count < packed_descriptor_count:
+            raise ValueError(
+                "direct_descriptor_count cannot be smaller than the packed count"
+            )
+        return cls(
+            logical_bytes=logical_bytes,
+            source_bytes=source_bytes,
+            wire_bytes=source_bytes,
+            avoided_direct_descriptor_count=(
+                direct_descriptor_count - packed_descriptor_count
+            ),
+            packed_descriptor_count=packed_descriptor_count,
+            chunk_count=chunk_count,
+            arrival_wait_seconds=arrival_wait_seconds,
+            scatter_enqueue_duration_seconds=scatter_enqueue_duration_seconds,
+            scatter_wall_duration_seconds=scatter_wall_duration_seconds,
+            scatter_gpu_duration_seconds=scatter_gpu_duration_seconds,
+            staging_residency_seconds=staging_residency_seconds,
+        )
+
+
 def _require_non_negative_int(name: str, value: int) -> None:
     """Require an exact, non-negative integer.
 
@@ -232,6 +391,17 @@ class NixlKVConnectorStats(KVConnectorStats):
             _PLAN_SCATTER_DURATION: [],
             _PLAN_SCATTER_GPU_DURATION: [],
             _PLAN_STAGING_RESIDENCY: [],
+            _PACKED_WRITE_LOGICAL_BYTES: [],
+            _PACKED_WRITE_SOURCE_BYTES: [],
+            _PACKED_WRITE_WIRE_BYTES: [],
+            _PACKED_WRITE_AVOIDED_DIRECT_DESCRIPTORS: [],
+            _PACKED_WRITE_NUM_DESCRIPTORS: [],
+            _PACKED_WRITE_NUM_CHUNKS: [],
+            _PACKED_WRITE_ARRIVAL_WAIT: [],
+            _PACKED_WRITE_SCATTER_ENQUEUE_DURATION: [],
+            _PACKED_WRITE_SCATTER_WALL_DURATION: [],
+            _PACKED_WRITE_SCATTER_GPU_DURATION: [],
+            _PACKED_WRITE_STAGING_RESIDENCY: [],
         }
 
     def record_transfer(self, res: "nixlXferTelemetry"):
@@ -271,6 +441,36 @@ class NixlKVConnectorStats(KVConnectorStats):
             )
         self.data[_PLAN_STAGING_RESIDENCY].append(telemetry.staging_residency_seconds)
 
+    def record_packed_write(self, telemetry: NixlPackedWriteTelemetry) -> None:
+        """Record one completed adaptive producer-packed write request.
+
+        :param telemetry: Validated request-level packed-write observations.
+        """
+        self.data[_PACKED_WRITE_LOGICAL_BYTES].append(telemetry.logical_bytes)
+        self.data[_PACKED_WRITE_SOURCE_BYTES].append(telemetry.source_bytes)
+        self.data[_PACKED_WRITE_WIRE_BYTES].append(telemetry.wire_bytes)
+        self.data[_PACKED_WRITE_AVOIDED_DIRECT_DESCRIPTORS].append(
+            telemetry.avoided_direct_descriptor_count
+        )
+        self.data[_PACKED_WRITE_NUM_DESCRIPTORS].append(
+            telemetry.packed_descriptor_count
+        )
+        self.data[_PACKED_WRITE_NUM_CHUNKS].append(telemetry.chunk_count)
+        self.data[_PACKED_WRITE_ARRIVAL_WAIT].append(telemetry.arrival_wait_seconds)
+        self.data[_PACKED_WRITE_SCATTER_ENQUEUE_DURATION].append(
+            telemetry.scatter_enqueue_duration_seconds
+        )
+        self.data[_PACKED_WRITE_SCATTER_WALL_DURATION].append(
+            telemetry.scatter_wall_duration_seconds
+        )
+        if telemetry.scatter_gpu_duration_seconds is not None:
+            self.data[_PACKED_WRITE_SCATTER_GPU_DURATION].append(
+                telemetry.scatter_gpu_duration_seconds
+            )
+        self.data[_PACKED_WRITE_STAGING_RESIDENCY].append(
+            telemetry.staging_residency_seconds
+        )
+
     def record_failed_transfer(self):
         """Record a failed NIXL transfer operation."""
         self.data["num_failed_transfers"].append(1)
@@ -293,6 +493,7 @@ class NixlKVConnectorStats(KVConnectorStats):
         return (
             self.num_successful_transfers == 0
             and self.num_coalesced_plans == 0
+            and self.num_packed_write_requests == 0
             and len(self.data["num_failed_transfers"]) == 0
             and len(self.data["num_failed_notifications"]) == 0
             and len(self.data["num_kv_expired_reqs"]) == 0
@@ -349,6 +550,7 @@ class NixlKVConnectorStats(KVConnectorStats):
                 "Avg number of descriptors": round(descs.mean(), 1),
             }
         reduced.update(self._reduce_coalesced_plans())
+        reduced.update(self._reduce_packed_writes())
         return reduced
 
     def _reduce_coalesced_plans(self) -> dict[str, int | float]:
@@ -411,6 +613,72 @@ class NixlKVConnectorStats(KVConnectorStats):
             )
         return reduced
 
+    def _reduce_packed_writes(self) -> dict[str, int | float]:
+        """Reduce completed packed-write observations for CLI logging.
+
+        :returns: Request counts, byte efficiency, descriptor savings, and phase
+            means.
+        """
+        if self.num_packed_write_requests == 0:
+            return {"Num packed write requests": 0}
+
+        logical_bytes = np.asarray(
+            self.data[_PACKED_WRITE_LOGICAL_BYTES], dtype=np.uint64
+        )
+        source_bytes = np.asarray(
+            self.data[_PACKED_WRITE_SOURCE_BYTES], dtype=np.uint64
+        )
+        wire_bytes = np.asarray(self.data[_PACKED_WRITE_WIRE_BYTES], dtype=np.uint64)
+        total_logical_bytes = int(logical_bytes.sum())
+        total_source_bytes = int(source_bytes.sum())
+        source_elision_percent = (
+            100.0 * (total_logical_bytes - total_source_bytes) / total_logical_bytes
+            if total_logical_bytes > 0
+            else 0.0
+        )
+
+        def mean_milliseconds(key: str) -> float:
+            values = np.asarray(self.data[key])
+            return round(values.mean() * 1e3, 3)
+
+        reduced: dict[str, int | float] = {
+            "Num packed write requests": self.num_packed_write_requests,
+            "Avg logical MB per packed write": round(logical_bytes.mean() / 2**20, 3),
+            "Avg source MB per packed write": round(source_bytes.mean() / 2**20, 3),
+            "Avg wire MB per packed write": round(wire_bytes.mean() / 2**20, 3),
+            "Packed write source bytes elided (%)": round(source_elision_percent, 3),
+            "Avg packed write avoided direct descriptors": round(
+                np.asarray(self.data[_PACKED_WRITE_AVOIDED_DIRECT_DESCRIPTORS]).mean(),
+                1,
+            ),
+            "Avg packed write descriptors": round(
+                np.asarray(self.data[_PACKED_WRITE_NUM_DESCRIPTORS]).mean(), 1
+            ),
+            "Avg packed write chunks": round(
+                np.asarray(self.data[_PACKED_WRITE_NUM_CHUNKS]).mean(), 1
+            ),
+            "Avg packed write arrival wait (ms)": mean_milliseconds(
+                _PACKED_WRITE_ARRIVAL_WAIT
+            ),
+            "Avg packed write scatter enqueue time (ms)": mean_milliseconds(
+                _PACKED_WRITE_SCATTER_ENQUEUE_DURATION
+            ),
+            "Avg packed write scatter wall time (ms)": mean_milliseconds(
+                _PACKED_WRITE_SCATTER_WALL_DURATION
+            ),
+            "Num packed write scatter GPU timings": len(
+                self.data[_PACKED_WRITE_SCATTER_GPU_DURATION]
+            ),
+            "Avg packed write staging residency (ms)": mean_milliseconds(
+                _PACKED_WRITE_STAGING_RESIDENCY
+            ),
+        }
+        if len(self.data[_PACKED_WRITE_SCATTER_GPU_DURATION]) > 0:
+            reduced["Avg packed write scatter GPU time (ms)"] = mean_milliseconds(
+                _PACKED_WRITE_SCATTER_GPU_DURATION
+            )
+        return reduced
+
     @property
     def num_successful_transfers(self) -> int:
         return len(self.data["transfer_duration"])
@@ -422,6 +690,11 @@ class NixlKVConnectorStats(KVConnectorStats):
         :returns: Number of recorded coalesced plans.
         """
         return len(self.data[_PLAN_LOGICAL_BYTES])
+
+    @property
+    def num_packed_write_requests(self) -> int:
+        """Return the number of complete packed-write request observations."""
+        return len(self.data[_PACKED_WRITE_LOGICAL_BYTES])
 
 
 class NixlPromMetrics(KVConnectorPromMetrics):
@@ -631,6 +904,100 @@ class NixlPromMetrics(KVConnectorPromMetrics):
                 create_metric_per_engine(histogram, self.per_engine_labelvalues),
             )
 
+        packed_descriptor_buckets: list[float | int] = [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            1000,
+            2000,
+            4000,
+            10000,
+            20000,
+            50000,
+        ]
+        chunk_buckets: list[float | int] = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        packed_write_histogram_specs: dict[str, tuple[str, str, list[float | int]]] = {
+            _PACKED_WRITE_LOGICAL_BYTES: (
+                "vllm:nixl_packed_write_logical_bytes",
+                "Logical bytes per completed adaptive producer-packed write.",
+                byte_buckets,
+            ),
+            _PACKED_WRITE_SOURCE_BYTES: (
+                "vllm:nixl_packed_write_source_bytes",
+                "Selected authoritative source bytes per completed packed write.",
+                byte_buckets,
+            ),
+            _PACKED_WRITE_WIRE_BYTES: (
+                "vllm:nixl_packed_write_wire_bytes",
+                "Lossless packed wire bytes per completed packed write.",
+                byte_buckets,
+            ),
+            _PACKED_WRITE_AVOIDED_DIRECT_DESCRIPTORS: (
+                "vllm:nixl_packed_write_avoided_direct_descriptors",
+                "Direct-transfer descriptors eliminated per completed packed write.",
+                packed_descriptor_buckets,
+            ),
+            _PACKED_WRITE_NUM_DESCRIPTORS: (
+                "vllm:nixl_packed_write_num_descriptors",
+                "Packed native descriptor count per completed packed write.",
+                packed_descriptor_buckets,
+            ),
+            _PACKED_WRITE_NUM_CHUNKS: (
+                "vllm:nixl_packed_write_num_chunks",
+                "Bounded chunk count per completed packed write.",
+                chunk_buckets,
+            ),
+            _PACKED_WRITE_ARRIVAL_WAIT: (
+                "vllm:nixl_packed_write_arrival_wait_seconds",
+                "Aggregate producer WRITE-arrival wait per completed packed write.",
+                duration_buckets,
+            ),
+            _PACKED_WRITE_SCATTER_ENQUEUE_DURATION: (
+                "vllm:nixl_packed_write_scatter_enqueue_time_seconds",
+                "CPU scatter enqueue duration per completed packed write.",
+                duration_buckets,
+            ),
+            _PACKED_WRITE_SCATTER_WALL_DURATION: (
+                "vllm:nixl_packed_write_scatter_wall_time_seconds",
+                "Scatter enqueue-to-completion wall duration per packed write.",
+                duration_buckets,
+            ),
+            _PACKED_WRITE_SCATTER_GPU_DURATION: (
+                "vllm:nixl_packed_write_scatter_gpu_time_seconds",
+                "Exact CUDA-event scatter duration per completed packed write.",
+                duration_buckets,
+            ),
+            _PACKED_WRITE_STAGING_RESIDENCY: (
+                "vllm:nixl_packed_write_staging_residency_seconds",
+                "First packed staging lease acquisition-to-release duration.",
+                duration_buckets,
+            ),
+        }
+        self.packed_write_histograms: dict[str, dict[int, Histogram]] = {}
+        for data_key, (
+            metric_name,
+            documentation,
+            metric_buckets,
+        ) in packed_write_histogram_specs.items():
+            histogram = histogram_cls(
+                name=metric_name,
+                documentation=documentation,
+                buckets=metric_buckets,
+                labelnames=labelnames,
+            )
+            self.packed_write_histograms[data_key] = cast(
+                dict[int, Histogram],
+                create_metric_per_engine(histogram, self.per_engine_labelvalues),
+            )
+
         counter_cls = cast(type[Counter], self._counter_cls)
         counter_nixl_num_failed_transfers = counter_cls(
             name="vllm:nixl_num_failed_transfers",
@@ -698,5 +1065,8 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             for list_item in transfer_stats_data[counter_item_key]:
                 counter_obj[engine_idx].inc(list_item)
         for data_key, histogram in self.coalesced_plan_histograms.items():
+            for observation in transfer_stats_data[data_key]:
+                histogram[engine_idx].observe(observation)
+        for data_key, histogram in self.packed_write_histograms.items():
             for observation in transfer_stats_data[data_key]:
                 histogram[engine_idx].observe(observation)

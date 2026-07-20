@@ -32,6 +32,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     RemoteMeta,
     ReqMeta,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.packed_write_config import (
+    PackedWriteConfig,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
     NixlPullConnectorWorker,
 )
@@ -327,13 +330,29 @@ def _make_worker(
     }
     worker._coalesce_plans = {}
     worker._coalesce_pending = deque()
+    worker._packed_write_config = PackedWriteConfig(
+        enabled=False,
+        chunk_bytes_per_rank=64 * 1024 * 1024,
+        min_descriptors_per_rank=1,
+        producer_slot_count=1,
+        consumer_slot_count=1,
+        alignment_bytes=256,
+        warn_after_s=1.0,
+        fail_after_s=2.0,
+    )
+    worker._packed_consumer_requests = {}
+    worker._packed_producer_pending = deque()
+    worker._packed_producer_operations = {}
+    worker._packed_done_recving = set()
     worker._pending_coalesced_scatters = {}
     worker._failed_recv_outcomes = queue.Queue()
     worker._failed_recv_pending = {}
     worker._completed_failed_recv_outcomes = queue.Queue()
     worker._invalid_block_ids = queue.Queue()
-    worker._released_rids = {}
-    worker._rid_completion_counts = {}
+    worker._released_remote_offers = {}
+    worker._remote_offer_completion_counts = {}
+    worker._remote_source_retired_through = {}
+    worker._remote_source_consumption_proven = {}
     worker._reqs_to_send = {}
     worker._reqs_to_process = set()
     worker._has_mamba = False
@@ -378,7 +397,10 @@ def test_hma_worker_failure_reports_every_group_as_one_terminal() -> None:
     worker.xfer_stats.record_failed_transfer.assert_called_once_with()
 
 
-def test_release_fence_reports_integrity_failure_for_every_group() -> None:
+@pytest.mark.parametrize("fence_mode", ["exact", "retirement-floor"])
+def test_release_fences_report_integrity_failure_for_every_group(
+    fence_mode: str,
+) -> None:
     """A late transfer is rejected without publishing any destination group."""
     local_block_ids = tuple(
         [group_index * 10 + offset for offset in range(3)] for group_index in range(13)
@@ -392,9 +414,15 @@ def test_release_fence_reports_integrity_failure_for_every_group() -> None:
         port=1234,
         engine_id="remote-engine",
         request_id=remote_request_id,
+        source_offer_generation=7,
     )
     worker._recving_transfers = {request_id: []}
-    worker._released_rids = {remote_request_id: 1.0}
+    remote = worker._recving_metadata[request_id].remote
+    assert remote is not None
+    if fence_mode == "exact":
+        worker._released_remote_offers = {remote.offer_key: 1.0}
+    else:
+        worker._remote_source_retired_through = {"remote-engine": 7}
 
     _, finished_recving = worker.get_finished()
     failures = worker.get_failed_recving()
@@ -410,6 +438,200 @@ def test_release_fence_reports_integrity_failure_for_every_group() -> None:
         )
     }
     assert worker.get_block_ids_with_load_errors() == set()
+
+
+@pytest.mark.parametrize("fence_mode", ["exact", "retirement-floor"])
+def test_coalesced_done_race_with_source_retirement_never_scatters(
+    fence_mode: str,
+) -> None:
+    """A source retired after native DONE cannot reach destination scatter."""
+    request_id = "coalesced-retirement-race"
+    worker = _make_worker(([9],), request_id)
+    meta = worker._recving_metadata[request_id]
+    meta.remote = RemoteMeta(
+        block_ids=([19],),
+        host="producer-host",
+        port=1234,
+        engine_id="producer-engine",
+        request_id="producer-request",
+        source_offer_generation=7,
+    )
+    remote = meta.remote
+
+    allocator = StagingRangeAllocator(1024)
+    plan = allocator.create_plan(
+        owner_id="decode:0:0",
+        request_id=request_id,
+        layout=_layout(1),
+        layout_duration_seconds=0.0,
+        remote_engine_id=remote.engine_id,
+    )
+    assert plan is not None
+    plan.begin_prepare(0)
+    plan.attach_handle(0, 17)
+    plan.begin_post(0)
+    plan.record_post_result(0, "PROC")
+    plan.seal_posting()
+    worker._staging_allocator = allocator
+    worker._coalesce_plans = {request_id: plan}
+    worker._coalesced_scatter = Mock()
+    worker.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    worker.nixl_wrapper.get_xfer_telemetry.return_value = _native_telemetry(
+        plan.layout.staging_size_bytes
+    )
+
+    def retire_source_offer(_handle: int) -> None:
+        if fence_mode == "exact":
+            worker._mark_remote_offer_released(remote.offer_key)
+            return
+        worker._advance_remote_source_retirement_floor(
+            remote.engine_id,
+            remote.source_offer_generation,
+        )
+
+    worker.nixl_wrapper.release_xfer_handle.side_effect = retire_source_offer
+    ready_when_failed: list[bool] = []
+    original_fail = plan.fail
+
+    def fail_after_ready(reason: str) -> None:
+        ready_when_failed.append(plan.ready_to_scatter)
+        original_fail(reason)
+
+    with patch.object(plan, "fail", side_effect=fail_after_ready):
+        assert worker._poll_coalesced_plans() == set()
+
+    assert ready_when_failed == [True]
+    worker._coalesced_scatter.assert_not_called()
+    worker.nixl_wrapper.check_xfer_state.assert_called_once_with(17)
+    worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(17)
+    assert plan.released
+    assert request_id not in worker._coalesce_plans
+    assert allocator.active == {}
+    assert allocator.free_bytes == allocator.capacity
+    assert worker._failed_recv_pending == {
+        request_id: _failure({9}, KVTransferFailureReason.INTEGRITY)
+    }
+
+    _, finished_recving = worker.get_finished()
+
+    assert finished_recving == {request_id}
+    assert worker.get_failed_recving() == {
+        request_id: _failure({9}, KVTransferFailureReason.INTEGRITY)
+    }
+    worker._coalesced_scatter.assert_not_called()
+
+
+def test_post_done_scatter_validation_failure_still_consumes_source() -> None:
+    """A decoder-local failure cannot discard its completed source read proof."""
+    request_id = "coalesced-validation-failure"
+    worker = _make_worker(([9],), request_id)
+    meta = worker._recving_metadata[request_id]
+    meta.remote = RemoteMeta(
+        block_ids=([19],),
+        host="producer-host",
+        port=1234,
+        engine_id="producer-engine",
+        request_id="producer-request",
+        expected_consumers=1,
+        source_offer_generation=7,
+    )
+    remote = meta.remote
+
+    allocator = StagingRangeAllocator(1024)
+    plan = allocator.create_plan(
+        owner_id="decode:0:0",
+        request_id=request_id,
+        layout=_layout(1),
+        layout_duration_seconds=0.0,
+        remote_engine_id=remote.engine_id,
+    )
+    assert plan is not None
+    plan.begin_prepare(0)
+    plan.attach_handle(0, 17)
+    plan.begin_post(0)
+    plan.record_post_result(0, "PROC")
+    plan.seal_posting()
+    worker._staging_allocator = allocator
+    worker._coalesce_plans = {request_id: plan}
+    worker._staging_buf = Mock()
+    worker._region_rows = (Mock(),)
+    worker._coalesced_scatter_stream = Mock()
+    worker.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    worker.nixl_wrapper.get_xfer_telemetry.return_value = _native_telemetry(
+        plan.layout.staging_size_bytes
+    )
+
+    validator_path = (
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker."
+        "validate_coalesced_scatter"
+    )
+    launcher_path = (
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker."
+        "launch_coalesced_scatter"
+    )
+    with (
+        patch(
+            validator_path, side_effect=ValueError("invalid destination geometry")
+        ) as validate,
+        patch(launcher_path) as launch,
+    ):
+        assert worker._poll_coalesced_plans() == set()
+
+    validate.assert_called_once()
+    launch.assert_not_called()
+    worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(17)
+    assert plan.source_consumption_proven
+    assert plan.released
+    assert request_id not in worker._coalesce_plans
+    assert allocator.free_bytes == allocator.capacity
+    assert worker._remote_source_consumption_proven == {request_id: remote.offer_key}
+    assert remote.offer_key not in worker._released_remote_offers
+
+    _, finished_recving = worker.get_finished()
+
+    assert finished_recving == {request_id}
+    assert worker.get_failed_recving() == {request_id: _failure({9})}
+    assert worker._remote_source_consumption_proven == {}
+    assert worker._remote_offer_completion_counts == {}
+    assert remote.offer_key in worker._released_remote_offers
+
+
+def test_success_reobserves_source_proof_without_double_counting() -> None:
+    """Natural success consumes an earlier per-child proof exactly once."""
+    request_id = "coalesced-success"
+    worker = _make_worker(([9],), request_id)
+    meta = worker._recving_metadata[request_id]
+    meta.remote = RemoteMeta(
+        block_ids=([19],),
+        host="producer-host",
+        port=1234,
+        engine_id="producer-engine",
+        request_id="producer-request",
+        expected_consumers=2,
+        source_offer_generation=7,
+    )
+    remote = meta.remote
+    worker._recving_transfers = {request_id: []}
+    worker.enable_permute_local_kv = False
+    worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
+        remote_block_size=16
+    )
+    worker.transfer_topo.block_size_ratio.return_value = 1
+    worker._record_remote_source_consumption_proven(request_id, meta)
+
+    with patch.object(
+        worker,
+        "_record_remote_source_consumption_proven",
+        wraps=worker._record_remote_source_consumption_proven,
+    ) as record_proof:
+        _, finished_recving = worker.get_finished()
+
+    assert finished_recving == {request_id}
+    record_proof.assert_called_once_with(request_id, meta)
+    assert worker.get_failed_recving() == {}
+    assert worker._remote_source_consumption_proven == {}
+    assert worker._remote_offer_completion_counts == {remote.offer_key: 1}
+    assert remote.offer_key not in worker._released_remote_offers
 
 
 def test_failed_receive_waits_for_all_known_worker_handles() -> None:
@@ -584,6 +806,7 @@ def test_multirank_prepost_failure_discharge_is_rank_exact() -> None:
         request_id=producer_request_id,
         expected_consumers=1,
         consumer_tp_size=1,
+        source_offer_generation=7,
     )
     worker._remote_agents = {
         producer_engine_id: {
@@ -632,18 +855,30 @@ def test_multirank_prepost_failure_discharge_is_rank_exact() -> None:
         call("producer-agent-2", notif_msg=notification_id),
         call("producer-agent-3", notif_msg=notification_id),
     ]
+    assert worker._remote_source_consumption_proven == {
+        request_id: meta.remote.offer_key
+    }
     proof = msgspec.msgpack.decode(
         notification_id[len(PULL_READ_COMPLETE_PREFIX) :],
         type=PullReadComplete,
     )
     assert proof == PullReadComplete(
         producer_request_id=producer_request_id,
+        offer_generation=7,
         consumer_request_id=request_id,
         consumer_index=0,
         consumer_rank=0,
         consumer_tp_size=1,
         expected_consumers=1,
     )
+
+    _, finished_recving = worker.get_finished()
+
+    assert finished_recving == {request_id}
+    assert worker.get_failed_recving() == {request_id: _failure({9})}
+    assert worker._remote_source_consumption_proven == {}
+    assert worker._remote_offer_completion_counts == {}
+    assert meta.remote.offer_key in worker._released_remote_offers
 
 
 def test_coalesced_prepare_failure_becomes_request_terminal() -> None:
