@@ -73,12 +73,12 @@ PRODUCTION_CONFIG_PATH = CONFIG_PATH.with_name("gemma4_tp4_to_tp1_2k.json")
 
 EXPECTED_CONFIG_IDENTITIES = {
     CONFIG_PATH.name: (
-        "fe418c0949c340423a34c2f4281ce6bcf36d4df5eb336e4b7a551a4b783034d5",
-        "9fc4a7ea34b7257e634a2d32934c1970f089d6ad4c343f0509f39137b89cb8e9",
+        "9a03cef6426f4395cf8491fec7716e79aafd7d0fcfae5f09769afa4004cb0b38",
+        "f05cec19e50426f9a437ccd5b360545dde9e7f61140df635cf35ec62bc4c0d8e",
     ),
     PRODUCTION_CONFIG_PATH.name: (
-        "4d831a475c286e8bc43ad5b8cf753c512e850355cb9ede0f57391cd4335719c5",
-        "ffabd1b3dd86ffdf0a0060cffdcd4b56c37ee25488081c7163755279240bf06b",
+        "f2b87d7826c6ded812fc5fa3edf31a9f57da17e6f8e94fa5d7a00413a4d5dec0",
+        "335f0a6c72693267cdd3830c319c61c1c37d38b65fed66a2ed3d743ca41a4933",
     ),
 }
 
