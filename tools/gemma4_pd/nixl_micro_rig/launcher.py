@@ -52,6 +52,7 @@ _TARGET2_SOURCE_PATHS = (
     "vllm/distributed/kv_transfer/kv_connector/v1/nixl/coalesced_scatter.py",
     "vllm/distributed/kv_transfer/nixl_contracts.py",
     "vllm/distributed/kv_transfer/staging_ownership.py",
+    "vllm/distributed/nixl_utils.py",
 )
 
 _GateCaseSpec = tuple[str, str, int, int, int, int, int, int]

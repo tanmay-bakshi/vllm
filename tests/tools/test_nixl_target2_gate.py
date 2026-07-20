@@ -550,7 +550,11 @@ def test_target2_source_identity_binds_gate_and_production_primitives() -> None:
     relative_paths = {record["path"] for record in records}
 
     assert len(identity["aggregate_sha256"]) == 64
-    assert "tools/gemma4_pd/nixl_micro_rig/target2_gate_roles.py" in relative_paths
+    assert {
+        "tools/gemma4_pd/nixl_micro_rig/roles.py",
+        "tools/gemma4_pd/nixl_micro_rig/target2_gate_roles.py",
+        "vllm/distributed/nixl_utils.py",
+    } <= relative_paths
     assert (
         "vllm/distributed/kv_transfer/kv_connector/v1/nixl/coalesced_pack.py"
         in relative_paths
