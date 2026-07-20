@@ -688,7 +688,11 @@ def _validate_metadata_geometry(
     if metadata.source_group_planes != expected_planes:
         raise LiveHandshakeError("live rank group-plane contract differs")
     if metadata.physical_group_token_capacities != expected_capacities:
-        raise LiveHandshakeError("live rank group token capacities differ")
+        raise LiveHandshakeError(
+            "live metadata group token capacities "
+            f"{metadata.physical_group_token_capacities} differ from rig "
+            f"configuration {expected_capacities}"
+        )
     if len(metadata.registration_generation) == 0:
         raise LiveHandshakeError("live rank registration generation is empty")
     if len(metadata.agent_metadata) == 0:

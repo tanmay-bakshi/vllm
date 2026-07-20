@@ -175,7 +175,7 @@ def test_production_2k_profile_matches_exact_gemma_transport_geometry() -> None:
         (2,) * 13
     )
     assert tuple(group.token_capacity for group in config.groups) == (
-        (32,) * 12 + (64,)
+        (16,) * 10 + (32, 32, 64)
     )
     assert [len(region.positions) for region in plan.transport.regions] == [
         770,

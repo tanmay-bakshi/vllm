@@ -50,6 +50,7 @@ def _wire_payload(
     block_count: int | None = None,
     decoder_row_scale: int | None = None,
     packed_pool_slot_bytes: int | None = None,
+    group_token_capacities: tuple[int, ...] | None = None,
 ) -> bytes:
     """Build one complete synthetic live connector-v11 response.
 
@@ -60,6 +61,7 @@ def _wire_payload(
     :param block_count: Optional advertised physical block count.
     :param decoder_row_scale: Optional decoder-to-producer row-width ratio.
     :param packed_pool_slot_bytes: Optional packed-WRITE rank stride.
+    :param group_token_capacities: Optional physical group-capacity override.
     :returns: Exact outer MessagePack payload.
     """
     config = load_config(CONFIG_PATH)
@@ -89,6 +91,8 @@ def _wire_payload(
     registration_generation = f"volatile-generation-{decoder}-{rank}"
     if packed_pool_slot_bytes is None:
         packed_pool_slot_bytes = 256 * 1024 * 1024
+    if group_token_capacities is None:
+        group_token_capacities = tuple(group.token_capacity for group in config.groups)
     packed_write_producer_pool = None
     packed_write_consumer_pool = None
     if decoder:
@@ -131,9 +135,7 @@ def _wire_payload(
         source_group_planes=tuple(
             group.destination_plane_count for group in config.groups
         ),
-        physical_group_token_capacities=tuple(
-            group.token_capacity for group in config.groups
-        ),
+        physical_group_token_capacities=group_token_capacities,
         packed_write_producer_pool=packed_write_producer_pool,
         packed_write_consumer_pool=packed_write_consumer_pool,
     )
@@ -152,6 +154,7 @@ def _payloads(
     decoder_row_scale: int | None = None,
     packed_pool_slot_bytes: int | None = None,
     packed_pool_drift_rank: int | None = None,
+    group_token_capacities: tuple[int, ...] | None = None,
 ) -> dict[tuple[str, int], bytes]:
     result = {
         ("producer", rank): _wire_payload(
@@ -165,6 +168,7 @@ def _payloads(
                 else packed_pool_slot_bytes
                 + (2 * 1024 * 1024 if rank == packed_pool_drift_rank else 0)
             ),
+            group_token_capacities=group_token_capacities,
         )
         for rank in range(4)
     }
@@ -173,6 +177,7 @@ def _payloads(
         decoder=True,
         block_count=decoder_block_count,
         decoder_row_scale=decoder_row_scale,
+        group_token_capacities=group_token_capacities,
     )
     return result
 
@@ -187,6 +192,7 @@ def _capture(
     decoder_row_scale: int | None = None,
     packed_pool_slot_bytes: int | None = None,
     packed_pool_drift_rank: int | None = None,
+    group_token_capacities: tuple[int, ...] | None = None,
 ) -> tuple[Path, str]:
     """Capture mocked endpoint bytes through the public command implementation.
 
@@ -198,6 +204,7 @@ def _capture(
     :param decoder_row_scale: Optional decoder row-width-ratio override.
     :param packed_pool_slot_bytes: Optional producer packed-WRITE slot size.
     :param packed_pool_drift_rank: Optional producer rank with different geometry.
+    :param group_token_capacities: Optional physical group-capacity override.
     :returns: Capture path and external SHA-256.
     """
     from tools.gemma4_pd.nixl_micro_rig import live_handshake
@@ -209,6 +216,7 @@ def _capture(
         decoder_row_scale=decoder_row_scale,
         packed_pool_slot_bytes=packed_pool_slot_bytes,
         packed_pool_drift_rank=packed_pool_drift_rank,
+        group_token_capacities=group_token_capacities,
     )
     monkeypatch.setattr(live_handshake, "_git_identity", lambda _: CODE_IDENTITY)
     monkeypatch.setattr(
@@ -386,6 +394,25 @@ def test_capture_requires_exact_64k_four_way_decoder_geometry(
             monkeypatch,
             decoder_block_count=decoder_block_count,
             decoder_row_scale=decoder_row_scale,
+        )
+
+    assert not (tmp_path / "live-v11.json").exists()
+
+
+def test_capture_reports_live_capacity_tuple_that_differs_from_rig(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_capacities = (32,) * 12 + (64,)
+
+    with pytest.raises(
+        LiveHandshakeError,
+        match=("live metadata group token capacities .* differ from rig configuration"),
+    ):
+        _capture(
+            tmp_path,
+            monkeypatch,
+            group_token_capacities=stale_capacities,
         )
 
     assert not (tmp_path / "live-v11.json").exists()
