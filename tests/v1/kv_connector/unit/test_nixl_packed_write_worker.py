@@ -1254,8 +1254,8 @@ def test_producer_routes_two_decoders_by_exact_endpoint_and_sender() -> None:
     worker._packed_consumer_agents.clear()
     worker._packed_consumer_agent_last_active.clear()
     agent_by_metadata = {
-        first.consumer_endpoint.agent_metadata: "decoder-agent-a",
-        second.consumer_endpoint.agent_metadata: "decoder-agent-b",
+        first.consumer_endpoint.agent_metadata: b"decoder-agent-a",
+        second.consumer_endpoint.agent_metadata: b"decoder-agent-b",
     }
     worker.nixl_wrapper.add_remote_agent.side_effect = agent_by_metadata.__getitem__
 

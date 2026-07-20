@@ -114,6 +114,7 @@ from vllm.distributed.kv_transfer.staging_ownership import (
     HandleState,
     StagingSafetyError,
 )
+from vllm.distributed.nixl_utils import canonicalize_nixl_agent_name
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.outputs import KVTransferFailureReason
@@ -2357,7 +2358,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         if cached is not None:
             self._packed_consumer_agent_last_active[endpoint] = time.perf_counter()
             return cached
-        agent = self.nixl_wrapper.add_remote_agent(endpoint.agent_metadata)
+        agent = canonicalize_nixl_agent_name(
+            self.nixl_wrapper.add_remote_agent(endpoint.agent_metadata)
+        )
         self._packed_consumer_agents[endpoint] = agent
         self._packed_consumer_agent_last_active[endpoint] = time.perf_counter()
         return agent

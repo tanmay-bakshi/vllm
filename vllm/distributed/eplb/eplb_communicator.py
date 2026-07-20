@@ -441,8 +441,8 @@ class NixlEplbCommunicator(EplbCommunicator):
                 continue
             peer_metadata = gathered_metadata[peer]
             assert peer_metadata is not None
-            self._remote_agents[peer] = self._nixl_wrapper.add_remote_agent(
-                peer_metadata
+            self._remote_agents[peer] = nixl_utils.canonicalize_nixl_agent_name(
+                self._nixl_wrapper.add_remote_agent(peer_metadata)
             )
 
     def _init_registered_buffers(self) -> None:

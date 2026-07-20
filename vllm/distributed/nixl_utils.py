@@ -87,8 +87,36 @@ def is_nixl_available() -> bool:
     return importlib.util.find_spec(pkg) is not None
 
 
+def canonicalize_nixl_agent_name(agent_name: str | bytes) -> str:
+    """Return one text representation for a native NIXL agent identity.
+
+    The NIXL Python wrapper declares that ``add_remote_agent`` returns text,
+    while supported bindings return UTF-8 bytes. Notification sender keys are
+    text. Canonicalizing the binding result prevents one native identity from
+    acquiring two unequal Python representations.
+
+    :param agent_name: Agent identity returned by a NIXL binding.
+    :returns: Non-empty UTF-8 agent identity.
+    :raises TypeError: If the binding returned an unsupported representation.
+    :raises ValueError: If the binding returned an invalid identity.
+    """
+    if type(agent_name) is bytes:
+        try:
+            canonical_name = agent_name.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("NIXL agent identity must be valid UTF-8") from error
+    elif type(agent_name) is str:
+        canonical_name = agent_name
+    else:
+        raise TypeError("NIXL agent identity must be bytes or text")
+    if len(canonical_name) == 0:
+        raise ValueError("NIXL agent identity must be non-empty")
+    return canonical_name
+
+
 __all__ = [
     "NixlWrapper",
+    "canonicalize_nixl_agent_name",
     "nixl_agent_config",
     "nixlXferTelemetry",
     "is_nixl_available",

@@ -72,6 +72,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.coalesced_pack import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.coalesced_scatter import (
     launch_packed_chunk_scatter,
 )
+from vllm.distributed.nixl_utils import canonicalize_nixl_agent_name
 
 _PACK_SLOT_COUNT = 2
 _GUARD_BYTES = 1024 * 1024
@@ -390,8 +391,8 @@ def run_target2_gate_producer(
                 raise RuntimeError("consumer packed receive capacity differs")
             if consumer_hello.logical_device != 0:
                 raise RuntimeError("consumer packed receive device differs")
-            remote_consumer = agent.add_remote_agent(
-                base64.b64decode(consumer_hello.agent_metadata)
+            remote_consumer = canonicalize_nixl_agent_name(
+                agent.add_remote_agent(base64.b64decode(consumer_hello.agent_metadata))
             )
             notification_inbox = _NotificationInbox(
                 agent=agent,
@@ -1197,7 +1198,9 @@ def run_target2_gate_consumer(
         hello = channel.receive(GateProducerHelloPayload, iteration=-1)
         _validate_producer_hello(config, rank, hello, maximum_chunk_bytes)
         remote_agents.append(
-            agent.add_remote_agent(base64.b64decode(hello.agent_metadata))
+            canonicalize_nixl_agent_name(
+                agent.add_remote_agent(base64.b64decode(hello.agent_metadata))
+            )
         )
         remote_bases.append(list(hello.source_base_addresses))
         remote_pack_bases.append(hello.pack_slot_base_addresses)

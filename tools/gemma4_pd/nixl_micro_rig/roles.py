@@ -61,6 +61,7 @@ from vllm.distributed.kv_transfer.staging_ownership import (
     StagingRangeAllocator,
     StagingSafetyError,
 )
+from vllm.distributed.nixl_utils import canonicalize_nixl_agent_name
 
 _UCX_BACKEND = "UCX"
 _PREPARED_DESCRIPTOR_PLANES = 2
@@ -847,7 +848,9 @@ def run_consumer(
         hello = channel.receive(HelloPayload, iteration=-1)
         _validate_producer_hello(config, rank, hello, producer_cuda_visibility)
         metadata = base64.b64decode(hello.agent_metadata)
-        remote_agents.append(agent.add_remote_agent(metadata))
+        remote_agents.append(
+            canonicalize_nixl_agent_name(agent.add_remote_agent(metadata))
+        )
         remote_bases.append(list(hello.base_addresses))
         remote_devices.append(hello.logical_device)
         remote_metadata_sha256.append(hashlib.sha256(metadata).hexdigest())

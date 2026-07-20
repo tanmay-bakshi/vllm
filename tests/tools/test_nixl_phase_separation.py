@@ -105,13 +105,15 @@ def _production_worker_methods(
         for node in syntax.body
         if isinstance(node, ast.ClassDef) and node.name == "NixlBaseConnectorWorker"
     )
+    required_names = set(method_names)
+    required_names.add("_packed_transfer_work_count")
     selected = [
         node
         for node in worker_node.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in method_names
+        and node.name in required_names
     ]
-    if {node.name for node in selected} != set(method_names):
+    if {node.name for node in selected} != required_names:
         raise AssertionError("production phase-separation method is missing")
     test_class = ast.ClassDef(
         name="ProductionWorkerMethods",

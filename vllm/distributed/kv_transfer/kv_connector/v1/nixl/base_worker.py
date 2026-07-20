@@ -115,7 +115,11 @@ from vllm.distributed.kv_transfer.staging_ownership import (
     StagingRangeAllocator,
     StagingSafetyError,
 )
-from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
+from vllm.distributed.nixl_utils import (
+    NixlWrapper,
+    canonicalize_nixl_agent_name,
+    nixl_agent_config,
+)
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -2489,8 +2493,8 @@ class NixlBaseConnectorWorker:
         transfer_topo.register_remote_engine(engine_id, transfer_info)
         self.tp_mappings[engine_id] = plan
         logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
-        remote_agent_name = self.nixl_wrapper.add_remote_agent(
-            nixl_agent_meta.agent_metadata
+        remote_agent_name = canonicalize_nixl_agent_name(
+            self.nixl_wrapper.add_remote_agent(nixl_agent_meta.agent_metadata)
         )
 
         # Create dst descs and xfer side handles. TP workers have same #blocks
