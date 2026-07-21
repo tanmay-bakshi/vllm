@@ -65,9 +65,94 @@ def _disabled_packed_write_config() -> PackedWriteConfig:
     )
 
 
+def _enabled_packed_write_config(
+    *,
+    min_descriptors_per_rank: int,
+) -> PackedWriteConfig:
+    """Build an enabled adaptive transport configuration.
+
+    :param min_descriptors_per_rank: Inclusive packed-WRITE selection threshold.
+    :returns: Enabled validated configuration.
+    """
+    return PackedWriteConfig(
+        enabled=True,
+        chunk_bytes_per_rank=64 * 1024 * 1024,
+        min_descriptors_per_rank=min_descriptors_per_rank,
+        producer_slot_count=1,
+        consumer_slot_count=1,
+        alignment_bytes=256,
+        warn_after_s=1.0,
+        fail_after_s=2.0,
+    )
+
+
 @pytest.mark.cpu_test
-def test_descriptor_construction_failure_records_prepare_failure() -> None:
-    """Descriptor exceptions take the typed, quiescent failure path."""
+@pytest.mark.parametrize(
+    ("descriptors_per_rank", "expected_mode", "expected_selected"),
+    (
+        (9, "direct", False),
+        (10, "packed", True),
+    ),
+)
+def test_adaptive_transport_selection_records_one_authoritative_event(
+    caplog: pytest.LogCaptureFixture,
+    descriptors_per_rank: int,
+    expected_mode: str,
+    expected_selected: bool,
+) -> None:
+    """The inclusive threshold drives one parseable route-selection event.
+
+    :param caplog: Captured log records.
+    :param descriptors_per_rank: Synthetic direct-plan descriptor cardinality.
+    :param expected_mode: Expected structured route name.
+    :param expected_selected: Whether packed WRITE should be selected.
+    """
+    worker = cast(
+        NixlPullConnectorWorker,
+        object.__new__(NixlPullConnectorWorker),
+    )
+    worker._packed_write_config = _enabled_packed_write_config(
+        min_descriptors_per_rank=10
+    )
+
+    with caplog.at_level(
+        "INFO",
+        logger=("vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker"),
+    ):
+        selected = worker._select_packed_write_transport(
+            direct_descriptors_per_rank=descriptors_per_rank,
+            localization_enabled=False,
+        )
+        worker._record_transfer_plan_selection(
+            request_id="consumer-request",
+            use_packed_write=selected,
+            direct_descriptors_per_rank=descriptors_per_rank,
+            source_rank_count=4,
+        )
+
+    events = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("[transfer-plan-selected]")
+    ]
+    assert selected is expected_selected
+    assert events == [
+        "[transfer-plan-selected] request=consumer-request "
+        f"mode={expected_mode} "
+        f"direct_descriptors_per_rank={descriptors_per_rank} "
+        "threshold_per_rank=10 "
+        f"direct_descriptors_total={descriptors_per_rank * 4}"
+    ]
+
+
+@pytest.mark.cpu_test
+def test_deferred_direct_selection_emits_once_before_prepare_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A deferred plan records its route only after successful reservation.
+
+    :param caplog: Captured log records.
+    """
     worker = cast(
         NixlPullConnectorWorker,
         object.__new__(NixlPullConnectorWorker),
@@ -115,6 +200,7 @@ def test_descriptor_construction_failure_records_prepare_failure() -> None:
 
     allocator = StagingRangeAllocator(4096)
     captured_plans: list[CoalescedStagingPlan] = []
+    create_attempts = 0
 
     def create_plan(
         req_id: str,
@@ -122,6 +208,10 @@ def test_descriptor_construction_failure_records_prepare_failure() -> None:
         layout: CoalescedTransferPlan,
         layout_duration_seconds: float,
     ) -> CoalescedStagingPlan | None:
+        nonlocal create_attempts
+        create_attempts += 1
+        if create_attempts == 1:
+            return None
         plan = allocator.create_plan(
             owner_id="descriptor-test-owner",
             request_id=req_id,
@@ -154,14 +244,35 @@ def test_descriptor_construction_failure_records_prepare_failure() -> None:
         )
     ]
 
-    result = worker._coalesced_read_request(
-        "consumer-request",
-        metadata,
-        read_specs,
-        b"notification",
-    )
+    with caplog.at_level(
+        "INFO",
+        logger=("vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker"),
+    ):
+        deferred = worker._coalesced_read_request(
+            "consumer-request",
+            metadata,
+            read_specs,
+            b"notification",
+        )
+        result = worker._coalesced_read_request(
+            "consumer-request",
+            metadata,
+            read_specs,
+            b"notification",
+        )
 
+    events = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("[transfer-plan-selected]")
+    ]
+    assert deferred == "defer"
     assert result == "posted"
+    assert events == [
+        "[transfer-plan-selected] request=consumer-request mode=direct "
+        "direct_descriptors_per_rank=1 threshold_per_rank=1 "
+        "direct_descriptors_total=1"
+    ]
     assert len(captured_plans) == 1
     plan = captured_plans[0]
     assert plan.slots[0].state is HandleState.PREPARE_FAILED

@@ -1302,6 +1302,44 @@ def test_consumer_exact_duplicate_at_arrival_quorum_is_idempotent() -> None:
 
 
 @pytest.mark.cpu_test
+def test_consumer_scatter_wall_time_includes_cpu_enqueue() -> None:
+    """Scatter wall time spans pre-launch enqueue through device completion."""
+    worker = _consumer_worker()
+    _start_consumer_request(worker)
+    owner = worker._packed_consumer_requests["decode-request"]
+    first = owner.active_chunks[0]
+    admitted_at = first.admitted_at
+    _accept_arrivals(worker, first.requests)
+
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker."
+            "launch_packed_chunk_scatter",
+            return_value=_FakeLaunch(),
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker."
+            "time.monotonic",
+            side_effect=(admitted_at + 1.0, admitted_at + 2.0, admitted_at + 4.0),
+        ),
+    ):
+        worker._consume_packed_terminal_notifications()
+
+    assert first.scatter_started_at == pytest.approx(admitted_at + 2.0)
+    assert first.scatter_enqueued_at == pytest.approx(admitted_at + 4.0)
+    assert first.scatter_enqueue_duration_seconds == pytest.approx(2.0)
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker.time.monotonic",
+        return_value=admitted_at + 10.0,
+    ):
+        worker._poll_packed_scatters()
+
+    assert owner.scatter_enqueue_duration_seconds == pytest.approx(2.0)
+    assert owner.scatter_wall_duration_seconds == pytest.approx(8.0)
+
+
+@pytest.mark.cpu_test
 def test_consumer_full_full_tail_scatter_reuses_slot_generation_atomically() -> None:
     """Three chunks scatter only after quorum and publish after the tail."""
     worker = _consumer_worker()

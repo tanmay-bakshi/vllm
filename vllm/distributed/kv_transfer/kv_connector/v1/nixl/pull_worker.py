@@ -268,6 +268,7 @@ class _ConsumerPackedChunk:
     :ivar admitted_at: Monotonic decoder slot admission time.
     :ivar terminal_at: Time the complete producer terminal quorum arrived.
     :ivar scatter_launch: Event-owned scatter launch, once enqueued.
+    :ivar scatter_started_at: Monotonic pre-launch scatter enqueue-start time.
     :ivar scatter_enqueued_at: Monotonic scatter enqueue-complete time.
     :ivar scatter_enqueue_duration_seconds: CPU enqueue duration.
     :ivar failure_reason: Known quiescent scatter failure, if any.
@@ -284,6 +285,7 @@ class _ConsumerPackedChunk:
     )
     terminal_at: float | None = None
     scatter_launch: ScatterLaunch | None = None
+    scatter_started_at: float | None = None
     scatter_enqueued_at: float | None = None
     scatter_enqueue_duration_seconds: float = 0.0
     failure_reason: str | None = None
@@ -1952,12 +1954,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         direct_descriptors_per_rank = sum(
             len(region.runs) for region in source_plan.regions
         )
-        if (
-            self._packed_write_config.enabled
-            and localization_enabled is False
-            and direct_descriptors_per_rank
-            >= self._packed_write_config.min_descriptors_per_rank
-        ):
+        use_packed_write = self._select_packed_write_transport(
+            direct_descriptors_per_rank=direct_descriptors_per_rank,
+            localization_enabled=localization_enabled,
+        )
+        if use_packed_write:
+            self._record_transfer_plan_selection(
+                request_id=req_id,
+                use_packed_write=True,
+                direct_descriptors_per_rank=direct_descriptors_per_rank,
+                source_rank_count=n_ranks,
+            )
             return self._packed_write_request(
                 req_id=req_id,
                 meta=meta,
@@ -2032,6 +2039,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         )
         if ownership is None:
             return "defer"
+        self._record_transfer_plan_selection(
+            request_id=req_id,
+            use_packed_write=False,
+            direct_descriptors_per_rank=direct_descriptors_per_rank,
+            source_rank_count=n_ranks,
+        )
         off = ownership.lease.offset
 
         if localization_enabled:
@@ -2190,6 +2203,52 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         self._notify_non_read_producer_ranks(meta, read_specs, notification_id)
         ownership.seal_posting()
         return "posted"
+
+    def _select_packed_write_transport(
+        self,
+        *,
+        direct_descriptors_per_rank: int,
+        localization_enabled: bool,
+    ) -> bool:
+        """Select the adaptive transport for one completed plan.
+
+        :param direct_descriptors_per_rank: Direct-plan descriptors per source rank.
+        :param localization_enabled: Whether diagnostic localization owns the route.
+        :returns: Whether producer-packed WRITE is selected.
+        """
+        threshold_per_rank = self._packed_write_config.min_descriptors_per_rank
+        return (
+            self._packed_write_config.enabled
+            and localization_enabled is False
+            and direct_descriptors_per_rank >= threshold_per_rank
+        )
+
+    def _record_transfer_plan_selection(
+        self,
+        *,
+        request_id: str,
+        use_packed_write: bool,
+        direct_descriptors_per_rank: int,
+        source_rank_count: int,
+    ) -> None:
+        """Record one adaptive route after its resources are committed.
+
+        :param request_id: Decoder request identifier.
+        :param use_packed_write: Whether producer-packed WRITE was selected.
+        :param direct_descriptors_per_rank: Direct-plan descriptors per source rank.
+        :param source_rank_count: Source ranks represented by the plan.
+        """
+        threshold_per_rank = self._packed_write_config.min_descriptors_per_rank
+        logger.info(
+            "[transfer-plan-selected] request=%s mode=%s "
+            "direct_descriptors_per_rank=%d threshold_per_rank=%d "
+            "direct_descriptors_total=%d",
+            request_id,
+            "packed" if use_packed_write else "direct",
+            direct_descriptors_per_rank,
+            threshold_per_rank,
+            direct_descriptors_per_rank * source_rank_count,
+        )
 
     def _record_packed_source_readiness(
         self,
@@ -3516,6 +3575,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         pool.begin_scatter(chunk.lease)
         destinations = tuple(row.reshape(-1) for row in self._region_rows)
         enqueue_started_at = time.monotonic()
+        chunk.scatter_started_at = enqueue_started_at
         try:
             launch = launch_packed_chunk_scatter(
                 buffer,
@@ -3530,8 +3590,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 staging_rank_stride_bytes=geometry.rank_stride_bytes,
             )
         except ScatterEnqueueError as error:
+            enqueue_completed_at = time.monotonic()
             chunk.scatter_enqueue_duration_seconds = (
-                time.monotonic() - enqueue_started_at
+                enqueue_completed_at - enqueue_started_at
             )
             if error.recovery_launch is None:
                 reason = str(error)
@@ -3539,7 +3600,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 owner.tracker.tombstone()
                 raise StagingSafetyError(reason) from error
             chunk.scatter_launch = error.recovery_launch
-            chunk.scatter_enqueued_at = time.monotonic()
+            chunk.scatter_enqueued_at = enqueue_completed_at
             chunk.failure_reason = str(error)
             self._begin_packed_request_failure(owner, str(error))
             return
@@ -3550,9 +3611,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             pool.tombstone(chunk.lease, reason)
             owner.tracker.tombstone()
             raise StagingSafetyError(reason) from error
-        chunk.scatter_enqueue_duration_seconds = time.monotonic() - enqueue_started_at
+        enqueue_completed_at = time.monotonic()
+        chunk.scatter_enqueue_duration_seconds = (
+            enqueue_completed_at - enqueue_started_at
+        )
         chunk.scatter_launch = launch
-        chunk.scatter_enqueued_at = time.monotonic()
+        chunk.scatter_enqueued_at = enqueue_completed_at
 
     def _poll_packed_scatters(self) -> None:
         """Release completed decoder slots and atomically publish requests."""
@@ -3598,12 +3662,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 owner.scatter_enqueue_duration_seconds += (
                     chunk.scatter_enqueue_duration_seconds
                 )
-                if chunk.scatter_enqueued_at is None:
+                if chunk.scatter_started_at is None:
                     raise StagingSafetyError(
                         "packed WRITE scatter completion has no start time"
                     )
                 owner.scatter_wall_duration_seconds += (
-                    completed_at - chunk.scatter_enqueued_at
+                    completed_at - chunk.scatter_started_at
                 )
                 owner.scatter_gpu_duration_seconds += gpu_duration
                 del owner.active_chunks[chunk.chunk_index]
