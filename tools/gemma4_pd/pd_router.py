@@ -52,6 +52,8 @@ KV_TRANSFER_SEED = {
     "remote_port": None,
 }
 
+BACKEND_KEEPALIVE_TIMEOUT_S: float = 1.0
+
 
 @dataclass
 class Backend:
@@ -174,7 +176,14 @@ class PDRouter:
         # 600s is far above any legitimate TTFT/generation gap here.
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=30.0,
                                         sock_read=600.0)
-        self._session = aiohttp.ClientSession(timeout=timeout)
+        # vLLM retires idle HTTP connections after five seconds, while
+        # aiohttp otherwise reuses them for fifteen. Expire our pool first:
+        # retrying an ambiguous prefill POST could orphan a second KV offer.
+        connector = aiohttp.TCPConnector(keepalive_timeout=BACKEND_KEEPALIVE_TIMEOUT_S)
+        self._session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+        )
         await self._sweep_health()
         self._health_task = asyncio.create_task(self._health_loop())
 

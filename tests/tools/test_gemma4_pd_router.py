@@ -10,7 +10,11 @@ import aiohttp
 import pytest
 from aiohttp import web
 
-from tools.gemma4_pd.pd_router import PDRouter, parse_args
+from tools.gemma4_pd.pd_router import (
+    BACKEND_KEEPALIVE_TIMEOUT_S,
+    PDRouter,
+    parse_args,
+)
 
 
 class _CompletionRequest:
@@ -83,9 +87,7 @@ def test_rejected_prefill_trace_is_stored_and_emitted_once(
     router = _router(trace=True, require_prefill=True)
     router._prefill[0].healthy = True
     session = MagicMock()
-    session.post.side_effect = aiohttp.ClientConnectionError(
-        "prefill socket closed"
-    )
+    session.post.side_effect = aiohttp.ClientConnectionError("prefill socket closed")
     monkeypatch.setattr(router, "_session", session)
     request_id = "target-request"
     request = cast(
@@ -108,6 +110,11 @@ def test_rejected_prefill_trace_is_stored_and_emitted_once(
     assert stored["p_error_type"] == "ClientConnectionError"
     assert stored["p_error_message"] == "prefill socket closed"
     assert "t_done" in stored
+    session.post.assert_called_once()
+    assert router._stats.pd_success == 0
+    assert router._stats.prefill_unavailable == 1
+    assert router._prefill[0].in_flight == 0
+    assert router._prefill[0].failed == 1
 
     lookup_request = cast(web.Request, _TraceRequest(request_id))
     lookup_response = asyncio.run(router.trace_lookup(lookup_request))
@@ -116,6 +123,142 @@ def test_rejected_prefill_trace_is_stored_and_emitted_once(
     lookup = json.loads(lookup_response.body)
     assert lookup["p_error_type"] == "ClientConnectionError"
     assert lookup["p_error_message"] == "prefill socket closed"
+
+
+def test_backend_pool_expires_before_vllm_idle_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retire pooled sockets before vLLM's five-second idle cutoff."""
+
+    router = _router()
+    sweep_health = AsyncMock()
+    monkeypatch.setattr(router, "_sweep_health", sweep_health)
+
+    async def exercise() -> None:
+        await router.start()
+        session = router._session
+        assert session is not None
+        connector = session.connector
+        assert isinstance(connector, aiohttp.TCPConnector)
+        assert session.connector_owner is True
+        assert connector._keepalive_timeout == BACKEND_KEEPALIVE_TIMEOUT_S
+        assert BACKEND_KEEPALIVE_TIMEOUT_S == 1.0
+        assert BACKEND_KEEPALIVE_TIMEOUT_S < 5.0
+        await router.close()
+        await asyncio.sleep(0)
+        assert session.closed is True
+        assert connector.closed is True
+
+    asyncio.run(exercise())
+    sweep_health.assert_awaited_once()
+
+
+def test_backend_pool_reuses_bursts_but_not_idle_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep active and burst traffic while retiring idle backend sockets."""
+
+    router = _router()
+    monkeypatch.setattr(router, "_sweep_health", AsyncMock())
+    connections: list[asyncio.BaseTransport] = []
+
+    async def handle(request: web.Request) -> web.Response:
+        transport = request.transport
+        assert transport is not None
+        connections.append(transport)
+        await request.read()
+        if request.path == "/slow":
+            await asyncio.sleep(BACKEND_KEEPALIVE_TIMEOUT_S + 0.1)
+        return web.Response(text="ok")
+
+    async def exercise() -> None:
+        app = web.Application()
+        app.router.add_post("/{path:.*}", handle)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+        try:
+            await router.start()
+            session = router._session
+            assert session is not None
+            async with session.post(f"http://127.0.0.1:{port}/fast") as response:
+                assert await response.text() == "ok"
+            async with session.post(f"http://127.0.0.1:{port}/fast") as response:
+                assert await response.text() == "ok"
+            assert connections[0] is connections[1]
+
+            await asyncio.sleep(BACKEND_KEEPALIVE_TIMEOUT_S + 0.1)
+            async with session.post(f"http://127.0.0.1:{port}/fast") as response:
+                assert await response.text() == "ok"
+            assert connections[2] is not connections[1]
+
+            async with session.post(f"http://127.0.0.1:{port}/slow") as response:
+                assert await response.text() == "ok"
+            assert connections[3] is connections[2]
+        finally:
+            await router.close()
+            await runner.cleanup()
+
+    asyncio.run(exercise())
+
+
+def test_ambiguous_prefill_disconnect_is_never_retried() -> None:
+    """Refuse a duplicate KV offer after the backend reads a full POST."""
+
+    dispatch_count = 0
+    router = _router(trace=True, require_prefill=True)
+
+    async def disconnect_after_request(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        nonlocal dispatch_count
+        header = await reader.readuntil(b"\r\n\r\n")
+        content_length = 0
+        for line in header.split(b"\r\n"):
+            name, separator, value = line.partition(b":")
+            if separator == b":" and name.lower() == b"content-length":
+                content_length = int(value.strip())
+        await reader.readexactly(content_length)
+        dispatch_count += 1
+        writer.close()
+        await writer.wait_closed()
+
+    async def exercise() -> web.StreamResponse:
+        server = await asyncio.start_server(disconnect_after_request, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        router._prefill[0].url = f"http://127.0.0.1:{port}"
+        router._prefill[0].healthy = True
+        router._session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(
+                keepalive_timeout=BACKEND_KEEPALIVE_TIMEOUT_S
+            )
+        )
+        request = cast(
+            web.Request,
+            _CompletionRequest(
+                "ambiguous-prefill",
+                {"messages": [{"role": "user", "content": "hello"}]},
+            ),
+        )
+        try:
+            return await router.handle_completions(request)
+        finally:
+            await router._session.close()
+            server.close()
+            await server.wait_closed()
+
+    response = asyncio.run(exercise())
+
+    assert response.status == 503
+    assert dispatch_count == 1
+    assert router._stats.pd_success == 0
+    assert router._stats.prefill_unavailable == 1
+    assert router._prefill[0].completed == 1
+    assert router._prefill[0].failed == 1
+    assert router._prefill[0].in_flight == 0
 
 
 def test_configured_decode_attempts_reach_dispatch(
